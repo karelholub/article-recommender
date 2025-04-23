@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BERT-Powered News Recommender</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
+    <style>
+        .article-card {
+            margin-bottom: 1rem;
+            cursor: pointer;
+        }
+        .article-card.selected {
+            background-color: #e3f2fd;
+        }
+        .label {
+            margin-right: 0.5rem;
+        }
+        .article-list {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        .similarity-indicator {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.5rem;
+            background-color: #f8f9fa;
+            border-radius: 0.25rem;
+            font-size: 0.875rem;
+        }
+        .similarity-indicator i {
+            color: #0d6efd;
+        }
+        .similarity-indicator span {
+            font-weight: 500;
+            margin-left: 0.25rem;
+        }
+        .similar-article {
+            padding: 1rem;
+            border: 1px solid #dee2e6;
+            border-radius: 0.25rem;
+            margin-bottom: 1rem;
+        }
+        .similar-article h5 {
+            margin-bottom: 0.5rem;
+        }
+        .similar-article p {
+            color: #6c757d;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+        <div class="container">
+            <a class="navbar-brand" href="#">
+                <i class="fas fa-brain me-2"></i>
+                BERT News Recommender
+            </a>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <div class="row">
+            <!-- Main Content -->
+            <div class="col-md-8">
+                <div class="card mb-4">
+                    <div class="card-body">
+                        <h2 class="card-title">How BERT Understands News</h2>
+                        <p class="lead">
+                            This demo showcases how BERT (Bidirectional Encoder Representations from Transformers) 
+                            understands and recommends news articles based on their semantic meaning.
+                        </p>
+                        <div class="alert alert-info">
+                            <i class="fas fa-info-circle me-2"></i>
+                            BERT analyzes the context and meaning of words in articles, not just keywords.
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Article Display -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">Current Article</h3>
+                    </div>
+                    <div class="card-body">
+                        <h4 id="article-title" class="card-title"></h4>
+                        <p id="article-content" class="card-text"></p>
+                        <div class="d-flex justify-content-between align-items-center">
+                            <a id="article-url" href="#" target="_blank" class="btn btn-primary">
+                                <i class="fas fa-external-link-alt me-2"></i>
+                                Read Full Article
+                            </a>
+                            <button id="show-similar" class="btn btn-outline-primary">
+                                <i class="fas fa-search me-2"></i>
+                                Find Similar Articles
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Similar Articles -->
+                <div id="similar-articles" class="card mb-4" style="display: none;">
+                    <div class="card-header">
+                        <h3 class="mb-0">Similar Articles</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="similar-list" class="list-group"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sidebar -->
+            <div class="col-md-4">
+                <!-- BERT Explanation -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">How It Works</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="bert-explanation">
+                            <h5><i class="fas fa-code me-2"></i>Semantic Understanding</h5>
+                            <p>BERT analyzes the meaning of words in context, understanding:</p>
+                            <ul>
+                                <li>Word relationships</li>
+                                <li>Contextual meaning</li>
+                                <li>Topic relevance</li>
+                            </ul>
+                            
+                            <h5><i class="fas fa-chart-line me-2"></i>Similarity Detection</h5>
+                            <p>Articles are compared based on:</p>
+                            <ul>
+                                <li>Semantic similarity</li>
+                                <li>Topic clustering</li>
+                                <li>Content freshness</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Article Statistics -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">Article Statistics</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="article-stats">
+                            <div class="text-center p-3">
+                                <div class="spinner-border text-primary" role="status">
+                                    <span class="visually-hidden">Loading...</span>
+                                </div>
+                                <p class="mt-2">Loading statistics...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Article List -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="mb-0">Available Articles</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="article-list" class="list-group"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html> 
