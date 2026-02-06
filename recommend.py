@@ -403,4 +403,4 @@ if __name__ == "__main__":
     )
     print("\nAdvanced recommendations:")
     for rec in advanced_recs:
-        print(f"{rec['score']:.3f} (base: {rec['base_score']:.3f}, decay: {rec['time_decay']:.3f}) → {rec['title']}")
+        print(f"{rec['score']:.3f} (semantic: {rec['similarity_components']['semantic']:.3f}, freshness: {rec['similarity_components']['freshness']:.3f}) → {rec['title']}")
