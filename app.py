@@ -14,6 +14,32 @@ from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, render_template, request
 
+from domain.common import (
+    extract_error_code as _extract_error_code_impl,
+    extract_sections as _extract_sections_impl,
+    normalize_string_list as _normalize_string_list_impl,
+    parse_sources_param as _parse_sources_param_impl,
+    safe_article_age_days as _safe_article_age_days_impl,
+    safe_parse_timestamp as _safe_parse_timestamp_impl,
+)
+from domain.cdp_logic import (
+    DEFAULT_MEIRO_MAPPING as _DEFAULT_MEIRO_MAPPING_IMPL,
+    MEIRO_MAPPING_PRESETS as _MEIRO_MAPPING_PRESETS_IMPL,
+    MEIRO_PROVIDER as _MEIRO_PROVIDER_IMPL,
+    apply_derivation_guardrails as _apply_derivation_guardrails_impl,
+    build_derivation_diff as _build_derivation_diff_impl,
+    derive_reco_fields_from_meiro_traits as _derive_reco_fields_from_meiro_traits_impl,
+    float_map_from_profile_trait as _float_map_from_profile_trait_impl,
+    list_from_profile_trait as _list_from_profile_trait_impl,
+    normalize_meiro_mapping as _normalize_meiro_mapping_impl,
+    resolve_cdp_personalization as _resolve_cdp_personalization_impl,
+    resolve_experiment_assignment as _resolve_experiment_assignment_impl,
+    safe_json_list_item as _safe_json_list_item_impl,
+)
+from domain.scenario_logic import (
+    apply_scenario_rules as _apply_scenario_rules_impl,
+    validate_scenario_rule_set as _validate_scenario_rule_set_impl,
+)
 from store import RecommenderStore
 from bootstrap_data import ensure_data_files
 from connector_pipeline import ConnectorIngestionService
@@ -82,61 +108,9 @@ _cdp_state = {
 }
 
 _WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
-_MEIRO_PROVIDER = "meiro"
-_DEFAULT_MEIRO_MAPPING = {
-    "external_id_path": "customer_entity_id",
-    "traits_path": "returned_attributes",
-    "segments_path": "",
-    "fixed_segments": [],
-    "preferred_sources_trait": "preferred_sources",
-    "excluded_sources_trait": "excluded_sources",
-    "source_weights_trait": "source_weights",
-    "source_weight_trait_prefix": "source_weight_",
-    "scenario_segment_map": {},
-    "config_segment_map": {},
-    "segment_priority": [],
-    "derivation_min_source_events": 3,
-    "derivation_min_category_events": 1,
-    "derivation_allowed_sources": [],
-    "derivation_blocked_sources": [],
-    "derivation_max_preferred_sources": 5,
-    "derivation_min_source_weight": 1.05,
-    "derivation_max_source_weight": 2.0,
-    "personalization_mode": "active",
-    "fallback_mode": "source_defaults",
-    "freshness_sla_hours": 24,
-}
-_MEIRO_MAPPING_PRESETS = {
-    "news_basic": {
-        "label": "News Basic",
-        "mapping": {
-            "external_id_path": "customer_entity_id",
-            "traits_path": "returned_attributes",
-            "segments_path": "",
-            "preferred_sources_trait": "preferred_sources",
-            "excluded_sources_trait": "excluded_sources",
-            "source_weights_trait": "source_weights",
-            "source_weight_trait_prefix": "source_weight_",
-            "personalization_mode": "active",
-            "fallback_mode": "source_defaults",
-            "freshness_sla_hours": 24,
-        },
-    },
-    "news_segments_first": {
-        "label": "News Segments First",
-        "mapping": {
-            "external_id_path": "customer_entity_id",
-            "traits_path": "returned_attributes",
-            "segments_path": "returned_attributes.mx_predicted_lifestyle_interests",
-            "segment_priority": ["premium", "sports", "business", "technology"],
-            "scenario_segment_map": {"premium": "homepage_premium"},
-            "config_segment_map": {"sports": "topic_heavy", "business": "balanced"},
-            "personalization_mode": "observe",
-            "fallback_mode": "source_defaults",
-            "freshness_sla_hours": 12,
-        },
-    },
-}
+_MEIRO_PROVIDER = _MEIRO_PROVIDER_IMPL
+_DEFAULT_MEIRO_MAPPING = dict(_DEFAULT_MEIRO_MAPPING_IMPL)
+_MEIRO_MAPPING_PRESETS = dict(_MEIRO_MAPPING_PRESETS_IMPL)
 _DEFAULT_EMBEDDING_CONFIG = {
     "model_name": os.getenv("EMBEDDING_MODEL_NAME", "paraphrase-multilingual-mpnet-base-v2"),
     "batch_size": int(os.getenv("EMBEDDING_BATCH_SIZE", "16")),
@@ -183,343 +157,55 @@ except Exception as e:
 
 
 def _parse_sources_param(value: str):
-    if not value:
-        return []
-    return [part.strip() for part in value.split(",") if part.strip()]
+    return _parse_sources_param_impl(value)
 
 
 def _normalize_string_list(value) -> list:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = [part.strip() for part in value.split(",")]
-    elif isinstance(value, list):
-        items = [str(part).strip() for part in value]
-    else:
-        return []
-    return [item for item in items if item]
+    return _normalize_string_list_impl(value)
 
 
 def _extract_sections(metadata: Dict, url: str) -> list:
-    sections = []
-    for key in ("section", "rubrika", "category", "categories"):
-        value = metadata.get(key)
-        if isinstance(value, str) and value.strip():
-            sections.append(value.strip().lower())
-        elif isinstance(value, list):
-            sections.extend(str(item).strip().lower() for item in value if str(item).strip())
-    parsed = urlparse(url or "")
-    path_parts = [segment for segment in parsed.path.split("/") if segment]
-    if path_parts:
-        sections.append(path_parts[0].lower())
-    return sorted(set(sections))
+    return _extract_sections_impl(metadata, url)
 
 
 def _safe_article_age_days(scraped_at: str) -> Optional[int]:
-    if not scraped_at:
-        return None
-    try:
-        ts = datetime.strptime(scraped_at, "%Y-%m-%d %H:%M:%S")
-        return max(0, (datetime.now() - ts).days)
-    except ValueError:
-        return None
+    return _safe_article_age_days_impl(scraped_at)
 
 
 def _safe_parse_timestamp(value: str) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
+    return _safe_parse_timestamp_impl(value)
 
 
 def _extract_error_code(value: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    return text.split(":", 1)[0].strip().lower()
+    return _extract_error_code_impl(value)
 
 
 def _normalize_meiro_mapping(mapping: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    merged = dict(_DEFAULT_MEIRO_MAPPING)
-    if isinstance(mapping, dict):
-        for key, value in mapping.items():
-            merged[str(key)] = value
-    for key in (
-        "external_id_path",
-        "traits_path",
-        "segments_path",
-        "preferred_sources_trait",
-        "excluded_sources_trait",
-        "source_weights_trait",
-        "source_weight_trait_prefix",
-    ):
-        merged[key] = str(merged.get(key, "")).strip()
-    if not isinstance(merged.get("scenario_segment_map"), dict):
-        merged["scenario_segment_map"] = {}
-    if not isinstance(merged.get("config_segment_map"), dict):
-        merged["config_segment_map"] = {}
-    if not isinstance(merged.get("fixed_segments"), list):
-        merged["fixed_segments"] = []
-    if not isinstance(merged.get("segment_priority"), list):
-        merged["segment_priority"] = []
-    if not isinstance(merged.get("derivation_allowed_sources"), list):
-        merged["derivation_allowed_sources"] = []
-    if not isinstance(merged.get("derivation_blocked_sources"), list):
-        merged["derivation_blocked_sources"] = []
-    merged["derivation_min_source_events"] = max(0, int(merged.get("derivation_min_source_events", 3)))
-    merged["derivation_min_category_events"] = max(0, int(merged.get("derivation_min_category_events", 1)))
-    merged["derivation_max_preferred_sources"] = max(1, int(merged.get("derivation_max_preferred_sources", 5)))
-    merged["derivation_min_source_weight"] = max(0.0, float(merged.get("derivation_min_source_weight", 1.05)))
-    merged["derivation_max_source_weight"] = max(
-        merged["derivation_min_source_weight"],
-        float(merged.get("derivation_max_source_weight", 2.0)),
-    )
-    personalization_mode = str(merged.get("personalization_mode", "active")).strip().lower()
-    if personalization_mode not in {"off", "observe", "active"}:
-        personalization_mode = "active"
-    fallback_mode = str(merged.get("fallback_mode", "source_defaults")).strip().lower()
-    if fallback_mode not in {"none", "source_defaults", "profile_traits"}:
-        fallback_mode = "source_defaults"
-    merged["personalization_mode"] = personalization_mode
-    merged["fallback_mode"] = fallback_mode
-    merged["freshness_sla_hours"] = max(1, min(24 * 30, int(merged.get("freshness_sla_hours", 24))))
-    merged["fixed_segments"] = [str(item).strip() for item in merged["fixed_segments"] if str(item).strip()]
-    merged["segment_priority"] = [str(item).strip() for item in merged["segment_priority"] if str(item).strip()]
-    merged["derivation_allowed_sources"] = [
-        str(item).strip().lower()
-        for item in merged["derivation_allowed_sources"]
-        if str(item).strip()
-    ]
-    merged["derivation_blocked_sources"] = [
-        str(item).strip().lower()
-        for item in merged["derivation_blocked_sources"]
-        if str(item).strip()
-    ]
-    return merged
+    return _normalize_meiro_mapping_impl(mapping)
 
 
 def _list_from_profile_trait(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return []
+    return _list_from_profile_trait_impl(value)
 
 
 def _float_map_from_profile_trait(value: Any) -> Dict[str, float]:
-    if not isinstance(value, dict):
-        return {}
-    out: Dict[str, float] = {}
-    for key, raw in value.items():
-        source = str(key).strip()
-        if not source:
-            continue
-        try:
-            out[source] = float(raw)
-        except (TypeError, ValueError):
-            continue
-    return out
+    return _float_map_from_profile_trait_impl(value)
 
 
 def _safe_json_list_item(value: str) -> Optional[List[Any]]:
-    try:
-        parsed = json.loads(value)
-        return parsed if isinstance(parsed, list) else None
-    except Exception:
-        return None
+    return _safe_json_list_item_impl(value)
 
 
 def _derive_reco_fields_from_meiro_traits(traits: Dict[str, Any]) -> Dict[str, Any]:
-    source_counter: Dict[str, int] = {}
-    categories: Dict[str, int] = {}
-    brands: Dict[str, int] = {}
-
-    for key in ("web_all_products_viewed_3", "me_shit_product_viewed_last_session2", "web_all_purchases_comp"):
-        values = traits.get(key) or []
-        if not isinstance(values, list):
-            continue
-        for raw in values:
-            if not isinstance(raw, str):
-                continue
-            row = _safe_json_list_item(raw)
-            if not row:
-                continue
-            if len(row) >= 7:
-                url_candidate = str(row[6] or "").strip()
-                if url_candidate:
-                    parsed = urlparse(url_candidate)
-                    domain = parsed.netloc.strip().lower()
-                    if domain:
-                        source_counter[domain] = source_counter.get(domain, 0) + 1
-            if len(row) >= 5:
-                category = str(row[4] or "").strip().lower()
-                if category:
-                    categories[category] = categories.get(category, 0) + 1
-            if len(row) >= 6:
-                brand = str(row[5] or "").strip().lower()
-                if brand:
-                    brands[brand] = brands.get(brand, 0) + 1
-
-    preferred_sources = [item[0] for item in sorted(source_counter.items(), key=lambda x: x[1], reverse=True)[:5]]
-    source_weights: Dict[str, float] = {}
-    if source_counter:
-        max_count = max(source_counter.values())
-        for source, count in source_counter.items():
-            ratio = (count / max_count) if max_count else 0.0
-            source_weights[source] = round(1.0 + ratio, 3)
-
-    segments = []
-    rfm_values = traits.get("web_rfm") or []
-    if isinstance(rfm_values, list):
-        for value in rfm_values:
-            text = str(value).strip().lower()
-            if text:
-                segments.append(f"rfm:{text.replace(' ', '_')}")
-    lifestage = traits.get("mx_predicted_lifestage") or []
-    if isinstance(lifestage, list):
-        for value in lifestage:
-            text = str(value).strip().lower()
-            if text:
-                segments.append(f"lifestage:{text.replace(' ', '_')}")
-    for category, count in sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]:
-        if count > 0:
-            segments.append(f"cat:{category}")
-    for brand, count in sorted(brands.items(), key=lambda x: x[1], reverse=True)[:2]:
-        if count > 0:
-            segments.append(f"brand:{brand.replace(' ', '_')}")
-    segments = sorted(set(segments))
-
-    return {
-        "preferred_sources": preferred_sources,
-        "source_weights": source_weights,
-        "derived_segments": segments,
-        "top_categories": [item[0] for item in sorted(categories.items(), key=lambda x: x[1], reverse=True)[:5]],
-        "top_brands": [item[0] for item in sorted(brands.items(), key=lambda x: x[1], reverse=True)[:5]],
-        "support": {
-            "source_events": sum(source_counter.values()),
-            "category_events": sum(categories.values()),
-            "brand_events": sum(brands.values()),
-        },
-    }
+    return _derive_reco_fields_from_meiro_traits_impl(traits)
 
 
 def _apply_derivation_guardrails(derived: Dict[str, Any], mapping: Dict[str, Any]) -> Dict[str, Any]:
-    support = derived.get("support") or {}
-    source_events = int(support.get("source_events") or 0)
-    category_events = int(support.get("category_events") or 0)
-    min_source_events = int(mapping.get("derivation_min_source_events", 3))
-    min_category_events = int(mapping.get("derivation_min_category_events", 1))
-    allowed = set(str(item).strip().lower() for item in (mapping.get("derivation_allowed_sources") or []) if str(item).strip())
-    blocked = set(str(item).strip().lower() for item in (mapping.get("derivation_blocked_sources") or []) if str(item).strip())
-    max_sources = int(mapping.get("derivation_max_preferred_sources", 5))
-    min_weight = float(mapping.get("derivation_min_source_weight", 1.05))
-    max_weight = float(mapping.get("derivation_max_source_weight", 2.0))
-
-    reasons = []
-    if source_events < min_source_events:
-        reasons.append(f"insufficient_source_events:{source_events}<{min_source_events}")
-    if category_events < min_category_events:
-        reasons.append(f"insufficient_category_events:{category_events}<{min_category_events}")
-
-    preferred = [str(item).strip().lower() for item in (derived.get("preferred_sources") or []) if str(item).strip()]
-    weights = dict(derived.get("source_weights") or {})
-    filtered = []
-    dropped_by_policy = []
-    for source in preferred:
-        if allowed and source not in allowed:
-            dropped_by_policy.append({"source": source, "reason": "not_in_allowlist"})
-            continue
-        if source in blocked:
-            dropped_by_policy.append({"source": source, "reason": "in_blocklist"})
-            continue
-        filtered.append(source)
-    filtered = filtered[:max_sources]
-
-    final_weights: Dict[str, float] = {}
-    for source in filtered:
-        raw = weights.get(source, 1.0)
-        try:
-            weight = float(raw)
-        except (TypeError, ValueError):
-            weight = 1.0
-        weight = max(min_weight, min(max_weight, weight))
-        final_weights[source] = round(weight, 3)
-
-    if not filtered:
-        reasons.append("no_preferred_sources_after_policy")
-
-    guardrail_pass = len(reasons) == 0
-    return {
-        "pass": guardrail_pass,
-        "reasons": reasons,
-        "policy": {
-            "min_source_events": min_source_events,
-            "min_category_events": min_category_events,
-            "allowlist_size": len(allowed),
-            "blocklist_size": len(blocked),
-            "max_preferred_sources": max_sources,
-            "min_source_weight": min_weight,
-            "max_source_weight": max_weight,
-        },
-        "dropped_sources": dropped_by_policy,
-        "result": {
-            "preferred_sources": filtered,
-            "source_weights": final_weights,
-            "derived_segments": list(derived.get("derived_segments") or []),
-            "top_categories": list(derived.get("top_categories") or []),
-            "top_brands": list(derived.get("top_brands") or []),
-            "support": support,
-        },
-    }
+    return _apply_derivation_guardrails_impl(derived, mapping)
 
 
 def _build_derivation_diff(profile: Dict[str, Any], guarded: Dict[str, Any]) -> Dict[str, Any]:
-    current_traits = dict(profile.get("traits") or {})
-    current_segments = [str(item).strip() for item in (profile.get("segments") or []) if str(item).strip()]
-    result = guarded.get("result") or {}
-    next_preferred = list(result.get("preferred_sources") or [])
-    next_weights = dict(result.get("source_weights") or {})
-    next_segments = sorted(set(current_segments + list(result.get("derived_segments") or [])))
-
-    current_preferred = [str(item).strip().lower() for item in _list_from_profile_trait(current_traits.get("preferred_sources"))]
-    current_weights = _float_map_from_profile_trait(current_traits.get("source_weights"))
-    added_segments = [item for item in next_segments if item not in current_segments]
-
-    return {
-        "preferred_sources": {
-            "before": current_preferred,
-            "after": next_preferred,
-            "added": [item for item in next_preferred if item not in current_preferred],
-            "removed": [item for item in current_preferred if item not in next_preferred],
-            "changed": current_preferred != next_preferred,
-        },
-        "source_weights": {
-            "before": current_weights,
-            "after": next_weights,
-            "changed_keys": sorted(set(current_weights.keys()) ^ set(next_weights.keys()))
-            + sorted(
-                key
-                for key in set(current_weights.keys()) & set(next_weights.keys())
-                if abs(float(current_weights.get(key, 0.0)) - float(next_weights.get(key, 0.0))) > 1e-9
-            ),
-            "changed": current_weights != next_weights,
-        },
-        "segments": {
-            "before": current_segments,
-            "after": next_segments,
-            "added": added_segments,
-            "changed": bool(added_segments),
-        },
-        "has_changes": (
-            current_preferred != next_preferred
-            or current_weights != next_weights
-            or bool(added_segments)
-        ),
-    }
+    return _build_derivation_diff_impl(profile, guarded)
 
 
 def _resolve_cdp_personalization(
@@ -530,174 +216,23 @@ def _resolve_cdp_personalization(
     scenario_explicit: bool,
     config_explicit: bool,
 ) -> Dict[str, Any]:
-    external = str(external_user_id or "").strip()
-    base = {
-        "applied": False,
-        "provider": _MEIRO_PROVIDER,
-        "external_user_id": external or None,
-        "profile_found": False,
-        "segments": [],
-        "preferred_sources": [],
-        "excluded_sources": [],
-        "source_weight_overrides": {},
-        "selected_scenario_id": scenario_id,
-        "selected_config_id": config_id,
-        "requested_sources": list(requested_sources or []),
-        "mapping": _DEFAULT_MEIRO_MAPPING,
-        "personalization_mode": "active",
-        "fallback_mode": "source_defaults",
-        "profile_stale": None,
-        "profile_age_hours": None,
-    }
-    if not store:
-        return base
-    integration = store.get_cdp_integration(_MEIRO_PROVIDER)
-    mapping = _normalize_meiro_mapping(integration.get("mapping"))
-    base["mapping"] = mapping
-    base["personalization_mode"] = mapping.get("personalization_mode", "active")
-    base["fallback_mode"] = mapping.get("fallback_mode", "source_defaults")
-    if not integration.get("enabled"):
-        return base
-    if mapping.get("personalization_mode") == "off":
-        base["applied_mode"] = "off"
-        return base
-    if not external:
-        return base
-    profile = store.get_cdp_profile(_MEIRO_PROVIDER, external)
-    if not profile:
-        base["applied_mode"] = "no_profile"
-        return base
-    base["profile_found"] = True
-    synced_at = _safe_parse_timestamp(str(profile.get("synced_at", "")))
-    profile_age_hours = None
-    profile_stale = None
-    if synced_at:
-        profile_age_hours = round((datetime.now() - synced_at).total_seconds() / 3600, 3)
-        profile_stale = profile_age_hours > float(mapping.get("freshness_sla_hours", 24))
-    base["profile_age_hours"] = profile_age_hours
-    base["profile_stale"] = profile_stale
-    traits = profile.get("traits") or {}
-    if not isinstance(traits, dict):
-        traits = {}
-    segments = [str(item).strip() for item in (profile.get("segments") or []) if str(item).strip()]
-    base["segments"] = segments
-
-    preferred_sources = _list_from_profile_trait(traits.get(mapping.get("preferred_sources_trait")))
-    excluded_sources = _list_from_profile_trait(traits.get(mapping.get("excluded_sources_trait")))
-    source_weight_overrides = _float_map_from_profile_trait(traits.get(mapping.get("source_weights_trait")))
-    prefix = mapping.get("source_weight_trait_prefix")
-    if prefix:
-        for key, value in traits.items():
-            trait_key = str(key)
-            if not trait_key.startswith(prefix):
-                continue
-            source = trait_key[len(prefix):].strip()
-            if not source:
-                continue
-            try:
-                source_weight_overrides[source] = float(value)
-            except (TypeError, ValueError):
-                continue
-
-    source_set = set(requested_sources or [])
-    source_set.update(preferred_sources)
-    source_set.difference_update(excluded_sources)
-    merged_sources = sorted(source_set)
-
-    scenario_segment_map = {str(k): str(v).strip() for k, v in (mapping.get("scenario_segment_map") or {}).items() if str(v).strip()}
-    config_segment_map = {str(k): str(v).strip() for k, v in (mapping.get("config_segment_map") or {}).items() if str(v).strip()}
-    segment_priority = mapping.get("segment_priority") or []
-    segment_order = segment_priority + [seg for seg in segments if seg not in segment_priority]
-
-    selected_scenario_id = scenario_id
-    if not scenario_explicit and not selected_scenario_id:
-        for segment in segment_order:
-            candidate = scenario_segment_map.get(segment)
-            if candidate:
-                selected_scenario_id = candidate
-                break
-
-    selected_config_id = config_id
-    if not config_explicit:
-        for segment in segment_order:
-            candidate = config_segment_map.get(segment)
-            if candidate:
-                selected_config_id = candidate
-                break
-
-    allow_apply = mapping.get("personalization_mode") == "active" and (
-        profile_stale is not True or mapping.get("fallback_mode") == "profile_traits"
+    return _resolve_cdp_personalization_impl(
+        store=store,
+        external_user_id=external_user_id,
+        requested_sources=requested_sources,
+        scenario_id=scenario_id,
+        config_id=config_id,
+        scenario_explicit=scenario_explicit,
+        config_explicit=config_explicit,
+        provider=_MEIRO_PROVIDER,
     )
-    if mapping.get("personalization_mode") == "observe":
-        allow_apply = False
-
-    base.update(
-        {
-            "applied": bool(profile),
-            "preferred_sources": preferred_sources,
-            "excluded_sources": excluded_sources,
-            "source_weight_overrides": source_weight_overrides if allow_apply else {},
-            "selected_scenario_id": selected_scenario_id if allow_apply else scenario_id,
-            "selected_config_id": selected_config_id if allow_apply else config_id,
-            "requested_sources": (merged_sources if allow_apply else list(requested_sources or [])),
-            "profile_synced_at": profile.get("synced_at"),
-            "applied_mode": (mapping.get("personalization_mode") if allow_apply else f"{mapping.get('personalization_mode')}_no_apply"),
-        }
-    )
-    return base
 
 
 def _resolve_experiment_assignment(
     experiment: Optional[Dict],
     effective_user_id: str,
 ) -> Optional[Dict]:
-    if not isinstance(experiment, dict):
-        return None
-    experiment_id = str(experiment.get("experiment_id", "")).strip()
-    variants = experiment.get("variants") or []
-    if not experiment_id or not isinstance(variants, list) or not variants:
-        return None
-
-    normalized = []
-    total_weight = 0.0
-    for variant in variants:
-        if not isinstance(variant, dict):
-            continue
-        variant_id = str(variant.get("variant_id", "")).strip()
-        weight = float(variant.get("weight", 0.0))
-        if not variant_id or weight <= 0:
-            continue
-        normalized.append(
-            {
-                "variant_id": variant_id,
-                "weight": weight,
-                "config_id": str(variant.get("config_id", "")).strip() or None,
-                "scenario_id": str(variant.get("scenario_id", "")).strip() or None,
-                "source_overrides": _normalize_string_list(variant.get("sources")),
-            }
-        )
-        total_weight += weight
-    if not normalized or total_weight <= 0:
-        return None
-
-    token = f"{experiment_id}:{effective_user_id}"
-    bucket = int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-    cursor = 0.0
-    selected = normalized[-1]
-    for candidate in normalized:
-        cursor += candidate["weight"] / total_weight
-        if bucket <= cursor:
-            selected = candidate
-            break
-    return {
-        "experiment_id": experiment_id,
-        "variant_id": selected["variant_id"],
-        "bucket": round(bucket, 6),
-        "selected_config_id": selected["config_id"],
-        "selected_scenario_id": selected["scenario_id"],
-        "selected_sources": selected["source_overrides"],
-        "variants_total": len(normalized),
-    }
+    return _resolve_experiment_assignment_impl(experiment, effective_user_id)
 
 
 def _resolve_article_source(article_id: Optional[str]) -> str:
@@ -719,58 +254,7 @@ def _resolve_event_source(event: Dict) -> str:
 
 
 def _validate_scenario_rule_set(rule_set: Dict) -> Dict:
-    candidate = dict(rule_set or {})
-    normalized = {
-        "include_sources": _normalize_string_list(candidate.get("include_sources")),
-        "exclude_sources": _normalize_string_list(candidate.get("exclude_sources")),
-        "include_sections": [value.lower() for value in _normalize_string_list(candidate.get("include_sections"))],
-        "exclude_sections": [value.lower() for value in _normalize_string_list(candidate.get("exclude_sections"))],
-        "include_keywords": [value.lower() for value in _normalize_string_list(candidate.get("include_keywords"))],
-        "exclude_keywords": [value.lower() for value in _normalize_string_list(candidate.get("exclude_keywords"))],
-        "exclude_article_ids": _normalize_string_list(candidate.get("exclude_article_ids")),
-        "max_age_days": candidate.get("max_age_days"),
-        "min_score": candidate.get("min_score"),
-        "source_boosts": {
-            str(key): float(value)
-            for key, value in (candidate.get("source_boosts") or {}).items()
-        },
-        "ranking_config_id": str(candidate.get("ranking_config_id", "")).strip() or None,
-        "max_per_source": candidate.get("max_per_source"),
-        "max_per_topic": candidate.get("max_per_topic"),
-        "max_per_section": candidate.get("max_per_section"),
-        "min_freshness": candidate.get("min_freshness"),
-        "recent_boost_days": candidate.get("recent_boost_days"),
-        "recent_boost_factor": candidate.get("recent_boost_factor"),
-        "dedup_by_title": bool(candidate.get("dedup_by_title", False)),
-        "dedup_by_url": bool(candidate.get("dedup_by_url", False)),
-    }
-
-    if normalized["max_age_days"] is not None:
-        normalized["max_age_days"] = max(0, int(normalized["max_age_days"]))
-    if normalized["min_score"] is not None:
-        normalized["min_score"] = float(normalized["min_score"])
-    for source, boost in normalized["source_boosts"].items():
-        if boost <= 0:
-            raise ValueError(f"source_boosts[{source}] must be greater than 0")
-    for key in ("max_per_source", "max_per_topic", "max_per_section"):
-        if normalized.get(key) is not None:
-            normalized[key] = max(1, int(normalized[key]))
-    if normalized.get("min_freshness") is not None:
-        normalized["min_freshness"] = float(normalized["min_freshness"])
-        if normalized["min_freshness"] < 0 or normalized["min_freshness"] > 1:
-            raise ValueError("min_freshness must be between 0 and 1")
-    if normalized.get("recent_boost_days") is not None:
-        normalized["recent_boost_days"] = max(0, int(normalized["recent_boost_days"]))
-    else:
-        normalized["recent_boost_days"] = 0
-    if normalized.get("recent_boost_factor") is not None:
-        normalized["recent_boost_factor"] = float(normalized["recent_boost_factor"])
-    else:
-        normalized["recent_boost_factor"] = 1.0
-    if normalized["recent_boost_factor"] < 0.5 or normalized["recent_boost_factor"] > 5:
-        raise ValueError("recent_boost_factor must be between 0.5 and 5")
-
-    return normalized
+    return _validate_scenario_rule_set_impl(rule_set)
 
 
 def _embedding_config_path() -> str:
@@ -1495,160 +979,12 @@ def _apply_scenario_rules(
     scenario: Optional[Dict],
     include_decisions: bool = False,
 ) -> Tuple[list, Dict]:
-    if not scenario:
-        trace = {"applied": False, "scenario_id": None, "filtered_out": 0, "reasons": {}}
-        if include_decisions:
-            trace["decisions"] = []
-        return recommendations, trace
-
-    rule_set = scenario.get("rule_set") or {}
-    include_sources = set(_normalize_string_list(rule_set.get("include_sources")))
-    exclude_sources = set(_normalize_string_list(rule_set.get("exclude_sources")))
-    include_sections = set(value.lower() for value in _normalize_string_list(rule_set.get("include_sections")))
-    exclude_sections = set(value.lower() for value in _normalize_string_list(rule_set.get("exclude_sections")))
-    include_keywords = [value.lower() for value in _normalize_string_list(rule_set.get("include_keywords"))]
-    exclude_keywords = [value.lower() for value in _normalize_string_list(rule_set.get("exclude_keywords"))]
-    exclude_article_ids = set(_normalize_string_list(rule_set.get("exclude_article_ids")))
-    source_boosts = {key: float(value) for key, value in (rule_set.get("source_boosts") or {}).items()}
-    max_age_days = rule_set.get("max_age_days")
-    min_score = rule_set.get("min_score")
-    min_freshness = rule_set.get("min_freshness")
-    max_per_source = rule_set.get("max_per_source")
-    max_per_topic = rule_set.get("max_per_topic")
-    max_per_section = rule_set.get("max_per_section")
-    recent_boost_days = rule_set.get("recent_boost_days")
-    recent_boost_factor = rule_set.get("recent_boost_factor")
-    dedup_by_title = bool(rule_set.get("dedup_by_title", False))
-    dedup_by_url = bool(rule_set.get("dedup_by_url", False))
-    if max_age_days is not None:
-        max_age_days = max(0, int(max_age_days))
-    if min_score is not None:
-        min_score = float(min_score)
-    if min_freshness is not None:
-        min_freshness = float(min_freshness)
-    if max_per_source is not None:
-        max_per_source = max(1, int(max_per_source))
-    if max_per_topic is not None:
-        max_per_topic = max(1, int(max_per_topic))
-    if max_per_section is not None:
-        max_per_section = max(1, int(max_per_section))
-    recent_boost_days = max(0, int(recent_boost_days or 0))
-    recent_boost_factor = float(recent_boost_factor or 1.0)
-
-    kept = []
-    filtered = 0
-    reasons: Dict[str, int] = {}
-    decisions = []
-    source_counts: Dict[str, int] = {}
-    topic_counts: Dict[str, int] = {}
-    section_counts: Dict[str, int] = {}
-    seen_titles: set = set()
-    seen_urls: set = set()
-
-    for rec in recommendations:
-        article_id = rec.get("article_id")
-        article_meta = recommender.article_vectors.get(article_id, {}).get("metadata", {})
-        source = rec.get("source", "unknown")
-        title = str(article_meta.get("title", rec.get("title", ""))).lower()
-        content = str(article_meta.get("content", rec.get("content", ""))).lower()
-        url = str(article_meta.get("url", rec.get("url", "")))
-        sections = _extract_sections(article_meta, url)
-        section_primary = sections[0] if sections else "unknown"
-        topic_cluster = str(rec.get("topic_cluster", "unknown"))
-        scraped_at = str(article_meta.get("scraped_at", ""))
-        age_days = _safe_article_age_days(scraped_at)
-        freshness_score = float((rec.get("features") or {}).get("freshness", rec.get("similarity_components", {}).get("freshness", 1.0)))
-        title_key = str(article_meta.get("title", rec.get("title", ""))).strip().lower()
-        url_key = url.strip().lower()
-
-        deny_reason = None
-        if include_sources and source not in include_sources:
-            deny_reason = "source_not_included"
-        elif source in exclude_sources:
-            deny_reason = "source_excluded"
-        elif include_sections and not any(section in include_sections for section in sections):
-            deny_reason = "section_not_included"
-        elif exclude_sections and any(section in exclude_sections for section in sections):
-            deny_reason = "section_excluded"
-        elif exclude_article_ids and article_id in exclude_article_ids:
-            deny_reason = "article_excluded"
-        elif include_keywords and not any(keyword in f"{title} {content}" for keyword in include_keywords):
-            deny_reason = "keyword_not_included"
-        elif exclude_keywords and any(keyword in f"{title} {content}" for keyword in exclude_keywords):
-            deny_reason = "keyword_excluded"
-        elif max_age_days is not None and age_days is not None and age_days > max_age_days:
-            deny_reason = "too_old"
-        elif min_freshness is not None and freshness_score < min_freshness:
-            deny_reason = "below_min_freshness"
-        elif min_score is not None and float(rec.get("score", 0.0)) < min_score:
-            deny_reason = "below_min_score"
-        elif dedup_by_title and title_key and title_key in seen_titles:
-            deny_reason = "dedup_title"
-        elif dedup_by_url and url_key and url_key in seen_urls:
-            deny_reason = "dedup_url"
-        elif max_per_source is not None and source_counts.get(source, 0) >= max_per_source:
-            deny_reason = "cap_source"
-        elif max_per_topic is not None and topic_counts.get(topic_cluster, 0) >= max_per_topic:
-            deny_reason = "cap_topic"
-        elif max_per_section is not None and section_counts.get(section_primary, 0) >= max_per_section:
-            deny_reason = "cap_section"
-
-        if deny_reason:
-            filtered += 1
-            reasons[deny_reason] = reasons.get(deny_reason, 0) + 1
-            if include_decisions:
-                decisions.append(
-                    {
-                        "article_id": article_id,
-                        "source": source,
-                        "status": "filtered",
-                        "reason": deny_reason,
-                        "score_before": round(float(rec.get("score", 0.0)), 4),
-                    }
-                )
-            continue
-
-        boost = float(source_boosts.get(source, 1.0))
-        if recent_boost_days > 0 and age_days is not None and age_days <= recent_boost_days:
-            boost *= recent_boost_factor
-        updated = dict(rec)
-        original_score = float(updated.get("score", 0.0))
-        boosted_score = original_score * boost
-        updated["score_before_scenario"] = round(original_score, 4)
-        updated["score"] = round(boosted_score, 4)
-        updated["scenario_boost"] = round(boost, 4)
-        updated["scenario_id"] = scenario["scenario_id"]
-        kept.append(updated)
-        source_counts[source] = source_counts.get(source, 0) + 1
-        topic_counts[topic_cluster] = topic_counts.get(topic_cluster, 0) + 1
-        section_counts[section_primary] = section_counts.get(section_primary, 0) + 1
-        if title_key:
-            seen_titles.add(title_key)
-        if url_key:
-            seen_urls.add(url_key)
-        if include_decisions:
-            decisions.append(
-                {
-                    "article_id": article_id,
-                    "source": source,
-                    "status": "kept",
-                    "reason": "passed",
-                    "score_before": round(original_score, 4),
-                    "score_after": round(boosted_score, 4),
-                    "boost": round(boost, 4),
-                }
-            )
-
-    kept.sort(key=lambda item: item.get("score", 0.0), reverse=True)
-    return kept, {
-        "applied": True,
-        "scenario_id": scenario["scenario_id"],
-        "scenario_name": scenario.get("name"),
-        "filtered_out": filtered,
-        "remaining": len(kept),
-        "reasons": reasons,
-        "decisions": decisions if include_decisions else None,
-    }
+    return _apply_scenario_rules_impl(
+        recommendations=recommendations,
+        scenario=scenario,
+        recommender=recommender,
+        include_decisions=include_decisions,
+    )
 
 
 def _build_run_decision_flow(run: Dict) -> Dict:

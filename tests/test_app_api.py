@@ -8,6 +8,16 @@ from app import app, recommender
 from connector_pipeline import IngestResult
 
 
+def _pick_dense_source() -> str:
+    counts = {}
+    for article in recommender.article_vectors.values():
+        source = recommender.extract_source(article.get('metadata', {}).get('url', ''))
+        counts[source] = counts.get(source, 0) + 1
+    if not counts:
+        return ''
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
 def test_health_endpoints():
     client = app.test_client()
 
@@ -537,6 +547,128 @@ def test_cdp_meiro_mapping_preview_endpoint():
     assert 'guardrail' in payload
 
 
+def test_cdp_mapping_presets_and_fallback_preview_endpoint():
+    client = app.test_client()
+
+    presets = client.get('/api/cdp/meiro/presets')
+    assert presets.status_code == 200
+    presets_payload = presets.get_json()
+    assert presets_payload['provider'] == 'meiro'
+    assert presets_payload['count'] >= 1
+    assert any(item['preset_id'] == 'news_basic' for item in presets_payload['presets'])
+
+    source_payload = client.get('/api/sources').get_json()
+    assert source_payload['sources']
+    source = source_payload['sources'][0]['source']
+
+    upsert_profile = client.post(
+        '/api/cdp/meiro/profiles/upsert',
+        json={
+            'external_id': 'ext-fallback-preview',
+            'traits': {
+                'preferred_sources': [source],
+                'source_weights': {source: 1.4},
+            },
+            'segments': ['vip'],
+        },
+    )
+    assert upsert_profile.status_code == 201
+
+    fallback = client.post(
+        '/api/cdp/meiro/fallback-preview',
+        json={
+            'external_user_id': 'ext-fallback-preview',
+            'sources': [],
+            'config_id': 'balanced',
+            'scenario_id': '',
+            'scenario_explicit': False,
+            'config_explicit': False,
+        },
+    )
+    assert fallback.status_code == 200
+    fallback_payload = fallback.get_json()
+    assert fallback_payload['provider'] == 'meiro'
+    assert 'context' in fallback_payload
+    assert fallback_payload['context']['profile_found'] is True
+
+
+def test_extended_ranking_config_fields_and_explainability_endpoints():
+    client = app.test_client()
+    config_id = f"extended_{uuid.uuid4().hex[:8]}"
+    source_payload = client.get('/api/sources').get_json()
+    assert source_payload['sources']
+    source = source_payload['sources'][0]['source']
+    article_ids = list(recommender.article_vectors.keys())
+
+    create = client.post(
+        '/api/ranking-configs',
+        json={
+            'config_id': config_id,
+            'weights': {'semantic': 0.5, 'freshness': 0.2, 'topic': 0.2, 'source': 0.1},
+            'time_decay_days': 21,
+            'source_weights': {source: 1.1},
+            'max_per_source': 2,
+            'max_per_topic': 3,
+            'max_per_section': 3,
+            'hard_max_age_days': 3650,
+            'min_freshness': 0.0,
+            'recent_boost_days': 2,
+            'recent_boost_factor': 1.1,
+            'dedup_by_title': True,
+            'dedup_by_url': True,
+        },
+    )
+    assert create.status_code == 201
+
+    all_configs = client.get('/api/ranking-configs')
+    assert all_configs.status_code == 200
+    configs_payload = all_configs.get_json()
+    assert config_id in configs_payload['configs']
+    saved_cfg = configs_payload['configs'][config_id]['config']
+    assert saved_cfg['max_per_source'] == 2
+    assert saved_cfg['max_per_topic'] == 3
+    assert saved_cfg['max_per_section'] == 3
+    assert saved_cfg['hard_max_age_days'] == 3650
+    assert abs(float(saved_cfg['recent_boost_factor']) - 1.1) < 1e-9
+    assert bool(saved_cfg['dedup_by_title']) is True
+    assert bool(saved_cfg['dedup_by_url']) is True
+
+    query = client.post(
+        '/api/recommendations/query',
+        json={
+            'user_id': 'demo_user',
+            'user_reads': [article_ids[0]],
+            'top_n': 3,
+            'sources': [source],
+            'config_id': config_id,
+        },
+    )
+    assert query.status_code == 200
+    query_payload = query.get_json()
+    assert query_payload['explainability_schema_version'] == 'v2'
+
+    why_not = client.post(
+        '/api/recommendations/why-not',
+        json={
+            'user_id': 'demo_user',
+            'user_reads': [article_ids[0]],
+            'top_n': 3,
+            'sources': [source],
+            'config_id': config_id,
+        },
+    )
+    assert why_not.status_code == 200
+    why_not_payload = why_not.get_json()
+    assert why_not_payload['explainability_schema_version'] == 'v2'
+    assert 'reason_counts' in why_not_payload
+
+    schema = client.get('/api/explainability/schema')
+    assert schema.status_code == 200
+    schema_payload = schema.get_json()
+    assert schema_payload['schema_version'] == 'v2'
+    assert 'dedup_title' in schema_payload['ranking_reason_codes']
+
+
 def test_recommendations_batch_endpoint():
     client = app.test_client()
     article_ids = list(recommender.article_vectors.keys())
@@ -1007,9 +1139,7 @@ def test_scenario_crud_and_context_application():
 def test_external_user_id_and_event_metrics():
     client = app.test_client()
     article_id = next(iter(recommender.article_vectors.keys()))
-    source = recommender.extract_source(
-        recommender.article_vectors[article_id].get('metadata', {}).get('url', '')
-    )
+    source = _pick_dense_source()
 
     scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
     create_scenario = client.post(
@@ -1146,9 +1276,7 @@ def test_cms_endpoint_and_scenario_simulation():
 def test_metrics_attribution_endpoint():
     client = app.test_client()
     article_id = next(iter(recommender.article_vectors.keys()))
-    source = recommender.extract_source(
-        recommender.article_vectors[article_id].get('metadata', {}).get('url', '')
-    )
+    source = _pick_dense_source()
     scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
 
     created = client.post(
@@ -1226,9 +1354,7 @@ def test_metrics_attribution_endpoint():
 def test_identity_and_scenario_trace_metrics_endpoints():
     client = app.test_client()
     article_id = next(iter(recommender.article_vectors.keys()))
-    source = recommender.extract_source(
-        recommender.article_vectors[article_id].get('metadata', {}).get('url', '')
-    )
+    source = _pick_dense_source()
     scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
 
     created = client.post(

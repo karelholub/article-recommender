@@ -3733,6 +3733,10 @@ function displayArticle(article) {
     }
 
     document.getElementById('show-similar').style.display = 'inline-block';
+    const whyNotInput = document.getElementById('why-not-article-id');
+    if (whyNotInput && !whyNotInput.value) {
+        whyNotInput.value = article.article_id || '';
+    }
 }
 
 function getSelectedSources() {
