@@ -231,6 +231,88 @@ def _float_map_from_profile_trait(value: Any) -> Dict[str, float]:
     return out
 
 
+def _safe_json_list_item(value: str) -> Optional[List[Any]]:
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else None
+    except Exception:
+        return None
+
+
+def _derive_reco_fields_from_meiro_traits(traits: Dict[str, Any]) -> Dict[str, Any]:
+    source_counter: Dict[str, int] = {}
+    categories: Dict[str, int] = {}
+    brands: Dict[str, int] = {}
+
+    for key in ("web_all_products_viewed_3", "me_shit_product_viewed_last_session2", "web_all_purchases_comp"):
+        values = traits.get(key) or []
+        if not isinstance(values, list):
+            continue
+        for raw in values:
+            if not isinstance(raw, str):
+                continue
+            row = _safe_json_list_item(raw)
+            if not row:
+                continue
+            if len(row) >= 7:
+                url_candidate = str(row[6] or "").strip()
+                if url_candidate:
+                    parsed = urlparse(url_candidate)
+                    domain = parsed.netloc.strip().lower()
+                    if domain:
+                        source_counter[domain] = source_counter.get(domain, 0) + 1
+            if len(row) >= 5:
+                category = str(row[4] or "").strip().lower()
+                if category:
+                    categories[category] = categories.get(category, 0) + 1
+            if len(row) >= 6:
+                brand = str(row[5] or "").strip().lower()
+                if brand:
+                    brands[brand] = brands.get(brand, 0) + 1
+
+    preferred_sources = [item[0] for item in sorted(source_counter.items(), key=lambda x: x[1], reverse=True)[:5]]
+    source_weights: Dict[str, float] = {}
+    if source_counter:
+        max_count = max(source_counter.values())
+        for source, count in source_counter.items():
+            ratio = (count / max_count) if max_count else 0.0
+            source_weights[source] = round(1.0 + ratio, 3)
+
+    segments = []
+    rfm_values = traits.get("web_rfm") or []
+    if isinstance(rfm_values, list):
+        for value in rfm_values:
+            text = str(value).strip().lower()
+            if text:
+                segments.append(f"rfm:{text.replace(' ', '_')}")
+    lifestage = traits.get("mx_predicted_lifestage") or []
+    if isinstance(lifestage, list):
+        for value in lifestage:
+            text = str(value).strip().lower()
+            if text:
+                segments.append(f"lifestage:{text.replace(' ', '_')}")
+    for category, count in sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]:
+        if count > 0:
+            segments.append(f"cat:{category}")
+    for brand, count in sorted(brands.items(), key=lambda x: x[1], reverse=True)[:2]:
+        if count > 0:
+            segments.append(f"brand:{brand.replace(' ', '_')}")
+    segments = sorted(set(segments))
+
+    return {
+        "preferred_sources": preferred_sources,
+        "source_weights": source_weights,
+        "derived_segments": segments,
+        "top_categories": [item[0] for item in sorted(categories.items(), key=lambda x: x[1], reverse=True)[:5]],
+        "top_brands": [item[0] for item in sorted(brands.items(), key=lambda x: x[1], reverse=True)[:5]],
+        "support": {
+            "source_events": sum(source_counter.values()),
+            "category_events": sum(categories.values()),
+            "brand_events": sum(brands.values()),
+        },
+    }
+
+
 def _resolve_cdp_personalization(
     external_user_id: Optional[str],
     requested_sources: List[str],
@@ -1648,6 +1730,68 @@ def cdp_meiro_profile_detail(external_user_id):
     if not profile:
         return jsonify({"error": "Profile not found"}), 404
     return jsonify(profile)
+
+
+@app.route("/api/cdp/meiro/profiles/<external_user_id>/derive", methods=["GET", "POST"])
+def cdp_meiro_profile_derive(external_user_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    profile = store.get_cdp_profile(_MEIRO_PROVIDER, external_user_id)
+    if not profile:
+        return jsonify({"error": "Profile not found"}), 404
+    derived = _derive_reco_fields_from_meiro_traits(profile.get("traits") or {})
+    if request.method == "GET":
+        return jsonify(
+            {
+                "provider": _MEIRO_PROVIDER,
+                "external_user_id": external_user_id,
+                "derived": derived,
+                "persisted": False,
+            }
+        )
+    try:
+        payload = request.get_json(silent=True) or {}
+        persist = bool(payload.get("persist", True))
+        if not persist:
+            return jsonify(
+                {
+                    "provider": _MEIRO_PROVIDER,
+                    "external_user_id": external_user_id,
+                    "derived": derived,
+                    "persisted": False,
+                }
+            )
+        traits = dict(profile.get("traits") or {})
+        traits["preferred_sources"] = derived.get("preferred_sources") or []
+        traits["source_weights"] = derived.get("source_weights") or {}
+        segments = sorted(set((profile.get("segments") or []) + (derived.get("derived_segments") or [])))
+        stored = store.upsert_cdp_profile(
+            provider=_MEIRO_PROVIDER,
+            external_user_id=external_user_id,
+            traits=traits,
+            segments=segments,
+            raw_payload=profile.get("raw") or {},
+        )
+        _record_audit(
+            action="derive",
+            resource_type="cdp_profile",
+            resource_id=external_user_id,
+            payload=payload,
+            extra={"provider": _MEIRO_PROVIDER, "persisted": True},
+        )
+        return jsonify(
+            {
+                "provider": _MEIRO_PROVIDER,
+                "external_user_id": external_user_id,
+                "derived": derived,
+                "persisted": True,
+                "profile": stored,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error deriving CDP profile fields: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/cdp/meiro/profiles/upsert", methods=["POST"])

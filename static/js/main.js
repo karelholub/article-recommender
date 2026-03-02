@@ -1541,6 +1541,30 @@ async function loadCdpDiagnostics() {
     }
 }
 
+async function deriveCdpProfile(persist = false) {
+    const externalId = (document.getElementById('cdp-derive-external-id')?.value || '').trim();
+    if (!externalId) {
+        throw new Error('Enter external user ID for derivation');
+    }
+    const output = document.getElementById('cdp-derivation-output');
+    if (output) output.textContent = 'Deriving...';
+    const response = await fetch(`/api/cdp/meiro/profiles/${encodeURIComponent(externalId)}/derive`, {
+        method: persist ? 'POST' : 'GET',
+        headers: persist ? { 'Content-Type': 'application/json', ...getOperatorHeaders() } : undefined,
+        body: persist ? JSON.stringify({ persist: true, actor_id: getOperatorId() || undefined }) : undefined
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to derive profile traits');
+    }
+    const payload = await response.json();
+    if (output) output.textContent = JSON.stringify(payload, null, 2);
+    if (persist) {
+        await loadCdpProfiles();
+        await loadCdpDiagnostics();
+    }
+}
+
 async function runCleanupNow() {
     const container = document.getElementById('cleanup-status');
     container.textContent = 'Running cleanup...';
@@ -2977,6 +3001,20 @@ function setupEventListeners() {
         }
     });
     on('refresh-cdp-diagnostics', 'click', loadCdpDiagnostics);
+    on('preview-cdp-derivation', 'click', async () => {
+        try {
+            await deriveCdpProfile(false);
+        } catch (error) {
+            showError(error.message || 'Failed to preview derivation');
+        }
+    });
+    on('persist-cdp-derivation', 'click', async () => {
+        try {
+            await deriveCdpProfile(true);
+        } catch (error) {
+            showError(error.message || 'Failed to persist derivation');
+        }
+    });
     on('refresh-audit-logs', 'click', loadAuditLogs);
     on('audit-actor-filter', 'change', loadAuditLogs);
     on('audit-resource-filter', 'change', loadAuditLogs);

@@ -163,6 +163,8 @@ python embed.py
 - `PUT /api/cdp/meiro`: Update Meiro integration settings + mapping rules
 - `GET /api/cdp/meiro/profiles?limit=50`: List cached CDP profiles
 - `GET /api/cdp/meiro/profiles/<external_user_id>`: Get one cached CDP profile
+- `GET /api/cdp/meiro/profiles/<external_user_id>/derive`: Preview derived recommender traits from raw Meiro attributes
+- `POST /api/cdp/meiro/profiles/<external_user_id>/derive`: Persist derived `preferred_sources`/`source_weights`/segments into cached profile
 - `POST /api/cdp/meiro/profiles/upsert`: Upsert CDP profile payload (webhook/manual ingest)
 - `POST /api/cdp/meiro/sync`: Pull profile(s) from Meiro API by external IDs
   - supports either `request_url_template` (e.g. `.../wbs?segment=107&attribute=stitching_meiro_id&value={external_user_id}`) or `base_url + profile_endpoint_template`

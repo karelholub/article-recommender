@@ -310,11 +310,26 @@ def test_cdp_meiro_endpoints_and_context():
         '/api/cdp/meiro/profiles/upsert',
         json={
             'external_id': 'ext-cdp-1',
-            'traits': {'preferred_sources': [source], 'source_weights': {source: 1.8}},
+            'traits': {
+                'preferred_sources': [source],
+                'source_weights': {source: 1.8},
+                'web_all_products_viewed_3': [f'["2026-03-02T12:00:49","sku","name","200","tops","Brand","https://{source}/a","img"]'],
+            },
             'segments': ['vip'],
         },
     )
     assert upsert_profile.status_code == 201
+
+    derive_preview = client.get('/api/cdp/meiro/profiles/ext-cdp-1/derive')
+    assert derive_preview.status_code == 200
+    derive_payload = derive_preview.get_json()
+    assert 'derived' in derive_payload
+    assert source in (derive_payload['derived'].get('preferred_sources') or [])
+
+    derive_persist = client.post('/api/cdp/meiro/profiles/ext-cdp-1/derive', json={'persist': True})
+    assert derive_persist.status_code == 200
+    derive_persist_payload = derive_persist.get_json()
+    assert derive_persist_payload['persisted'] is True
 
     context_resp = client.post(
         '/api/recommendation-context',
