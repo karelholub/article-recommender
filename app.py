@@ -132,6 +132,24 @@ def _safe_article_age_days(scraped_at: str) -> Optional[int]:
         return None
 
 
+def _resolve_article_source(article_id: Optional[str]) -> str:
+    if not recommender or not article_id:
+        return "unknown"
+    article = recommender.article_vectors.get(article_id)
+    if not article:
+        return "unknown"
+    url = article.get("metadata", {}).get("url", "")
+    return recommender.extract_source(url)
+
+
+def _resolve_event_source(event: Dict) -> str:
+    metadata = event.get("metadata") or {}
+    source = str(metadata.get("source") or "").strip()
+    if source:
+        return source
+    return _resolve_article_source(event.get("article_id"))
+
+
 def _validate_scenario_rule_set(rule_set: Dict) -> Dict:
     candidate = dict(rule_set or {})
     normalized = {
@@ -2089,11 +2107,7 @@ def scenario_source_metrics(scenario_id):
         events = store.list_events(limit=limit, scenario_id=scenario_id, days=days)
         by_source: Dict[str, Dict] = {}
         for event in events:
-            article_id = event.get("article_id")
-            source = "unknown"
-            if article_id in recommender.article_vectors:
-                url = recommender.article_vectors[article_id].get("metadata", {}).get("url", "")
-                source = recommender.extract_source(url)
+            source = _resolve_event_source(event)
             bucket = by_source.setdefault(source, {"source": source, "impressions": 0, "clicks": 0, "conversions": 0})
             if event["event_type"] == "impression":
                 bucket["impressions"] += 1
@@ -2153,13 +2167,7 @@ def metrics_trends():
                 continue
 
             if source_filter:
-                if not recommender:
-                    continue
-                article_id = event.get("article_id")
-                source = "unknown"
-                if article_id in recommender.article_vectors:
-                    url = recommender.article_vectors[article_id].get("metadata", {}).get("url", "")
-                    source = recommender.extract_source(url)
+                source = _resolve_event_source(event)
                 if source.lower() != source_filter:
                     continue
 
@@ -2253,6 +2261,374 @@ def metrics_trends():
         )
     except Exception as e:
         logger.error(f"Error computing metric trends: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/attribution", methods=["GET"])
+def metrics_attribution():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        limit = max(1, min(100000, int(request.args.get("limit", 50000))))
+        top_runs = max(1, min(500, int(request.args.get("top_runs", 50))))
+        scenario_ids_raw = request.args.get("scenario_ids", "").strip()
+        source_filter = request.args.get("source", "").strip().lower()
+        scenario_filter = {part.strip() for part in scenario_ids_raw.split(",") if part.strip()}
+        scenario_catalog = {entry["scenario_id"]: entry for entry in store.list_scenarios(include_disabled=True)}
+
+        events = store.list_events(limit=limit, days=days)
+        run_stats: Dict[str, Dict] = {}
+        source_stats: Dict[str, Dict] = {}
+        scenario_stats: Dict[str, Dict] = {}
+        totals = {"impressions": 0, "clicks": 0, "conversions": 0}
+        user_ids = set()
+        external_user_ids = set()
+        article_source_cache: Dict[str, str] = {}
+
+        for event in events:
+            scenario_id = event.get("scenario_id") or "default"
+            if scenario_filter and scenario_id not in scenario_filter:
+                continue
+
+            article_id = event.get("article_id")
+            source = "unknown"
+            if article_id:
+                source = article_source_cache.get(article_id, "")
+                if not source:
+                    source = _resolve_event_source(event)
+                    article_source_cache[article_id] = source
+            else:
+                source = _resolve_event_source(event)
+            if source_filter and source.lower() != source_filter:
+                continue
+
+            event_type = event.get("event_type")
+            if event_type not in {"impression", "click", "conversion"}:
+                continue
+            metric_key = f"{event_type}s"
+
+            totals[metric_key] += 1
+            user_value = str(event.get("user_id") or "").strip()
+            if user_value:
+                user_ids.add(user_value)
+            external_user_value = str(event.get("external_user_id") or "").strip()
+            if external_user_value:
+                external_user_ids.add(external_user_value)
+
+            source_bucket = source_stats.setdefault(
+                source,
+                {"source": source, "impressions": 0, "clicks": 0, "conversions": 0},
+            )
+            source_bucket[metric_key] += 1
+
+            scenario_bucket = scenario_stats.setdefault(
+                scenario_id,
+                {
+                    "scenario_id": scenario_id,
+                    "name": scenario_catalog.get(scenario_id, {}).get("name", "Default"),
+                    "impressions": 0,
+                    "clicks": 0,
+                    "conversions": 0,
+                },
+            )
+            scenario_bucket[metric_key] += 1
+
+            run_id = event.get("run_id") or "untracked"
+            run_bucket = run_stats.setdefault(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "scenario_id": scenario_id,
+                    "impressions": 0,
+                    "clicks": 0,
+                    "conversions": 0,
+                    "sources": set(),
+                },
+            )
+            run_bucket[metric_key] += 1
+            run_bucket["sources"].add(source)
+
+        for bucket in source_stats.values():
+            impressions = bucket["impressions"]
+            clicks = bucket["clicks"]
+            bucket["ctr"] = round((clicks / impressions), 4) if impressions else 0.0
+            bucket["conversion_rate"] = round((bucket["conversions"] / clicks), 4) if clicks else 0.0
+
+        for bucket in scenario_stats.values():
+            impressions = bucket["impressions"]
+            clicks = bucket["clicks"]
+            bucket["ctr"] = round((clicks / impressions), 4) if impressions else 0.0
+            bucket["conversion_rate"] = round((bucket["conversions"] / clicks), 4) if clicks else 0.0
+
+        ranked_runs = sorted(
+            run_stats.items(),
+            key=lambda pair: (pair[1]["impressions"], pair[1]["clicks"], pair[1]["conversions"]),
+            reverse=True,
+        )[:top_runs]
+        run_rows: List[Dict] = []
+        for run_id, bucket in ranked_runs:
+            run_meta = store.get_run(run_id) if run_id != "untracked" else None
+            request_payload = run_meta.get("request", {}) if run_meta else {}
+            selected_sources = request_payload.get("sources")
+            if not selected_sources and request_payload.get("trace"):
+                selected_sources = request_payload["trace"].get("selected_sources")
+            impressions = bucket["impressions"]
+            clicks = bucket["clicks"]
+            run_rows.append(
+                {
+                    "run_id": run_id,
+                    "created_at": run_meta.get("created_at") if run_meta else None,
+                    "config_id": run_meta.get("config_id") if run_meta else None,
+                    "config_version": run_meta.get("config_version") if run_meta else None,
+                    "scenario_id": bucket["scenario_id"],
+                    "scenario_name": scenario_catalog.get(bucket["scenario_id"], {}).get("name", "Default"),
+                    "selected_sources": selected_sources or sorted(bucket["sources"]),
+                    "event_sources": sorted(bucket["sources"]),
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "conversions": bucket["conversions"],
+                    "ctr": round((clicks / impressions), 4) if impressions else 0.0,
+                    "conversion_rate": round((bucket["conversions"] / clicks), 4) if clicks else 0.0,
+                }
+            )
+
+        source_rows = sorted(source_stats.values(), key=lambda item: (item["impressions"], item["clicks"]), reverse=True)
+        scenario_rows = sorted(scenario_stats.values(), key=lambda item: (item["impressions"], item["clicks"]), reverse=True)
+        summary = dict(totals)
+        summary["ctr"] = round((totals["clicks"] / totals["impressions"]), 4) if totals["impressions"] else 0.0
+        summary["conversion_rate"] = round((totals["conversions"] / totals["clicks"]), 4) if totals["clicks"] else 0.0
+        summary["unique_users"] = len(user_ids)
+        summary["unique_external_users"] = len(external_user_ids)
+        return jsonify(
+            {
+                "window_days": days,
+                "filters": {
+                    "scenario_ids": sorted(scenario_filter),
+                    "source": source_filter or None,
+                },
+                "summary": summary,
+                "by_run": run_rows,
+                "by_source": source_rows,
+                "by_scenario": scenario_rows,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error computing attribution metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/identity", methods=["GET"])
+def metrics_identity():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        limit_events = max(1, min(200000, int(request.args.get("limit_events", 50000))))
+        limit_runs = max(1, min(10000, int(request.args.get("limit_runs", 1000))))
+        top_external = max(1, min(200, int(request.args.get("top_external", 25))))
+
+        events = store.list_events(limit=limit_events, days=days)
+        totals = {"events": 0, "impressions": 0, "clicks": 0, "conversions": 0}
+        users = set()
+        external_users = set()
+        by_external: Dict[str, Dict] = {}
+        by_scenario: Dict[str, Dict] = {}
+
+        for event in events:
+            event_type = event.get("event_type")
+            if event_type not in {"impression", "click", "conversion"}:
+                continue
+            totals["events"] += 1
+            totals[f"{event_type}s"] += 1
+
+            user_id = str(event.get("user_id") or "").strip()
+            external_user_id = str(event.get("external_user_id") or "").strip()
+            scenario_id = event.get("scenario_id") or "default"
+            if user_id:
+                users.add(user_id)
+            if external_user_id:
+                external_users.add(external_user_id)
+                ext_bucket = by_external.setdefault(
+                    external_user_id,
+                    {
+                        "external_user_id": external_user_id,
+                        "events": 0,
+                        "impressions": 0,
+                        "clicks": 0,
+                        "conversions": 0,
+                        "scenarios": set(),
+                    },
+                )
+                ext_bucket["events"] += 1
+                ext_bucket[f"{event_type}s"] += 1
+                ext_bucket["scenarios"].add(scenario_id)
+
+            scenario_bucket = by_scenario.setdefault(
+                scenario_id,
+                {"scenario_id": scenario_id, "events": 0, "external_events": 0},
+            )
+            scenario_bucket["events"] += 1
+            if external_user_id:
+                scenario_bucket["external_events"] += 1
+
+        run_rows = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+        runs_total = 0
+        runs_with_external = 0
+        run_external_ids = set()
+        for row in run_rows:
+            runs_total += 1
+            request_payload = row.get("request", {})
+            external_user_id = str(request_payload.get("external_user_id") or "").strip()
+            if external_user_id:
+                runs_with_external += 1
+                run_external_ids.add(external_user_id)
+
+        external_rows = []
+        for item in by_external.values():
+            impressions = item["impressions"]
+            clicks = item["clicks"]
+            external_rows.append(
+                {
+                    "external_user_id": item["external_user_id"],
+                    "events": item["events"],
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "conversions": item["conversions"],
+                    "ctr": round((clicks / impressions), 4) if impressions else 0.0,
+                    "scenario_count": len(item["scenarios"]),
+                }
+            )
+        external_rows.sort(key=lambda item: (item["events"], item["clicks"]), reverse=True)
+
+        scenario_rows = []
+        for item in by_scenario.values():
+            events_total = item["events"]
+            scenario_rows.append(
+                {
+                    "scenario_id": item["scenario_id"],
+                    "events": events_total,
+                    "external_events": item["external_events"],
+                    "external_share": round((item["external_events"] / events_total), 4) if events_total else 0.0,
+                }
+            )
+        scenario_rows.sort(key=lambda item: item["events"], reverse=True)
+
+        return jsonify(
+            {
+                "window_days": days,
+                "summary": {
+                    **totals,
+                    "unique_users": len(users),
+                    "unique_external_users": len(external_users),
+                    "external_event_share": round((sum(item["external_events"] for item in by_scenario.values()) / totals["events"]), 4) if totals["events"] else 0.0,
+                    "runs_total": runs_total,
+                    "runs_with_external": runs_with_external,
+                    "run_external_share": round((runs_with_external / runs_total), 4) if runs_total else 0.0,
+                    "unique_external_users_in_runs": len(run_external_ids),
+                },
+                "top_external_users": external_rows[:top_external],
+                "by_scenario": scenario_rows,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error computing identity metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/scenario-traces", methods=["GET"])
+def metrics_scenario_traces():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        limit_runs = max(1, min(10000, int(request.args.get("limit_runs", 1000))))
+        top_rules = max(1, min(200, int(request.args.get("top_rules", 25))))
+        scenario_ids_raw = request.args.get("scenario_ids", "").strip()
+        scenario_filter = {part.strip() for part in scenario_ids_raw.split(",") if part.strip()}
+        scenario_catalog = {entry["scenario_id"]: entry for entry in store.list_scenarios(include_disabled=True)}
+
+        rows = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+        summary = {"runs_total": 0, "runs_with_scenario": 0, "runs_with_trace": 0}
+        by_scenario: Dict[str, Dict] = {}
+        global_rules: Dict[str, int] = {}
+
+        for row in rows:
+            summary["runs_total"] += 1
+            request_payload = row.get("request", {})
+            scenario_id = request_payload.get("scenario_id") or "default"
+            if scenario_filter and scenario_id not in scenario_filter:
+                continue
+            if scenario_id != "default":
+                summary["runs_with_scenario"] += 1
+
+            trace = request_payload.get("scenario_trace") or {}
+            if not trace:
+                continue
+            summary["runs_with_trace"] += 1
+
+            bucket = by_scenario.setdefault(
+                scenario_id,
+                {
+                    "scenario_id": scenario_id,
+                    "name": scenario_catalog.get(scenario_id, {}).get("name", "Default"),
+                    "runs": 0,
+                    "filtered_out": 0,
+                    "remaining": 0,
+                    "boosts_applied": 0,
+                    "rules": {},
+                },
+            )
+            bucket["runs"] += 1
+            bucket["filtered_out"] += int(trace.get("filtered_out") or 0)
+            bucket["remaining"] += int(trace.get("remaining") or 0)
+            bucket["boosts_applied"] += int(trace.get("boosts_applied") or 0)
+
+            reasons = trace.get("reasons") or {}
+            for rule, count in reasons.items():
+                count_value = int(count or 0)
+                if count_value <= 0:
+                    continue
+                bucket["rules"][rule] = bucket["rules"].get(rule, 0) + count_value
+                global_rules[rule] = global_rules.get(rule, 0) + count_value
+
+        scenario_rows = []
+        for bucket in by_scenario.values():
+            base = bucket["filtered_out"] + bucket["remaining"]
+            scenario_rows.append(
+                {
+                    "scenario_id": bucket["scenario_id"],
+                    "name": bucket["name"],
+                    "runs": bucket["runs"],
+                    "filtered_out": bucket["filtered_out"],
+                    "remaining": bucket["remaining"],
+                    "boosts_applied": bucket["boosts_applied"],
+                    "drop_rate": round((bucket["filtered_out"] / base), 4) if base else 0.0,
+                    "top_rules": [
+                        {"rule": rule, "count": count}
+                        for rule, count in sorted(bucket["rules"].items(), key=lambda item: item[1], reverse=True)[:5]
+                    ],
+                }
+            )
+        scenario_rows.sort(key=lambda item: (item["runs"], item["filtered_out"]), reverse=True)
+
+        return jsonify(
+            {
+                "window_days": days,
+                "filters": {"scenario_ids": sorted(scenario_filter)},
+                "summary": summary,
+                "global_top_rules": [
+                    {"rule": rule, "count": count}
+                    for rule, count in sorted(global_rules.items(), key=lambda item: item[1], reverse=True)[:top_rules]
+                ],
+                "scenarios": scenario_rows,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error computing scenario trace metrics: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 

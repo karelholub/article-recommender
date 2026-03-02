@@ -684,6 +684,157 @@ def test_cms_endpoint_and_scenario_simulation():
     assert 'sources' in source_metrics_payload
 
 
+def test_metrics_attribution_endpoint():
+    client = app.test_client()
+    article_id = next(iter(recommender.article_vectors.keys()))
+    source = recommender.extract_source(
+        recommender.article_vectors[article_id].get('metadata', {}).get('url', '')
+    )
+    scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
+
+    created = client.post(
+        '/api/scenarios',
+        json={
+            'scenario_id': scenario_id,
+            'name': 'Attribution Scenario',
+            'enabled': True,
+            'rule_set': {'include_sources': [source]},
+        },
+    )
+    assert created.status_code == 201
+
+    rec_resp = client.post(
+        '/api/recommendations/query',
+        json={
+            'user_id': 'attr_user',
+            'external_user_id': 'attr-ext-1',
+            'user_reads': [article_id],
+            'top_n': 3,
+            'sources': [source],
+            'config_id': 'balanced',
+            'scenario_id': scenario_id,
+            'track_impressions': True,
+        },
+    )
+    assert rec_resp.status_code == 200
+    rec_payload = rec_resp.get_json()
+    run_id = rec_payload['run_id']
+
+    recs = rec_payload.get('recommendations') or []
+    if recs:
+        event_resp = client.post(
+            '/api/events',
+            json={
+                'events': [
+                    {
+                        'event_type': 'click',
+                        'run_id': run_id,
+                        'article_id': recs[0]['article_id'],
+                        'scenario_id': scenario_id,
+                        'external_user_id': 'attr-ext-1',
+                    },
+                    {
+                        'event_type': 'conversion',
+                        'run_id': run_id,
+                        'article_id': recs[0]['article_id'],
+                        'scenario_id': scenario_id,
+                        'external_user_id': 'attr-ext-1',
+                    },
+                ]
+            },
+        )
+        assert event_resp.status_code == 201
+
+    attribution_resp = client.get(
+        f'/api/metrics/attribution?days=3650&scenario_ids={scenario_id}&top_runs=20'
+    )
+    assert attribution_resp.status_code == 200
+    payload = attribution_resp.get_json()
+    assert 'summary' in payload
+    assert 'by_run' in payload
+    assert 'by_source' in payload
+    assert 'by_scenario' in payload
+
+    assert any(item['scenario_id'] == scenario_id for item in payload['by_scenario'])
+    matched_runs = [item for item in payload['by_run'] if item['run_id'] == run_id]
+    assert matched_runs
+    row = matched_runs[0]
+    assert row['config_id'] == 'balanced'
+    assert row['scenario_id'] == scenario_id
+    assert isinstance(row['selected_sources'], list)
+
+
+def test_identity_and_scenario_trace_metrics_endpoints():
+    client = app.test_client()
+    article_id = next(iter(recommender.article_vectors.keys()))
+    source = recommender.extract_source(
+        recommender.article_vectors[article_id].get('metadata', {}).get('url', '')
+    )
+    scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
+
+    created = client.post(
+        '/api/scenarios',
+        json={
+            'scenario_id': scenario_id,
+            'name': 'Identity Trace Scenario',
+            'enabled': True,
+            'rule_set': {'include_sources': [source], 'max_age_days': 3650},
+        },
+    )
+    assert created.status_code == 201
+
+    rec_resp = client.post(
+        '/api/recommendations/query',
+        json={
+            'user_id': 'identity_user',
+            'external_user_id': 'identity-ext-1',
+            'user_reads': [article_id],
+            'top_n': 3,
+            'sources': [source],
+            'config_id': 'balanced',
+            'scenario_id': scenario_id,
+            'track_impressions': True,
+        },
+    )
+    assert rec_resp.status_code == 200
+    rec_payload = rec_resp.get_json()
+    run_id = rec_payload['run_id']
+
+    recs = rec_payload.get('recommendations') or []
+    if recs:
+        event_resp = client.post(
+            '/api/events',
+            json={
+                'events': [
+                    {
+                        'event_type': 'click',
+                        'run_id': run_id,
+                        'article_id': recs[0]['article_id'],
+                        'scenario_id': scenario_id,
+                        'external_user_id': 'identity-ext-1',
+                    }
+                ]
+            },
+        )
+        assert event_resp.status_code == 201
+
+    identity_resp = client.get('/api/metrics/identity?days=3650&limit_events=50000&limit_runs=1000')
+    assert identity_resp.status_code == 200
+    identity_payload = identity_resp.get_json()
+    assert 'summary' in identity_payload
+    assert 'top_external_users' in identity_payload
+    assert identity_payload['summary']['unique_external_users'] >= 1
+    assert any(item['external_user_id'] == 'identity-ext-1' for item in identity_payload['top_external_users'])
+
+    trace_resp = client.get(f'/api/metrics/scenario-traces?days=3650&limit_runs=1000&scenario_ids={scenario_id}')
+    assert trace_resp.status_code == 200
+    trace_payload = trace_resp.get_json()
+    assert 'summary' in trace_payload
+    assert 'scenarios' in trace_payload
+    assert trace_payload['summary']['runs_with_trace'] >= 1
+    assert any(item['scenario_id'] == scenario_id for item in trace_payload['scenarios'])
+
+
 def test_engine_config_endpoint():
     client = app.test_client()
     response = client.get('/api/engine/config')

@@ -180,3 +180,28 @@ def test_alert_incident_lifecycle_sqlite(tmp_path):
     assert resolved is True
     listed_resolved = store.list_alert_incidents(limit=10, offset=0, status='resolved', metric='ctr')
     assert listed_resolved
+
+
+def test_list_runs_with_request_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    run_id = store.persist_recommendation_run(
+        user_id='u1',
+        config_id='balanced',
+        config_version=1,
+        request_payload={
+            'user_id': 'u1',
+            'external_user_id': 'ext-1',
+            'scenario_id': 'homepage',
+            'scenario_trace': {'filtered_out': 1, 'remaining': 2, 'reasons': {'max_age_days': 1}},
+        },
+        recommendations=[
+            {'article_id': 'a1', 'score': 0.9, 'source': 'example.com', 'features': {}, 'feature_contributions': {}, 'explanation': 'x'}
+        ],
+        request_duration_ms=10,
+    )
+    rows = store.list_runs_with_request(limit=10, offset=0, days=30)
+    assert rows
+    assert rows[0]['run_id'] == run_id
+    assert rows[0]['request']['external_user_id'] == 'ext-1'
+    assert rows[0]['request']['scenario_id'] == 'homepage'
+    assert 'items' not in rows[0]

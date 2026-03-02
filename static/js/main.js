@@ -15,6 +15,9 @@ let reportingCtrChart = null;
 let reportingScenarioOverlayChart = null;
 let reportingFunnelChart = null;
 let reportingLastPayload = null;
+let reportingLastAttribution = null;
+let reportingLastIdentity = null;
+let reportingLastScenarioTraces = null;
 let recommendationRuns = [];
 
 function hasElement(id) {
@@ -25,7 +28,7 @@ function hasElement(id) {
 document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('article-list')) loadArticles();
     if (hasElement('article-stats')) loadStats();
-    if (hasElement('source-filters')) loadSources();
+    if (hasElement('source-filters') || hasElement('reporting-source-filter')) loadSources();
     if (hasElement('ranking-config')) loadRankingConfigs();
     if (hasElement('scenario-select') || hasElement('reporting-scenario-filter') || hasElement('scenario-id')) loadScenarios();
     if (hasElement('offline-metrics')) loadOfflineMetrics();
@@ -98,10 +101,13 @@ async function loadSources() {
         const data = await response.json();
         sourceOptions = data.sources || [];
         renderSourceFilters();
-        loadDecisionContext();
+        renderReportingSourceFilterOptions();
+        if (hasElement('decision-context')) loadDecisionContext();
+        if (hasElement('reporting-summary')) loadReportingWorkspace();
     } catch (error) {
         console.error('Error loading sources:', error);
-        document.getElementById('source-filters').innerHTML = `<span>Failed to load sources</span>`;
+        const sourceFilters = document.getElementById('source-filters');
+        if (sourceFilters) sourceFilters.innerHTML = `<span>Failed to load sources</span>`;
     }
 }
 
@@ -554,6 +560,7 @@ function setConnectorCardError(connectorId, message) {
 
 function renderSourceFilters() {
     const sourceFilters = document.getElementById('source-filters');
+    if (!sourceFilters) return;
     if (!sourceOptions.length) {
         sourceFilters.innerHTML = '<span>No source information available.</span>';
         return;
@@ -577,6 +584,18 @@ function renderSourceFilters() {
             </div>
         </div>
     `).join('');
+}
+
+function renderReportingSourceFilterOptions() {
+    const select = document.getElementById('reporting-source-filter');
+    if (!select) return;
+    const previous = select.value;
+    const options = ['<option value="">All sources</option>']
+        .concat(sourceOptions.map(item => `<option value="${item.source}">${item.source} (${item.article_count})</option>`));
+    select.innerHTML = options.join('');
+    if (previous && sourceOptions.some(item => item.source === previous)) {
+        select.value = previous;
+    }
 }
 
 function collectSourceSettingsFromUI() {
@@ -1521,27 +1540,148 @@ function renderReportingWorkspace(payload) {
     });
 }
 
+function renderReportingAttribution(payload) {
+    reportingLastAttribution = payload;
+    const attributionTable = document.getElementById('reporting-attribution-table');
+    if (attributionTable) {
+        const runRows = (payload.by_run || []).map(item => `
+            <tr>
+                <td><code>${item.run_id === 'untracked' ? 'untracked' : item.run_id.slice(0, 8)}</code></td>
+                <td>${item.config_id ? `${item.config_id} v${item.config_version}` : 'n/a'}</td>
+                <td>${item.scenario_name || item.scenario_id || 'default'}</td>
+                <td class="small">${(item.selected_sources || []).slice(0, 4).join(', ') || 'n/a'}</td>
+                <td>${item.impressions || 0}</td>
+                <td>${item.clicks || 0}</td>
+                <td>${item.conversions || 0}</td>
+                <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+                <td>${(Number(item.conversion_rate || 0) * 100).toFixed(2)}%</td>
+            </tr>
+        `).join('');
+        attributionTable.innerHTML = runRows || '<tr><td colspan="9" class="text-muted">No run attribution in selected window.</td></tr>';
+    }
+
+    const sourceTable = document.getElementById('reporting-source-table');
+    if (sourceTable) {
+        const sourceRows = (payload.by_source || []).map(item => `
+            <tr>
+                <td>${item.source || 'unknown'}</td>
+                <td>${item.impressions || 0}</td>
+                <td>${item.clicks || 0}</td>
+                <td>${item.conversions || 0}</td>
+                <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+                <td>${(Number(item.conversion_rate || 0) * 100).toFixed(2)}%</td>
+            </tr>
+        `).join('');
+        sourceTable.innerHTML = sourceRows || '<tr><td colspan="6" class="text-muted">No source attribution in selected window.</td></tr>';
+    }
+}
+
+function renderIdentityMetrics(payload) {
+    reportingLastIdentity = payload;
+    const summary = payload.summary || {};
+    const summaryEl = document.getElementById('reporting-identity-summary');
+    if (summaryEl) {
+        summaryEl.innerHTML = `
+            <strong>Identity coverage:</strong>
+            external events ${(Number(summary.external_event_share || 0) * 100).toFixed(2)}%,
+            runs with external ID ${(Number(summary.run_external_share || 0) * 100).toFixed(2)}%
+            | unique external users ${summary.unique_external_users ?? 0}
+            | unique users ${summary.unique_users ?? 0}
+        `;
+    }
+    const table = document.getElementById('reporting-identity-table');
+    if (table) {
+        const rows = (payload.top_external_users || []).map(item => `
+            <tr>
+                <td><code>${item.external_user_id}</code></td>
+                <td>${item.events || 0}</td>
+                <td>${item.impressions || 0}</td>
+                <td>${item.clicks || 0}</td>
+                <td>${item.conversions || 0}</td>
+                <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+                <td>${item.scenario_count || 0}</td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="7" class="text-muted">No external ID events in selected window.</td></tr>';
+    }
+}
+
+function renderScenarioTraceMetrics(payload) {
+    reportingLastScenarioTraces = payload;
+    const table = document.getElementById('reporting-scenario-trace-table');
+    if (!table) return;
+    const rows = (payload.scenarios || []).map(item => `
+        <tr>
+            <td>${item.name || item.scenario_id}</td>
+            <td>${item.runs || 0}</td>
+            <td>${item.filtered_out || 0}</td>
+            <td>${item.remaining || 0}</td>
+            <td>${(Number(item.drop_rate || 0) * 100).toFixed(2)}%</td>
+            <td class="small">${(item.top_rules || []).map(rule => `${rule.rule}:${rule.count}`).join(' | ') || 'n/a'}</td>
+        </tr>
+    `).join('');
+    table.innerHTML = rows || '<tr><td colspan="6" class="text-muted">No scenario trace data in selected window.</td></tr>';
+}
+
 async function loadReportingWorkspace() {
     try {
         const days = Number(document.getElementById('reporting-days')?.value || 30);
         const scenarioIds = getSelectedReportingScenarioIds();
         const source = (document.getElementById('reporting-source-filter')?.value || '').trim();
+        const topRunsRaw = Number(document.getElementById('reporting-top-runs')?.value || 30);
+        const topRuns = Number.isFinite(topRunsRaw) ? Math.max(5, Math.min(200, Math.round(topRunsRaw))) : 30;
         const params = new URLSearchParams({
             days: String(Number.isFinite(days) && days > 0 ? Math.round(days) : 30),
             limit: '50000'
         });
         if (scenarioIds.length) params.set('scenario_ids', scenarioIds.join(','));
         if (source) params.set('source', source);
-        const response = await fetch(`/api/metrics/trends?${params.toString()}`);
-        if (!response.ok) {
-            const error = await response.json();
+        const attributionParams = new URLSearchParams(params);
+        attributionParams.set('top_runs', String(topRuns));
+
+        const [trendsResponse, attributionResponse, identityResponse, traceResponse] = await Promise.all([
+            fetch(`/api/metrics/trends?${params.toString()}`),
+            fetch(`/api/metrics/attribution?${attributionParams.toString()}`),
+            fetch(`/api/metrics/identity?days=${params.get('days')}&limit_events=50000&limit_runs=1000&top_external=25`),
+            fetch(`/api/metrics/scenario-traces?days=${params.get('days')}&limit_runs=1000${scenarioIds.length ? `&scenario_ids=${encodeURIComponent(scenarioIds.join(','))}` : ''}`)
+        ]);
+        if (!trendsResponse.ok) {
+            const error = await trendsResponse.json();
             throw new Error(error.error || 'Failed to load reporting trends');
         }
-        const payload = await response.json();
-        renderReportingWorkspace(payload);
+        if (!attributionResponse.ok) {
+            const error = await attributionResponse.json();
+            throw new Error(error.error || 'Failed to load attribution trends');
+        }
+        if (!identityResponse.ok) {
+            const error = await identityResponse.json();
+            throw new Error(error.error || 'Failed to load identity analytics');
+        }
+        if (!traceResponse.ok) {
+            const error = await traceResponse.json();
+            throw new Error(error.error || 'Failed to load scenario trace analytics');
+        }
+        const trendsPayload = await trendsResponse.json();
+        const attributionPayload = await attributionResponse.json();
+        const identityPayload = await identityResponse.json();
+        const tracePayload = await traceResponse.json();
+        renderReportingWorkspace(trendsPayload);
+        renderReportingAttribution(attributionPayload);
+        renderIdentityMetrics(identityPayload);
+        renderScenarioTraceMetrics(tracePayload);
     } catch (error) {
         document.getElementById('reporting-summary').textContent = `Reporting unavailable: ${error.message}`;
         document.getElementById('reporting-scenario-table').innerHTML = '<tr><td colspan="5" class="text-danger">Failed to load reporting data.</td></tr>';
+        const attributionTable = document.getElementById('reporting-attribution-table');
+        const sourceTable = document.getElementById('reporting-source-table');
+        const identitySummary = document.getElementById('reporting-identity-summary');
+        const identityTable = document.getElementById('reporting-identity-table');
+        const traceTable = document.getElementById('reporting-scenario-trace-table');
+        if (attributionTable) attributionTable.innerHTML = '<tr><td colspan="9" class="text-danger">Failed to load attribution data.</td></tr>';
+        if (sourceTable) sourceTable.innerHTML = '<tr><td colspan="6" class="text-danger">Failed to load attribution data.</td></tr>';
+        if (identitySummary) identitySummary.textContent = `Identity analytics unavailable: ${error.message}`;
+        if (identityTable) identityTable.innerHTML = '<tr><td colspan="7" class="text-danger">Failed to load identity analytics.</td></tr>';
+        if (traceTable) traceTable.innerHTML = '<tr><td colspan="6" class="text-danger">Failed to load scenario trace analytics.</td></tr>';
     }
 }
 
@@ -1559,6 +1699,54 @@ function exportReportingCsv() {
     (reportingLastPayload.scenarios || []).forEach(item => {
         rows.push([item.scenario_id, item.name, item.impressions, item.clicks, item.conversions, item.ctr]);
     });
+    if (reportingLastAttribution) {
+        rows.push([]);
+        rows.push(['run_id', 'config_id', 'config_version', 'scenario_id', 'selected_sources', 'impressions', 'clicks', 'conversions', 'ctr', 'conversion_rate']);
+        (reportingLastAttribution.by_run || []).forEach(item => {
+            rows.push([
+                item.run_id,
+                item.config_id,
+                item.config_version,
+                item.scenario_id,
+                (item.selected_sources || []).join('|'),
+                item.impressions,
+                item.clicks,
+                item.conversions,
+                item.ctr,
+                item.conversion_rate
+            ]);
+        });
+    }
+    if (reportingLastIdentity) {
+        rows.push([]);
+        rows.push(['external_user_id', 'events', 'impressions', 'clicks', 'conversions', 'ctr', 'scenario_count']);
+        (reportingLastIdentity.top_external_users || []).forEach(item => {
+            rows.push([
+                item.external_user_id,
+                item.events,
+                item.impressions,
+                item.clicks,
+                item.conversions,
+                item.ctr,
+                item.scenario_count
+            ]);
+        });
+    }
+    if (reportingLastScenarioTraces) {
+        rows.push([]);
+        rows.push(['scenario_id', 'scenario_name', 'runs', 'filtered_out', 'remaining', 'drop_rate', 'top_rules']);
+        (reportingLastScenarioTraces.scenarios || []).forEach(item => {
+            rows.push([
+                item.scenario_id,
+                item.name,
+                item.runs,
+                item.filtered_out,
+                item.remaining,
+                item.drop_rate,
+                (item.top_rules || []).map(rule => `${rule.rule}:${rule.count}`).join('|')
+            ]);
+        });
+    }
     const csv = rows.map(row => row.map(toCsvCell).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -1962,6 +2150,7 @@ function setupEventListeners() {
     on('reporting-days', 'change', loadReportingWorkspace);
     on('reporting-scenario-filter', 'change', loadReportingWorkspace);
     on('reporting-source-filter', 'change', loadReportingWorkspace);
+    on('reporting-top-runs', 'change', loadReportingWorkspace);
     on('refresh-run-explorer', 'click', loadRecommendationRuns);
     on('run-limit', 'change', loadRecommendationRuns);
     on('run-list', 'click', async (event) => {

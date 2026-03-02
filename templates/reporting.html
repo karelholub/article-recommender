@@ -12,17 +12,23 @@
             </div>
             <div class="card-body">
                 <div class="row g-2 mb-2">
-                    <div class="col-md-3">
+                    <div class="col-md-2">
                         <label class="form-label small mb-1" for="reporting-days">Window (days)</label>
                         <input id="reporting-days" class="form-control form-control-sm" type="number" min="1" max="365" value="30">
                     </div>
-                    <div class="col-md-5">
+                    <div class="col-md-4">
                         <label class="form-label small mb-1" for="reporting-scenario-filter">Scenarios (multi-select)</label>
                         <select id="reporting-scenario-filter" class="form-select form-select-sm" multiple size="3"></select>
                     </div>
                     <div class="col-md-4">
                         <label class="form-label small mb-1" for="reporting-source-filter">Source</label>
-                        <input id="reporting-source-filter" class="form-control form-control-sm" placeholder="e.g., www.e15.cz">
+                        <select id="reporting-source-filter" class="form-select form-select-sm">
+                            <option value="">All sources</option>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label small mb-1" for="reporting-top-runs">Top runs</label>
+                        <input id="reporting-top-runs" class="form-control form-control-sm" type="number" min="5" max="200" value="30">
                     </div>
                 </div>
                 <div id="reporting-summary" class="small text-muted mb-2">Loading reporting metrics...</div>
@@ -36,6 +42,48 @@
                     <table class="table table-sm mb-0">
                         <thead><tr><th>Scenario</th><th>Impressions</th><th>Clicks</th><th>Conversions</th><th>CTR</th></tr></thead>
                         <tbody id="reporting-scenario-table"><tr><td colspan="5" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+                <hr>
+                <div class="small text-muted mb-2">
+                    Attribution drilldown combines event stream with recommendation run metadata (config version + requested sources).
+                </div>
+                <div class="table-responsive mb-3">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr>
+                                <th>Run</th><th>Config</th><th>Scenario</th><th>Selected Sources</th>
+                                <th>Impressions</th><th>Clicks</th><th>Conv.</th><th>CTR</th><th>CVR</th>
+                            </tr>
+                        </thead>
+                        <tbody id="reporting-attribution-table"><tr><td colspan="9" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr><th>Source</th><th>Impressions</th><th>Clicks</th><th>Conv.</th><th>CTR</th><th>CVR</th></tr>
+                        </thead>
+                        <tbody id="reporting-source-table"><tr><td colspan="6" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+                <hr>
+                <div id="reporting-identity-summary" class="small text-muted mb-2">Loading identity analytics...</div>
+                <div class="table-responsive mb-3">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr><th>External User ID</th><th>Events</th><th>Impressions</th><th>Clicks</th><th>Conv.</th><th>CTR</th><th>Scenarios</th></tr>
+                        </thead>
+                        <tbody id="reporting-identity-table"><tr><td colspan="7" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="small text-muted mb-2">Scenario trace analytics aggregates persisted `scenario_trace` outcomes from recommendation runs.</div>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr><th>Scenario</th><th>Runs</th><th>Filtered Out</th><th>Remaining</th><th>Drop Rate</th><th>Top Rules</th></tr>
+                        </thead>
+                        <tbody id="reporting-scenario-trace-table"><tr><td colspan="6" class="text-muted">Loading...</td></tr></tbody>
                     </table>
                 </div>
             </div>

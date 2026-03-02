@@ -47,6 +47,14 @@ class BaseRecommenderStore:
     def list_runs(self, limit: int = 20, offset: int = 0) -> List[Dict]:
         raise NotImplementedError
 
+    def list_runs_with_request(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        days: Optional[int] = None,
+    ) -> List[Dict]:
+        raise NotImplementedError
+
     def get_run(self, run_id: str) -> Optional[Dict]:
         raise NotImplementedError
 
@@ -423,6 +431,15 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                 CREATE INDEX IF NOT EXISTS idx_recommendation_events_article
                     ON recommendation_events(article_id, created_at);
 
+                CREATE INDEX IF NOT EXISTS idx_recommendation_events_run
+                    ON recommendation_events(run_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_recommendation_events_external_user
+                    ON recommendation_events(external_user_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
+                    ON recommendation_runs(created_at);
+
                 CREATE INDEX IF NOT EXISTS idx_api_idempotency_created_at
                     ON api_idempotency_keys(created_at);
 
@@ -610,6 +627,45 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                 "config_id": row["config_id"],
                 "config_version": int(row["config_version"]),
                 "summary": json.loads(row["summary_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def list_runs_with_request(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        days: Optional[int] = None,
+    ) -> List[Dict]:
+        clauses = []
+        params: List = []
+        if days is not None:
+            cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d %H:%M:%S")
+            clauses.append("created_at >= ?")
+            params.append(cutoff)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT run_id, user_id, config_id, config_version, request_json, summary_json, created_at
+                FROM recommendation_runs
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                OFFSET ?
+                """,
+                (*params, int(limit), int(offset)),
+            ).fetchall()
+
+        return [
+            {
+                "run_id": row["run_id"],
+                "user_id": row["user_id"],
+                "config_id": row["config_id"],
+                "config_version": int(row["config_version"]),
+                "request": json.loads(row["request_json"] or "{}"),
+                "summary": json.loads(row["summary_json"] or "{}"),
                 "created_at": row["created_at"],
             }
             for row in rows
@@ -1908,6 +1964,24 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 )
                 cur.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_recommendation_events_run
+                    ON recommendation_events(run_id, created_at);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_recommendation_events_external_user
+                    ON recommendation_events(external_user_id, created_at);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
+                    ON recommendation_runs(created_at);
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_api_idempotency_created_at
                     ON api_idempotency_keys(created_at);
                     """
@@ -2117,6 +2191,47 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 "config_version": int(row[3]),
                 "summary": json.loads(row[4]),
                 "created_at": row[5].strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            for row in rows
+        ]
+
+    def list_runs_with_request(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        days: Optional[int] = None,
+    ) -> List[Dict]:
+        clauses = []
+        params: List = []
+        if days is not None:
+            cutoff = datetime.now(UTC) - timedelta(days=max(1, int(days)))
+            clauses.append("created_at >= %s")
+            params.append(cutoff)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT run_id::text, user_id, config_id, config_version, request_json::text, summary_json::text, created_at
+                    FROM recommendation_runs
+                    {where}
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    OFFSET %s
+                    """,
+                    (*params, int(limit), int(offset)),
+                )
+                rows = cur.fetchall()
+
+        return [
+            {
+                "run_id": row[0],
+                "user_id": row[1],
+                "config_id": row[2],
+                "config_version": int(row[3]),
+                "request": json.loads(row[4] or "{}"),
+                "summary": json.loads(row[5] or "{}"),
+                "created_at": row[6].strftime("%Y-%m-%d %H:%M:%S"),
             }
             for row in rows
         ]

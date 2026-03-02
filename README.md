@@ -197,6 +197,9 @@ python embed.py
 - `GET /api/metrics/scenarios?days=30&top_articles=5`: Scenario-level reporting (impressions, clicks, CTR, conversions, top articles)
 - `GET /api/metrics/scenarios/<scenario_id>/sources?days=30`: Scenario KPI breakdown by source domain
 - `GET /api/metrics/trends?days=30&scenario_ids=homepage&source=www.e15.cz`: Daily trends for impressions/clicks/conversions/CTR (supports filters)
+- `GET /api/metrics/attribution?days=30&scenario_ids=homepage&source=www.e15.cz&top_runs=30`: Run/source/scenario attribution drilldown (includes config version + selected source traces)
+- `GET /api/metrics/identity?days=30&limit_events=50000&limit_runs=1000&top_external=25`: External-ID analytics (cross-device coverage, top external users, scenario external-share)
+- `GET /api/metrics/scenario-traces?days=30&limit_runs=1000&scenario_ids=homepage&top_rules=25`: Aggregated scenario trace/rule impact diagnostics from persisted recommendation runs
 - `GET /api/engine/config`: Full runtime engine configuration snapshot (sources/configs/scenarios/scheduler)
   - alias: `/api/v1/engine/config`
 - `GET /api/observability/overview?days=7`: SLA-oriented operational snapshot (recommendation latency stats, events throughput, connector failure rate)
