@@ -38,6 +38,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('sli-overview')) loadSliOverview();
     if (hasElement('alert-incidents')) loadAlertIncidents();
     if (hasElement('cleanup-status')) loadCleanupStatus();
+    if (hasElement('rollups-status')) loadRollupsStatus();
     if (hasElement('engine-config-snapshot')) loadEngineConfigSnapshot();
     if (hasElement('audit-logs-list')) loadAuditLogs();
     if (hasElement('run-list')) loadRecommendationRuns();
@@ -189,6 +190,10 @@ function renderConnectors() {
                 <div class="text-muted small">
                     Last status: ${metric.last_status || 'none'}
                     ${typeof metric.success_rate === 'number' ? ` | Success ${(metric.success_rate * 100).toFixed(0)}%` : ''}
+                </div>
+                <div class="text-muted small">
+                    Health: ${metric.health_state || 'unknown'}
+                    ${metric.last_error_code ? ` | Last error: ${metric.last_error_code}` : ''}
                 </div>
                 <div class="row g-2 mt-1">
                     <div class="col-4">
@@ -1328,6 +1333,59 @@ async function runCleanupNow() {
     `;
 }
 
+async function loadRollupsStatus() {
+    const container = document.getElementById('rollups-status');
+    if (!container) return;
+    try {
+        const daysRaw = Number(document.getElementById('rollups-days')?.value || 30);
+        const days = Number.isFinite(daysRaw) ? Math.max(1, Math.min(365, Math.round(daysRaw))) : 30;
+        const response = await fetch(`/api/metrics/rollups/daily?days=${days}`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load rollups');
+        }
+        const payload = await response.json();
+        const totals = (payload.rows || []).reduce((acc, row) => {
+            acc.impressions += Number(row.impressions || 0);
+            acc.clicks += Number(row.clicks || 0);
+            acc.conversions += Number(row.conversions || 0);
+            return acc;
+        }, { impressions: 0, clicks: 0, conversions: 0 });
+        container.innerHTML = `
+            <div><strong>Rows:</strong> ${payload.count ?? 0}</div>
+            <div><strong>Window:</strong> ${payload.window_days} days</div>
+            <div><strong>Aggregated events:</strong> impressions ${totals.impressions}, clicks ${totals.clicks}, conversions ${totals.conversions}</div>
+        `;
+    } catch (error) {
+        container.textContent = `Rollup status unavailable: ${error.message}`;
+    }
+}
+
+async function rebuildRollups() {
+    const container = document.getElementById('rollups-status');
+    if (container) container.textContent = 'Rebuilding rollups...';
+    const daysRaw = Number(document.getElementById('rollups-days')?.value || 30);
+    const days = Number.isFinite(daysRaw) ? Math.max(1, Math.min(365, Math.round(daysRaw))) : 30;
+    const response = await fetch('/api/metrics/rollups/rebuild', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ days, actor_id: getOperatorId() || undefined })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to rebuild rollups');
+    }
+    const payload = await response.json();
+    if (container) {
+        container.innerHTML = `
+            <div><strong>Rebuild done.</strong></div>
+            <div>Rows: ${payload.rows_upserted ?? 0}</div>
+            <div>Window start day: ${payload.window_start_day || 'n/a'}</div>
+            <div>Rebuilt at: ${payload.rebuilt_at || 'n/a'}</div>
+        `;
+    }
+}
+
 async function loadDecisionContext() {
     const container = document.getElementById('decision-context');
     if (!container) return;
@@ -1823,16 +1881,50 @@ function renderRecommendationRunDetail(run) {
     `).join('') || '<tr><td colspan="4" class="text-muted">No items.</td></tr>';
 }
 
+function renderRunDecisionFlow(flow) {
+    const summary = document.getElementById('run-decision-flow-summary');
+    const table = document.getElementById('run-decision-flow-table');
+    if (!summary || !table) return;
+    const trace = flow.scenario_trace_summary || {};
+    summary.innerHTML = `
+        <strong>Scenario:</strong> ${flow.scenario_id || 'none'}
+        | <strong>Applied:</strong> ${trace.applied ? 'yes' : 'no'}
+        | <strong>Filtered out:</strong> ${trace.filtered_out ?? 0}
+        | <strong>Remaining:</strong> ${trace.remaining ?? 0}
+    `;
+    const rows = (flow.decisions || []).map(item => `
+        <tr>
+            <td>${item.position ?? ''}</td>
+            <td><code>${item.article_id || 'n/a'}</code><div class="small text-muted">${item.source || 'unknown'}</div></td>
+            <td>${item.status || 'n/a'}</td>
+            <td>${item.score_before == null ? 'n/a' : Number(item.score_before).toFixed(4)}</td>
+            <td>${item.boost == null ? 'n/a' : Number(item.boost).toFixed(3)}</td>
+            <td>${item.score_after == null ? 'n/a' : Number(item.score_after).toFixed(4)}</td>
+            <td>${item.reason || 'n/a'}</td>
+            <td>${item.final_rank ?? 'n/a'}</td>
+        </tr>
+    `).join('');
+    table.innerHTML = rows || '<tr><td colspan="8" class="text-muted">No scenario decisions for this run.</td></tr>';
+}
+
 async function loadRecommendationRunDetail(runId) {
     const summary = document.getElementById('run-detail-summary');
     summary.textContent = `Loading run ${runId}...`;
-    const response = await fetch(`/api/recommendation-runs/${encodeURIComponent(runId)}`);
-    if (!response.ok) {
-        const error = await response.json();
+    const [runResponse, flowResponse] = await Promise.all([
+        fetch(`/api/recommendation-runs/${encodeURIComponent(runId)}`),
+        fetch(`/api/recommendation-runs/${encodeURIComponent(runId)}/decision-flow`)
+    ]);
+    if (!runResponse.ok) {
+        const error = await runResponse.json();
         throw new Error(error.error || 'Failed to load run detail');
     }
-    const payload = await response.json();
-    renderRecommendationRunDetail(payload);
+    if (!flowResponse.ok) {
+        const error = await flowResponse.json();
+        throw new Error(error.error || 'Failed to load run decision flow');
+    }
+    const [runPayload, flowPayload] = await Promise.all([runResponse.json(), flowResponse.json()]);
+    renderRecommendationRunDetail(runPayload);
+    renderRunDecisionFlow(flowPayload);
 }
 
 async function loadStats() {
@@ -2288,6 +2380,16 @@ function setupEventListeners() {
         }
     });
     on('refresh-cleanup-status', 'click', loadCleanupStatus);
+    on('refresh-rollups-status', 'click', loadRollupsStatus);
+    on('rollups-days', 'change', loadRollupsStatus);
+    on('rebuild-rollups', 'click', async () => {
+        try {
+            await rebuildRollups();
+            if (hasElement('reporting-summary')) await loadReportingWorkspace();
+        } catch (error) {
+            showError(error.message || 'Failed to rebuild rollups');
+        }
+    });
     on('run-cleanup-now', 'click', async () => {
         try {
             await runCleanupNow();

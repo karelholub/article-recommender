@@ -162,6 +162,14 @@ def test_recommendation_query_persists_run_and_exposes_metrics():
     run_payload = run_detail_resp.get_json()
     assert run_payload['run_id'] == payload['run_id']
     assert 'items' in run_payload
+    assert 'scenario_trace' in run_payload.get('request', {})
+
+    flow_resp = client.get(f"/api/recommendation-runs/{payload['run_id']}/decision-flow")
+    assert flow_resp.status_code == 200
+    flow_payload = flow_resp.get_json()
+    assert flow_payload['run_id'] == payload['run_id']
+    assert 'decisions' in flow_payload
+    assert 'scenario_trace_summary' in flow_payload
 
     runs_list_resp = client.get('/api/recommendation-runs?limit=5')
     assert runs_list_resp.status_code == 200
@@ -833,6 +841,25 @@ def test_identity_and_scenario_trace_metrics_endpoints():
     assert 'scenarios' in trace_payload
     assert trace_payload['summary']['runs_with_trace'] >= 1
     assert any(item['scenario_id'] == scenario_id for item in trace_payload['scenarios'])
+
+
+def test_rollup_metrics_endpoints():
+    client = app.test_client()
+    rebuild_resp = client.post('/api/metrics/rollups/rebuild', json={'days': 30})
+    assert rebuild_resp.status_code == 200
+    rebuilt = rebuild_resp.get_json()
+    assert 'rows_upserted' in rebuilt
+
+    daily_resp = client.get('/api/metrics/rollups/daily?days=30')
+    assert daily_resp.status_code == 200
+    daily_payload = daily_resp.get_json()
+    assert 'rows' in daily_payload
+    assert 'count' in daily_payload
+
+    trends_resp = client.get('/api/metrics/trends?days=30')
+    assert trends_resp.status_code == 200
+    trends_payload = trends_resp.get_json()
+    assert 'rollups_used' in trends_payload
 
 
 def test_engine_config_endpoint():

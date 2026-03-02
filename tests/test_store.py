@@ -205,3 +205,33 @@ def test_list_runs_with_request_sqlite(tmp_path):
     assert rows[0]['request']['external_user_id'] == 'ext-1'
     assert rows[0]['request']['scenario_id'] == 'homepage'
     assert 'items' not in rows[0]
+
+
+def test_event_rollups_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    store.record_events(
+        [
+            {
+                'event_type': 'impression',
+                'run_id': None,
+                'article_id': 'a1',
+                'scenario_id': 'homepage',
+                'user_id': 'u1',
+                'metadata': {'source': 'example.com'},
+            },
+            {
+                'event_type': 'click',
+                'run_id': None,
+                'article_id': 'a1',
+                'scenario_id': 'homepage',
+                'user_id': 'u1',
+                'metadata': {'source': 'example.com'},
+            },
+        ]
+    )
+    rebuilt = store.rebuild_event_rollups(days=30)
+    assert rebuilt['rows_upserted'] >= 1
+    rows = store.list_event_rollups(days=30, scenario_ids=['homepage'], source='example.com')
+    assert rows
+    assert rows[0]['impressions'] >= 1
+    assert rows[0]['clicks'] >= 1

@@ -145,6 +145,17 @@ class BaseRecommenderStore:
     ) -> List[Dict]:
         raise NotImplementedError
 
+    def rebuild_event_rollups(self, days: int = 30) -> Dict:
+        raise NotImplementedError
+
+    def list_event_rollups(
+        self,
+        days: int = 30,
+        scenario_ids: Optional[List[str]] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict]:
+        raise NotImplementedError
+
     def get_idempotency_record(self, endpoint: str, key: str, max_age_hours: int = 24) -> Optional[Dict]:
         raise NotImplementedError
 
@@ -399,6 +410,17 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS event_rollups_daily (
+                    day TEXT NOT NULL,
+                    scenario_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    impressions INTEGER NOT NULL DEFAULT 0,
+                    clicks INTEGER NOT NULL DEFAULT 0,
+                    conversions INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (day, scenario_id, source)
+                );
+
                 CREATE TABLE IF NOT EXISTS alert_thresholds (
                     threshold_id TEXT PRIMARY KEY,
                     thresholds_json TEXT NOT NULL,
@@ -439,6 +461,12 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
 
                 CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
                     ON recommendation_runs(created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_event_rollups_day
+                    ON event_rollups_daily(day);
+
+                CREATE INDEX IF NOT EXISTS idx_event_rollups_scenario_source
+                    ON event_rollups_daily(scenario_id, source, day);
 
                 CREATE INDEX IF NOT EXISTS idx_api_idempotency_created_at
                     ON api_idempotency_keys(created_at);
@@ -1541,6 +1569,84 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
             for row in rows
         ]
 
+    def rebuild_event_rollups(self, days: int = 30) -> Dict:
+        days = max(1, int(days))
+        cutoff_ts = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_day = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+        now = self._now()
+        with self._managed_connection() as conn:
+            conn.execute(
+                "DELETE FROM event_rollups_daily WHERE day >= ?",
+                (cutoff_day,),
+            )
+            conn.execute(
+                """
+                INSERT INTO event_rollups_daily (day, scenario_id, source, impressions, clicks, conversions, updated_at)
+                SELECT
+                    substr(created_at, 1, 10) AS day,
+                    COALESCE(NULLIF(scenario_id, ''), 'default') AS scenario_id,
+                    COALESCE(NULLIF(json_extract(metadata_json, '$.source'), ''), 'unknown') AS source,
+                    SUM(CASE WHEN event_type = 'impression' THEN 1 ELSE 0 END) AS impressions,
+                    SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END) AS clicks,
+                    SUM(CASE WHEN event_type = 'conversion' THEN 1 ELSE 0 END) AS conversions,
+                    ? AS updated_at
+                FROM recommendation_events
+                WHERE created_at >= ?
+                GROUP BY substr(created_at, 1, 10), COALESCE(NULLIF(scenario_id, ''), 'default'), COALESCE(NULLIF(json_extract(metadata_json, '$.source'), ''), 'unknown')
+                """,
+                (now, cutoff_ts),
+            )
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM event_rollups_daily WHERE day >= ?",
+                (cutoff_day,),
+            ).fetchone()
+        return {
+            "days": days,
+            "rows_upserted": int(row["c"] if row else 0),
+            "window_start_day": cutoff_day,
+            "rebuilt_at": now,
+        }
+
+    def list_event_rollups(
+        self,
+        days: int = 30,
+        scenario_ids: Optional[List[str]] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict]:
+        days = max(1, int(days))
+        cutoff_day = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+        clauses = ["day >= ?"]
+        params: List = [cutoff_day]
+        if scenario_ids:
+            placeholders = ",".join(["?"] * len(scenario_ids))
+            clauses.append(f"scenario_id IN ({placeholders})")
+            params.extend(scenario_ids)
+        if source:
+            clauses.append("source = ?")
+            params.append(source)
+        where = f"WHERE {' AND '.join(clauses)}"
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT day, scenario_id, source, impressions, clicks, conversions
+                FROM event_rollups_daily
+                {where}
+                ORDER BY day ASC, scenario_id ASC, source ASC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "day": row["day"],
+                "scenario_id": row["scenario_id"],
+                "source": row["source"],
+                "impressions": int(row["impressions"] or 0),
+                "clicks": int(row["clicks"] or 0),
+                "conversions": int(row["conversions"] or 0),
+            }
+            for row in rows
+        ]
+
     def compute_scenario_metrics(self, days: int = 30, top_articles: int = 5) -> Dict:
         cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d %H:%M:%S")
         with self._managed_connection() as conn:
@@ -1946,6 +2052,20 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 )
                 cur.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS event_rollups_daily (
+                        day DATE NOT NULL,
+                        scenario_id TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        impressions BIGINT NOT NULL DEFAULT 0,
+                        clicks BIGINT NOT NULL DEFAULT 0,
+                        conversions BIGINT NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (day, scenario_id, source)
+                    );
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_recommendation_events_created_at
                     ON recommendation_events(created_at);
                     """
@@ -1978,6 +2098,18 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                     """
                     CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
                     ON recommendation_runs(created_at);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_event_rollups_day
+                    ON event_rollups_daily(day);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_event_rollups_scenario_source
+                    ON event_rollups_daily(scenario_id, source, day);
                     """
                 )
                 cur.execute(
@@ -2750,6 +2882,87 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 "event_value": float(row[8]),
                 "metadata": json.loads(row[9] or "{}"),
                 "created_at": row[10].strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            for row in rows
+        ]
+
+    def rebuild_event_rollups(self, days: int = 30) -> Dict:
+        days = max(1, int(days))
+        cutoff_dt = datetime.now(UTC) - timedelta(days=days)
+        cutoff_day = cutoff_dt.strftime("%Y-%m-%d")
+        now = datetime.now(UTC)
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM event_rollups_daily WHERE day >= %s::date",
+                    (cutoff_day,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO event_rollups_daily (day, scenario_id, source, impressions, clicks, conversions, updated_at)
+                    SELECT
+                        DATE(created_at AT TIME ZONE 'UTC') AS day,
+                        COALESCE(NULLIF(scenario_id, ''), 'default') AS scenario_id,
+                        COALESCE(NULLIF(metadata_json->>'source', ''), 'unknown') AS source,
+                        SUM(CASE WHEN event_type = 'impression' THEN 1 ELSE 0 END) AS impressions,
+                        SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END) AS clicks,
+                        SUM(CASE WHEN event_type = 'conversion' THEN 1 ELSE 0 END) AS conversions,
+                        %s
+                    FROM recommendation_events
+                    WHERE created_at >= %s
+                    GROUP BY DATE(created_at AT TIME ZONE 'UTC'), COALESCE(NULLIF(scenario_id, ''), 'default'), COALESCE(NULLIF(metadata_json->>'source', ''), 'unknown')
+                    """,
+                    (now, cutoff_dt),
+                )
+                cur.execute(
+                    "SELECT COUNT(*) FROM event_rollups_daily WHERE day >= %s::date",
+                    (cutoff_day,),
+                )
+                row = cur.fetchone()
+        return {
+            "days": days,
+            "rows_upserted": int(row[0] if row else 0),
+            "window_start_day": cutoff_day,
+            "rebuilt_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def list_event_rollups(
+        self,
+        days: int = 30,
+        scenario_ids: Optional[List[str]] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict]:
+        days = max(1, int(days))
+        cutoff_dt = datetime.now(UTC) - timedelta(days=days)
+        clauses = ["day >= %s::date"]
+        params: List = [cutoff_dt.strftime("%Y-%m-%d")]
+        if scenario_ids:
+            clauses.append("scenario_id = ANY(%s)")
+            params.append(scenario_ids)
+        if source:
+            clauses.append("source = %s")
+            params.append(source)
+        where = f"WHERE {' AND '.join(clauses)}"
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT day, scenario_id, source, impressions, clicks, conversions
+                    FROM event_rollups_daily
+                    {where}
+                    ORDER BY day ASC, scenario_id ASC, source ASC
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "day": row[0].strftime("%Y-%m-%d"),
+                "scenario_id": row[1],
+                "source": row[2],
+                "impressions": int(row[3] or 0),
+                "clicks": int(row[4] or 0),
+                "conversions": int(row[5] or 0),
             }
             for row in rows
         ]

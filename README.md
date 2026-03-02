@@ -185,6 +185,7 @@ python embed.py
 - `POST /api/recommendation-context`: Resolve effective source/config context without executing ranking
 - `GET /api/recommendation-runs?limit=20`: Recent recommendation runs
 - `GET /api/recommendation-runs/<run_id>`: Full trace for one run
+- `GET /api/recommendation-runs/<run_id>/decision-flow`: Per-item scenario decision waterfall (kept/filtered, score before/after, boost, reason, final rank)
 - `GET /api/metrics/offline?limit_runs=100`: Offline aggregate metrics from stored runs
 - `POST /api/recommendations/cms`: CMS-style recommendation integration payload (external ID + placement + trace)
   - supports `Idempotency-Key` header
@@ -200,6 +201,8 @@ python embed.py
 - `GET /api/metrics/attribution?days=30&scenario_ids=homepage&source=www.e15.cz&top_runs=30`: Run/source/scenario attribution drilldown (includes config version + selected source traces)
 - `GET /api/metrics/identity?days=30&limit_events=50000&limit_runs=1000&top_external=25`: External-ID analytics (cross-device coverage, top external users, scenario external-share)
 - `GET /api/metrics/scenario-traces?days=30&limit_runs=1000&scenario_ids=homepage&top_rules=25`: Aggregated scenario trace/rule impact diagnostics from persisted recommendation runs
+- `POST /api/metrics/rollups/rebuild`: Rebuild daily event rollups for reporting windows
+- `GET /api/metrics/rollups/daily?days=30&scenario_ids=homepage&source=www.e15.cz`: Inspect persisted daily rollup rows
 - `GET /api/engine/config`: Full runtime engine configuration snapshot (sources/configs/scenarios/scheduler)
   - alias: `/api/v1/engine/config`
 - `GET /api/observability/overview?days=7`: SLA-oriented operational snapshot (recommendation latency stats, events throughput, connector failure rate)

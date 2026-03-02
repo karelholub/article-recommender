@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,14 +71,17 @@ class ConnectorIngestionService:
         attempted = 0
         ingested = 0
         skipped_existing = 0
+        retries = max(0, int(config.get("request_retries", 2)))
+        backoff_ms = max(0, int(config.get("request_backoff_ms", 300)))
 
         try:
             if connector_type == "rss":
-                candidates = self._collect_from_rss(config, max_articles)
+                candidates, collection_errors = self._collect_from_rss(config, max_articles, retries, backoff_ms)
             elif connector_type == "section_scraper":
-                candidates = self._collect_from_section(config, max_articles)
+                candidates, collection_errors = self._collect_from_section(config, max_articles, retries, backoff_ms)
             else:
                 raise ValueError(f"Unsupported connector type: {connector_type}")
+            errors.extend(collection_errors)
         except Exception as exc:
             errors.append(str(exc))
             return IngestResult(connector_id, attempted, ingested, skipped_existing, errors)
@@ -139,13 +143,19 @@ class ConnectorIngestionService:
             encoding="utf-8",
         )
 
-    def _collect_from_rss(self, config: Dict, max_articles: int) -> List[Dict]:
+    def _collect_from_rss(
+        self,
+        config: Dict,
+        max_articles: int,
+        retries: int = 2,
+        backoff_ms: int = 300,
+    ) -> tuple[List[Dict], List[str]]:
         feed_url = (config.get("feed_url") or "").strip()
         if not feed_url:
             raise ValueError("RSS connector requires config.feed_url")
 
-        response = self.session.get(feed_url, timeout=12)
-        response.raise_for_status()
+        collection_errors: List[str] = []
+        response = self._http_get(feed_url, timeout=12, retries=retries, backoff_ms=backoff_ms)
         root = ElementTree.fromstring(response.content)
         items = root.findall(".//item")
         results: List[Dict] = []
@@ -155,7 +165,7 @@ class ConnectorIngestionService:
             description = self._xml_text(item.find("description"))
             pub_date = self._xml_text(item.find("pubDate"))
             scraped_at = self._normalize_datetime(pub_date)
-            body = self._extract_article_body(link) if link else description
+            body = self._extract_article_body(link, collection_errors, retries, backoff_ms) if link else description
             results.append(
                 {
                     "title": title or "Untitled",
@@ -164,25 +174,31 @@ class ConnectorIngestionService:
                     "scraped_at": scraped_at,
                 }
             )
-        return results
+        return results, collection_errors
 
-    def _collect_from_section(self, config: Dict, max_articles: int) -> List[Dict]:
+    def _collect_from_section(
+        self,
+        config: Dict,
+        max_articles: int,
+        retries: int = 2,
+        backoff_ms: int = 300,
+    ) -> tuple[List[Dict], List[str]]:
         base_url = (config.get("base_url") or "").strip()
         if not base_url:
             raise ValueError("Section connector requires config.base_url")
 
+        collection_errors: List[str] = []
         self._prime_consent(base_url)
-        response = self.session.get(base_url, timeout=12)
-        response.raise_for_status()
+        response = self._http_get(base_url, timeout=12, retries=retries, backoff_ms=backoff_ms)
         soup = BeautifulSoup(response.text, "lxml")
         self._strip_overlays(soup)
         links = self._extract_links(soup, base_url)
         results: List[Dict] = []
         for link in links[:max_articles]:
-            article = self._extract_article(link)
+            article = self._extract_article(link, collection_errors, retries, backoff_ms)
             if article:
                 results.append(article)
-        return results
+        return results, collection_errors
 
     def _extract_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
         base_host = urlparse(base_url).netloc
@@ -218,18 +234,30 @@ class ConnectorIngestionService:
             deduped.append(full_url)
         return deduped
 
-    def _extract_article(self, url: str) -> Optional[Dict]:
+    def _extract_article(
+        self,
+        url: str,
+        errors: Optional[List[str]] = None,
+        retries: int = 2,
+        backoff_ms: int = 300,
+    ) -> Optional[Dict]:
         try:
             self._prime_consent(url)
-            response = self.session.get(url, timeout=12)
-            response.raise_for_status()
-        except Exception:
+            response = self._http_get(url, timeout=12, retries=retries, backoff_ms=backoff_ms)
+        except Exception as exc:
+            if errors is not None:
+                errors.append(f"http_error:{url}:{str(exc)}")
             return None
 
         soup = BeautifulSoup(response.text, "lxml")
         self._strip_overlays(soup)
+        blocker = self._classify_blocker_page(soup)
+        if blocker and errors is not None:
+            errors.append(f"{blocker}:{url}")
         title = self._clean_text(self._first_text(soup, ["h1.article-title", "h1.title", "h1"]))
         if not title:
+            if errors is not None:
+                errors.append(f"missing_title:{url}")
             return None
 
         paragraphs = []
@@ -243,6 +271,8 @@ class ConnectorIngestionService:
 
         content = " ".join(paragraphs).strip()
         if len(content.split()) < 20:
+            if errors is not None:
+                errors.append(f"low_content:{url}")
             return None
 
         return {
@@ -252,9 +282,42 @@ class ConnectorIngestionService:
             "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    def _extract_article_body(self, url: str) -> str:
-        article = self._extract_article(url)
+    def _extract_article_body(
+        self,
+        url: str,
+        errors: Optional[List[str]] = None,
+        retries: int = 2,
+        backoff_ms: int = 300,
+    ) -> str:
+        article = self._extract_article(url, errors=errors, retries=retries, backoff_ms=backoff_ms)
         return article["content"] if article else ""
+
+    def _http_get(self, url: str, timeout: int = 12, retries: int = 2, backoff_ms: int = 300):
+        last_exc: Optional[Exception] = None
+        attempts = max(1, retries + 1)
+        for attempt in range(attempts):
+            try:
+                response = self.session.get(url, timeout=timeout)
+                response.raise_for_status()
+                return response
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts - 1:
+                    break
+                delay = (backoff_ms / 1000.0) * (2**attempt)
+                time.sleep(min(5.0, delay))
+        raise RuntimeError(f"request_failed_after_retries:{url}:{last_exc}")
+
+    @staticmethod
+    def _classify_blocker_page(soup: BeautifulSoup) -> Optional[str]:
+        text = soup.get_text(" ", strip=True).lower()
+        if any(token in text for token in ["cookie", "cookies", "consent", "souhlas", "gdpr"]):
+            return "blocked_cookie_wall"
+        if any(token in text for token in ["subscribe", "předplatné", "predplatne", "paywall"]):
+            return "blocked_paywall"
+        if any(token in text for token in ["sign in", "login", "přihlásit", "prihlasit"]):
+            return "blocked_login_wall"
+        return None
 
     def _embed_text(self, text: str) -> List[float]:
         vec = np.zeros(self.vector_dim, dtype=np.float32)

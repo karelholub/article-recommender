@@ -128,6 +128,25 @@
     <div class="col-12">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Metrics Rollups</strong>
+                <button id="refresh-rollups-status" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="row g-2 mb-2">
+                    <div class="col-md-3">
+                        <input id="rollups-days" class="form-control form-control-sm" type="number" min="1" max="365" value="30">
+                    </div>
+                    <div class="col-md-9 d-flex gap-2">
+                        <button id="rebuild-rollups" class="btn btn-sm btn-outline-primary">Rebuild Rollups</button>
+                    </div>
+                </div>
+                <div id="rollups-status" class="small text-muted">Loading rollup status...</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
                 <strong>Maintenance</strong>
                 <button id="refresh-cleanup-status" class="btn btn-sm btn-outline-secondary">Refresh</button>
             </div>

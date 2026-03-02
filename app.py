@@ -218,6 +218,7 @@ def _is_protected_request() -> bool:
         or request.path.startswith("/api/ranking-configs")
         or request.path.startswith("/api/connectors")
         or request.path.startswith("/api/source-settings")
+        or request.path.startswith("/api/metrics/rollups")
     )
     return protected_paths and request.method in _WRITE_METHODS.union({"GET"})
 
@@ -297,6 +298,7 @@ def _rate_limit_for_endpoint(path: str) -> int:
             "/api/v1/events": 120,
             "/api/scenarios": 30,
             "/api/ranking-configs": 30,
+            "/api/metrics/rollups": 10,
         }
 
     matched_limit = default_limit
@@ -661,6 +663,73 @@ def _apply_scenario_rules(
         "remaining": len(kept),
         "reasons": reasons,
         "decisions": decisions if include_decisions else None,
+    }
+
+
+def _build_run_decision_flow(run: Dict) -> Dict:
+    request_payload = run.get("request", {}) or {}
+    scenario_trace = request_payload.get("scenario_trace") or {}
+    decisions = scenario_trace.get("decisions")
+    if not isinstance(decisions, list):
+        decisions = []
+
+    item_by_article = {item.get("article_id"): item for item in (run.get("items") or [])}
+    rows = []
+    for idx, decision in enumerate(decisions, start=1):
+        article_id = decision.get("article_id")
+        item = item_by_article.get(article_id, {})
+        score_before = decision.get("score_before")
+        score_after = decision.get("score_after")
+        boost = decision.get("boost")
+        if score_after is None and item:
+            score_after = item.get("score")
+        if score_before is None and score_after is not None and boost not in (None, 0):
+            try:
+                score_before = float(score_after) / float(boost)
+            except (TypeError, ValueError, ZeroDivisionError):
+                score_before = None
+        rows.append(
+            {
+                "position": idx,
+                "article_id": article_id,
+                "source": decision.get("source") or item.get("source"),
+                "status": decision.get("status") or ("kept" if item else "filtered"),
+                "reason": decision.get("reason") or "n/a",
+                "score_before": round(float(score_before), 4) if isinstance(score_before, (int, float)) else None,
+                "score_after": round(float(score_after), 4) if isinstance(score_after, (int, float)) else None,
+                "boost": round(float(boost), 4) if isinstance(boost, (int, float)) else None,
+                "final_rank": item.get("rank"),
+                "final_explanation": item.get("explanation"),
+            }
+        )
+
+    if not rows:
+        for item in run.get("items", []):
+            rows.append(
+                {
+                    "position": item.get("rank"),
+                    "article_id": item.get("article_id"),
+                    "source": item.get("source"),
+                    "status": "kept",
+                    "reason": "no_scenario_decisions",
+                    "score_before": None,
+                    "score_after": item.get("score"),
+                    "boost": None,
+                    "final_rank": item.get("rank"),
+                    "final_explanation": item.get("explanation"),
+                }
+            )
+
+    return {
+        "run_id": run.get("run_id"),
+        "scenario_id": request_payload.get("scenario_id"),
+        "scenario_trace_summary": {
+            "applied": bool(scenario_trace.get("applied")),
+            "filtered_out": int(scenario_trace.get("filtered_out") or 0),
+            "remaining": int(scenario_trace.get("remaining") or 0),
+            "reasons": scenario_trace.get("reasons") or {},
+        },
+        "decisions": rows,
     }
 
 
@@ -1271,6 +1340,17 @@ def connector_metrics():
             success_like += success_count
             ingested_sum = sum(int(r.get("ingested", 0)) for r in runs)
             total_ingested += ingested_sum
+            last_run = runs[0] if runs else {}
+            last_errors = last_run.get("errors") or []
+            first_error = str(last_errors[0]) if last_errors else ""
+            error_code = first_error.split(":", 1)[0] if first_error else None
+            health_state = "healthy"
+            if last_run.get("status") == "failed":
+                health_state = "failing"
+            elif last_run.get("status") == "completed_with_errors":
+                health_state = "degraded"
+            elif not runs:
+                health_state = "idle"
             per_connector.append(
                 {
                     "connector_id": connector["connector_id"],
@@ -1278,8 +1358,10 @@ def connector_metrics():
                     "run_count": run_count,
                     "success_rate": round((success_count / run_count), 4) if run_count else 0.0,
                     "avg_ingested": round((ingested_sum / run_count), 4) if run_count else 0.0,
-                    "last_status": runs[0]["status"] if runs else None,
+                    "last_status": last_run.get("status"),
                     "last_run_at": connector.get("last_run_at"),
+                    "health_state": health_state,
+                    "last_error_code": error_code,
                 }
             )
 
@@ -1639,7 +1721,7 @@ def query_recommendations():
             )
         else:
             recs = []
-        recs, scenario_trace = _apply_scenario_rules(recs, scenario)
+        recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
         recs = recs[: max(1, top_n)]
 
         run_id = store.persist_recommendation_run(
@@ -1740,6 +1822,17 @@ def get_recommendation_run(run_id):
     return jsonify(run)
 
 
+@app.route("/api/recommendation-runs/<run_id>/decision-flow")
+def get_recommendation_run_decision_flow(run_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+
+    run = store.get_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found"}), 404
+    return jsonify(_build_run_decision_flow(run))
+
+
 @app.route("/api/recommendations/cms", methods=["POST"])
 @app.route("/api/v1/recommendations/cms", methods=["POST"])
 def recommendations_cms():
@@ -1786,7 +1879,7 @@ def recommendations_cms():
             config_id=decision_context["effective_config_id"],
             ranking_config=effective_ranking_config,
         ) if selected_sources else []
-        recs, scenario_trace = _apply_scenario_rules(recs, scenario)
+        recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
         recs = recs[:top_n]
 
         run_id = store.persist_recommendation_run(
@@ -2137,6 +2230,7 @@ def metrics_trends():
     try:
         days = max(1, min(365, int(request.args.get("days", 30))))
         limit = max(1, min(100000, int(request.args.get("limit", 50000))))
+        use_rollups = request.args.get("use_rollups", "true").lower() != "false"
         scenario_ids_raw = request.args.get("scenario_ids", "").strip()
         source_filter = request.args.get("source", "").strip().lower()
         scenario_filter = {part.strip() for part in scenario_ids_raw.split(",") if part.strip()}
@@ -2152,34 +2246,63 @@ def metrics_trends():
             for label in date_labels
         }
 
-        events = store.list_events(limit=limit, days=days)
-        for event in events:
-            created_at = str(event.get("created_at") or "")
-            try:
-                day = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-            if day not in daily:
-                continue
+        rollups_used = False
+        if use_rollups:
+            rollup_rows = store.list_event_rollups(
+                days=days,
+                scenario_ids=sorted(scenario_filter) if scenario_filter else None,
+                source=source_filter or None,
+            )
+            if rollup_rows:
+                rollups_used = True
+                for row in rollup_rows:
+                    day = row.get("day")
+                    if day not in daily:
+                        continue
+                    scenario_id = row.get("scenario_id") or "default"
+                    impressions = int(row.get("impressions") or 0)
+                    clicks = int(row.get("clicks") or 0)
+                    conversions = int(row.get("conversions") or 0)
+                    daily[day]["impressions"] += impressions
+                    daily[day]["clicks"] += clicks
+                    daily[day]["conversions"] += conversions
+                    scenario_bucket = daily[day]["scenarios"].setdefault(
+                        scenario_id,
+                        {"impressions": 0, "clicks": 0, "conversions": 0},
+                    )
+                    scenario_bucket["impressions"] += impressions
+                    scenario_bucket["clicks"] += clicks
+                    scenario_bucket["conversions"] += conversions
 
-            scenario_id = event.get("scenario_id") or "default"
-            if scenario_filter and scenario_id not in scenario_filter:
-                continue
-
-            if source_filter:
-                source = _resolve_event_source(event)
-                if source.lower() != source_filter:
+        if not rollups_used:
+            events = store.list_events(limit=limit, days=days)
+            for event in events:
+                created_at = str(event.get("created_at") or "")
+                try:
+                    day = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+                if day not in daily:
                     continue
 
-            event_type = event.get("event_type")
-            if event_type not in {"impression", "click", "conversion"}:
-                continue
-            daily[day][f"{event_type}s"] += 1
-            scenario_bucket = daily[day]["scenarios"].setdefault(
-                scenario_id,
-                {"impressions": 0, "clicks": 0, "conversions": 0},
-            )
-            scenario_bucket[f"{event_type}s"] += 1
+                scenario_id = event.get("scenario_id") or "default"
+                if scenario_filter and scenario_id not in scenario_filter:
+                    continue
+
+                if source_filter:
+                    source = _resolve_event_source(event)
+                    if source.lower() != source_filter:
+                        continue
+
+                event_type = event.get("event_type")
+                if event_type not in {"impression", "click", "conversion"}:
+                    continue
+                daily[day][f"{event_type}s"] += 1
+                scenario_bucket = daily[day]["scenarios"].setdefault(
+                    scenario_id,
+                    {"impressions": 0, "clicks": 0, "conversions": 0},
+                )
+                scenario_bucket[f"{event_type}s"] += 1
 
         totals = {"impressions": 0, "clicks": 0, "conversions": 0}
         by_scenario: Dict[str, Dict] = {}
@@ -2257,6 +2380,7 @@ def metrics_trends():
                 "dates": date_labels,
                 "totals_by_day": totals_by_day,
                 "scenarios": scenario_items,
+                "rollups_used": rollups_used,
             }
         )
     except Exception as e:
@@ -2629,6 +2753,55 @@ def metrics_scenario_traces():
         )
     except Exception as e:
         logger.error(f"Error computing scenario trace metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/rollups/daily", methods=["GET"])
+def metrics_rollups_daily():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        scenario_ids_raw = request.args.get("scenario_ids", "").strip()
+        source = request.args.get("source", "").strip() or None
+        scenario_ids = [part.strip() for part in scenario_ids_raw.split(",") if part.strip()]
+        rows = store.list_event_rollups(days=days, scenario_ids=scenario_ids or None, source=source)
+        return jsonify(
+            {
+                "window_days": days,
+                "filters": {
+                    "scenario_ids": scenario_ids,
+                    "source": source,
+                },
+                "rows": rows,
+                "count": len(rows),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error reading event rollups: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/rollups/rebuild", methods=["POST"])
+def metrics_rollups_rebuild():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json(silent=True) or {}
+        days = max(1, min(365, int(payload.get("days", 30))))
+        result = store.rebuild_event_rollups(days=days)
+        _record_audit(
+            action="rebuild",
+            resource_type="event_rollups",
+            resource_id=f"daily:{days}",
+            payload=payload,
+            extra=result,
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error rebuilding event rollups: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
