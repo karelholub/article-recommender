@@ -152,6 +152,9 @@
                         <h3 class="mb-0">Source Connectors</h3>
                     </div>
                     <div class="card-body">
+                        <div class="small text-muted mb-2">
+                            Configure ingestion sources, scheduling, and inspect sync outcomes.
+                        </div>
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <button id="sync-due-connectors" class="btn btn-sm btn-outline-success">Sync Due Now</button>
                             <span id="connector-sync-summary" class="small text-muted">No sync queued.</span>
@@ -161,6 +164,21 @@
                             <span id="scheduler-status" class="small text-muted">Scheduler status unknown.</span>
                         </div>
                         <div id="connector-metrics" class="small text-muted mb-2">Loading connector metrics...</div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-7">
+                                <input id="connector-search" class="form-control form-control-sm" placeholder="Search connector name...">
+                            </div>
+                            <div class="col-5">
+                                <select id="connector-status-filter" class="form-select form-select-sm">
+                                    <option value="all">All statuses</option>
+                                    <option value="failed">Failed</option>
+                                    <option value="completed_with_errors">Completed with errors</option>
+                                    <option value="completed">Completed</option>
+                                    <option value="running">Running</option>
+                                    <option value="none">No runs</option>
+                                </select>
+                            </div>
+                        </div>
                         <div class="mb-2">
                             <input id="connector-name" class="form-control form-control-sm mb-2" placeholder="Connector name">
                             <select id="connector-type" class="form-select form-select-sm mb-2">
@@ -183,6 +201,10 @@
                                 </div>
                             </div>
                             <button id="create-connector" class="btn btn-sm btn-outline-primary">Create Connector</button>
+                            <div id="connector-form-hint" class="small text-muted mt-1">
+                                URL must be http(s). Max articles range is 1-50.
+                            </div>
+                            <div id="connector-form-error" class="small text-danger mt-1" style="display:none;"></div>
                         </div>
                         <div id="connector-list" class="small text-muted">Loading connectors...</div>
                     </div>
