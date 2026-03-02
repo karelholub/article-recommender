@@ -299,6 +299,8 @@ def test_cdp_meiro_endpoints_and_context():
                 'scenario_segment_map': {'vip': scenario_id},
                 'config_segment_map': {},
                 'segment_priority': ['vip'],
+                'derivation_min_source_events': 1,
+                'derivation_min_category_events': 0,
             },
         },
     )
@@ -324,12 +326,30 @@ def test_cdp_meiro_endpoints_and_context():
     assert derive_preview.status_code == 200
     derive_payload = derive_preview.get_json()
     assert 'derived' in derive_payload
+    assert 'guardrail' in derive_payload
+    assert 'diff' in derive_payload
     assert source in (derive_payload['derived'].get('preferred_sources') or [])
 
     derive_persist = client.post('/api/cdp/meiro/profiles/ext-cdp-1/derive', json={'persist': True})
     assert derive_persist.status_code == 200
     derive_persist_payload = derive_persist.get_json()
     assert derive_persist_payload['persisted'] is True
+
+    # Tighten guardrail and validate blocked + forced persist behavior.
+    tighten = client.put(
+        '/api/cdp/meiro',
+        json={'mapping': {'derivation_min_source_events': 999}},
+    )
+    assert tighten.status_code == 200
+    blocked = client.post('/api/cdp/meiro/profiles/ext-cdp-1/derive', json={'persist': True})
+    assert blocked.status_code == 409
+    blocked_payload = blocked.get_json()
+    assert blocked_payload['persisted'] is False
+    forced = client.post('/api/cdp/meiro/profiles/ext-cdp-1/derive', json={'persist': True, 'force': True})
+    assert forced.status_code == 200
+    forced_payload = forced.get_json()
+    assert forced_payload['persisted'] is True
+    assert forced_payload['forced'] is True
 
     context_resp = client.post(
         '/api/recommendation-context',

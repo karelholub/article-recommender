@@ -1359,6 +1359,12 @@ async function loadCdpConfig() {
         document.getElementById('cdp-excluded-sources-trait').value = payload.mapping?.excluded_sources_trait || 'excluded_sources';
         document.getElementById('cdp-source-weights-trait').value = payload.mapping?.source_weights_trait || 'source_weights';
         document.getElementById('cdp-source-weight-prefix').value = payload.mapping?.source_weight_trait_prefix || 'source_weight_';
+        document.getElementById('cdp-derivation-min-source-events').value = Number(payload.mapping?.derivation_min_source_events ?? 3);
+        document.getElementById('cdp-derivation-min-category-events').value = Number(payload.mapping?.derivation_min_category_events ?? 1);
+        document.getElementById('cdp-derivation-max-sources').value = Number(payload.mapping?.derivation_max_preferred_sources ?? 5);
+        document.getElementById('cdp-derivation-weight-range').value = `${Number(payload.mapping?.derivation_min_source_weight ?? 1.05)}:${Number(payload.mapping?.derivation_max_source_weight ?? 2.0)}`;
+        document.getElementById('cdp-derivation-allowlist').value = (payload.mapping?.derivation_allowed_sources || []).join(', ');
+        document.getElementById('cdp-derivation-blocklist').value = (payload.mapping?.derivation_blocked_sources || []).join(', ');
         document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(payload.mapping?.scenario_segment_map || {}, null, 2);
         document.getElementById('cdp-config-segment-map').value = JSON.stringify(payload.mapping?.config_segment_map || {}, null, 2);
         document.getElementById('cdp-segment-priority').value = (payload.mapping?.segment_priority || []).join(', ');
@@ -1377,6 +1383,11 @@ async function saveCdpConfig() {
         configMap = JSON.parse(document.getElementById('cdp-config-segment-map').value || '{}');
     } catch (error) {
         throw new Error('Invalid JSON in mapping fields');
+    }
+    const weightRangeRaw = (document.getElementById('cdp-derivation-weight-range').value || '').trim();
+    const weightRange = weightRangeRaw.split(':').map(item => Number(item.trim()));
+    if (weightRange.length !== 2 || !Number.isFinite(weightRange[0]) || !Number.isFinite(weightRange[1])) {
+        throw new Error('Invalid derivation weight range (expected min:max)');
     }
     const payload = {
         enabled: document.getElementById('cdp-enabled').checked,
@@ -1397,6 +1408,13 @@ async function saveCdpConfig() {
             excluded_sources_trait: (document.getElementById('cdp-excluded-sources-trait').value || '').trim(),
             source_weights_trait: (document.getElementById('cdp-source-weights-trait').value || '').trim(),
             source_weight_trait_prefix: (document.getElementById('cdp-source-weight-prefix').value || '').trim(),
+            derivation_min_source_events: Number(document.getElementById('cdp-derivation-min-source-events').value || 3),
+            derivation_min_category_events: Number(document.getElementById('cdp-derivation-min-category-events').value || 1),
+            derivation_max_preferred_sources: Number(document.getElementById('cdp-derivation-max-sources').value || 5),
+            derivation_min_source_weight: Number(weightRange[0]),
+            derivation_max_source_weight: Number(weightRange[1]),
+            derivation_allowed_sources: (document.getElementById('cdp-derivation-allowlist').value || '').split(',').map(item => item.trim()).filter(Boolean),
+            derivation_blocked_sources: (document.getElementById('cdp-derivation-blocklist').value || '').split(',').map(item => item.trim()).filter(Boolean),
             scenario_segment_map: scenarioMap,
             config_segment_map: configMap,
             segment_priority: (document.getElementById('cdp-segment-priority').value || '').split(',').map(item => item.trim()).filter(Boolean)
@@ -1551,7 +1569,11 @@ async function deriveCdpProfile(persist = false) {
     const response = await fetch(`/api/cdp/meiro/profiles/${encodeURIComponent(externalId)}/derive`, {
         method: persist ? 'POST' : 'GET',
         headers: persist ? { 'Content-Type': 'application/json', ...getOperatorHeaders() } : undefined,
-        body: persist ? JSON.stringify({ persist: true, actor_id: getOperatorId() || undefined }) : undefined
+        body: persist ? JSON.stringify({
+            persist: true,
+            force: Boolean(document.getElementById('cdp-derive-force')?.checked),
+            actor_id: getOperatorId() || undefined
+        }) : undefined
     });
     if (!response.ok) {
         const error = await response.json();

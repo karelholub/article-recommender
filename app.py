@@ -92,6 +92,13 @@ _DEFAULT_MEIRO_MAPPING = {
     "scenario_segment_map": {},
     "config_segment_map": {},
     "segment_priority": [],
+    "derivation_min_source_events": 3,
+    "derivation_min_category_events": 1,
+    "derivation_allowed_sources": [],
+    "derivation_blocked_sources": [],
+    "derivation_max_preferred_sources": 5,
+    "derivation_min_source_weight": 1.05,
+    "derivation_max_source_weight": 2.0,
 }
 
 
@@ -201,8 +208,30 @@ def _normalize_meiro_mapping(mapping: Optional[Dict[str, Any]]) -> Dict[str, Any
         merged["fixed_segments"] = []
     if not isinstance(merged.get("segment_priority"), list):
         merged["segment_priority"] = []
+    if not isinstance(merged.get("derivation_allowed_sources"), list):
+        merged["derivation_allowed_sources"] = []
+    if not isinstance(merged.get("derivation_blocked_sources"), list):
+        merged["derivation_blocked_sources"] = []
+    merged["derivation_min_source_events"] = max(0, int(merged.get("derivation_min_source_events", 3)))
+    merged["derivation_min_category_events"] = max(0, int(merged.get("derivation_min_category_events", 1)))
+    merged["derivation_max_preferred_sources"] = max(1, int(merged.get("derivation_max_preferred_sources", 5)))
+    merged["derivation_min_source_weight"] = max(0.0, float(merged.get("derivation_min_source_weight", 1.05)))
+    merged["derivation_max_source_weight"] = max(
+        merged["derivation_min_source_weight"],
+        float(merged.get("derivation_max_source_weight", 2.0)),
+    )
     merged["fixed_segments"] = [str(item).strip() for item in merged["fixed_segments"] if str(item).strip()]
     merged["segment_priority"] = [str(item).strip() for item in merged["segment_priority"] if str(item).strip()]
+    merged["derivation_allowed_sources"] = [
+        str(item).strip().lower()
+        for item in merged["derivation_allowed_sources"]
+        if str(item).strip()
+    ]
+    merged["derivation_blocked_sources"] = [
+        str(item).strip().lower()
+        for item in merged["derivation_blocked_sources"]
+        if str(item).strip()
+    ]
     return merged
 
 
@@ -310,6 +339,121 @@ def _derive_reco_fields_from_meiro_traits(traits: Dict[str, Any]) -> Dict[str, A
             "category_events": sum(categories.values()),
             "brand_events": sum(brands.values()),
         },
+    }
+
+
+def _apply_derivation_guardrails(derived: Dict[str, Any], mapping: Dict[str, Any]) -> Dict[str, Any]:
+    support = derived.get("support") or {}
+    source_events = int(support.get("source_events") or 0)
+    category_events = int(support.get("category_events") or 0)
+    min_source_events = int(mapping.get("derivation_min_source_events", 3))
+    min_category_events = int(mapping.get("derivation_min_category_events", 1))
+    allowed = set(str(item).strip().lower() for item in (mapping.get("derivation_allowed_sources") or []) if str(item).strip())
+    blocked = set(str(item).strip().lower() for item in (mapping.get("derivation_blocked_sources") or []) if str(item).strip())
+    max_sources = int(mapping.get("derivation_max_preferred_sources", 5))
+    min_weight = float(mapping.get("derivation_min_source_weight", 1.05))
+    max_weight = float(mapping.get("derivation_max_source_weight", 2.0))
+
+    reasons = []
+    if source_events < min_source_events:
+        reasons.append(f"insufficient_source_events:{source_events}<{min_source_events}")
+    if category_events < min_category_events:
+        reasons.append(f"insufficient_category_events:{category_events}<{min_category_events}")
+
+    preferred = [str(item).strip().lower() for item in (derived.get("preferred_sources") or []) if str(item).strip()]
+    weights = dict(derived.get("source_weights") or {})
+    filtered = []
+    dropped_by_policy = []
+    for source in preferred:
+        if allowed and source not in allowed:
+            dropped_by_policy.append({"source": source, "reason": "not_in_allowlist"})
+            continue
+        if source in blocked:
+            dropped_by_policy.append({"source": source, "reason": "in_blocklist"})
+            continue
+        filtered.append(source)
+    filtered = filtered[:max_sources]
+
+    final_weights: Dict[str, float] = {}
+    for source in filtered:
+        raw = weights.get(source, 1.0)
+        try:
+            weight = float(raw)
+        except (TypeError, ValueError):
+            weight = 1.0
+        weight = max(min_weight, min(max_weight, weight))
+        final_weights[source] = round(weight, 3)
+
+    if not filtered:
+        reasons.append("no_preferred_sources_after_policy")
+
+    guardrail_pass = len(reasons) == 0
+    return {
+        "pass": guardrail_pass,
+        "reasons": reasons,
+        "policy": {
+            "min_source_events": min_source_events,
+            "min_category_events": min_category_events,
+            "allowlist_size": len(allowed),
+            "blocklist_size": len(blocked),
+            "max_preferred_sources": max_sources,
+            "min_source_weight": min_weight,
+            "max_source_weight": max_weight,
+        },
+        "dropped_sources": dropped_by_policy,
+        "result": {
+            "preferred_sources": filtered,
+            "source_weights": final_weights,
+            "derived_segments": list(derived.get("derived_segments") or []),
+            "top_categories": list(derived.get("top_categories") or []),
+            "top_brands": list(derived.get("top_brands") or []),
+            "support": support,
+        },
+    }
+
+
+def _build_derivation_diff(profile: Dict[str, Any], guarded: Dict[str, Any]) -> Dict[str, Any]:
+    current_traits = dict(profile.get("traits") or {})
+    current_segments = [str(item).strip() for item in (profile.get("segments") or []) if str(item).strip()]
+    result = guarded.get("result") or {}
+    next_preferred = list(result.get("preferred_sources") or [])
+    next_weights = dict(result.get("source_weights") or {})
+    next_segments = sorted(set(current_segments + list(result.get("derived_segments") or [])))
+
+    current_preferred = [str(item).strip().lower() for item in _list_from_profile_trait(current_traits.get("preferred_sources"))]
+    current_weights = _float_map_from_profile_trait(current_traits.get("source_weights"))
+    added_segments = [item for item in next_segments if item not in current_segments]
+
+    return {
+        "preferred_sources": {
+            "before": current_preferred,
+            "after": next_preferred,
+            "added": [item for item in next_preferred if item not in current_preferred],
+            "removed": [item for item in current_preferred if item not in next_preferred],
+            "changed": current_preferred != next_preferred,
+        },
+        "source_weights": {
+            "before": current_weights,
+            "after": next_weights,
+            "changed_keys": sorted(set(current_weights.keys()) ^ set(next_weights.keys()))
+            + sorted(
+                key
+                for key in set(current_weights.keys()) & set(next_weights.keys())
+                if abs(float(current_weights.get(key, 0.0)) - float(next_weights.get(key, 0.0))) > 1e-9
+            ),
+            "changed": current_weights != next_weights,
+        },
+        "segments": {
+            "before": current_segments,
+            "after": next_segments,
+            "added": added_segments,
+            "changed": bool(added_segments),
+        },
+        "has_changes": (
+            current_preferred != next_preferred
+            or current_weights != next_weights
+            or bool(added_segments)
+        ),
     }
 
 
@@ -1659,8 +1803,12 @@ def cdp_meiro_config():
         current_config = dict(integration.get("config") or {})
         current_mapping = _normalize_meiro_mapping(integration.get("mapping"))
         next_enabled = payload.get("enabled")
-        next_config = payload.get("config") if isinstance(payload.get("config"), dict) else current_config
-        next_mapping = payload.get("mapping") if isinstance(payload.get("mapping"), dict) else current_mapping
+        next_config = dict(current_config)
+        if isinstance(payload.get("config"), dict):
+            next_config.update(payload.get("config") or {})
+        next_mapping = dict(current_mapping)
+        if isinstance(payload.get("mapping"), dict):
+            next_mapping.update(payload.get("mapping") or {})
         # Keep existing secret if UI sends masked value.
         if str(next_config.get("api_key", "")).strip() == "***":
             next_config["api_key"] = current_config.get("api_key", "")
@@ -1739,32 +1887,54 @@ def cdp_meiro_profile_derive(external_user_id):
     profile = store.get_cdp_profile(_MEIRO_PROVIDER, external_user_id)
     if not profile:
         return jsonify({"error": "Profile not found"}), 404
+    integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+    mapping = _normalize_meiro_mapping(integration.get("mapping"))
     derived = _derive_reco_fields_from_meiro_traits(profile.get("traits") or {})
+    guardrail = _apply_derivation_guardrails(derived, mapping)
+    diff = _build_derivation_diff(profile, guardrail)
     if request.method == "GET":
         return jsonify(
             {
                 "provider": _MEIRO_PROVIDER,
                 "external_user_id": external_user_id,
                 "derived": derived,
+                "guardrail": guardrail,
+                "diff": diff,
                 "persisted": False,
             }
         )
     try:
         payload = request.get_json(silent=True) or {}
         persist = bool(payload.get("persist", True))
+        force = bool(payload.get("force", False))
         if not persist:
             return jsonify(
                 {
                     "provider": _MEIRO_PROVIDER,
                     "external_user_id": external_user_id,
                     "derived": derived,
+                    "guardrail": guardrail,
+                    "diff": diff,
                     "persisted": False,
                 }
             )
+        if not guardrail.get("pass") and not force:
+            return jsonify(
+                {
+                    "error": "Derivation blocked by guardrails",
+                    "provider": _MEIRO_PROVIDER,
+                    "external_user_id": external_user_id,
+                    "derived": derived,
+                    "guardrail": guardrail,
+                    "diff": diff,
+                    "persisted": False,
+                }
+            ), 409
+        result = guardrail.get("result") or {}
         traits = dict(profile.get("traits") or {})
-        traits["preferred_sources"] = derived.get("preferred_sources") or []
-        traits["source_weights"] = derived.get("source_weights") or {}
-        segments = sorted(set((profile.get("segments") or []) + (derived.get("derived_segments") or [])))
+        traits["preferred_sources"] = result.get("preferred_sources") or []
+        traits["source_weights"] = result.get("source_weights") or {}
+        segments = sorted(set((profile.get("segments") or []) + (result.get("derived_segments") or [])))
         stored = store.upsert_cdp_profile(
             provider=_MEIRO_PROVIDER,
             external_user_id=external_user_id,
@@ -1777,14 +1947,17 @@ def cdp_meiro_profile_derive(external_user_id):
             resource_type="cdp_profile",
             resource_id=external_user_id,
             payload=payload,
-            extra={"provider": _MEIRO_PROVIDER, "persisted": True},
+            extra={"provider": _MEIRO_PROVIDER, "persisted": True, "guardrail_pass": bool(guardrail.get("pass")), "forced": force},
         )
         return jsonify(
             {
                 "provider": _MEIRO_PROVIDER,
                 "external_user_id": external_user_id,
                 "derived": derived,
+                "guardrail": guardrail,
+                "diff": diff,
                 "persisted": True,
+                "forced": force,
                 "profile": stored,
             }
         )

@@ -38,6 +38,10 @@
                         <button id="persist-cdp-derivation" class="btn btn-sm btn-outline-primary">Persist Derived</button>
                     </div>
                 </div>
+                <div class="form-check mb-2">
+                    <input id="cdp-derive-force" class="form-check-input" type="checkbox">
+                    <label class="form-check-label small" for="cdp-derive-force">Force persist even when guardrails fail</label>
+                </div>
                 <pre id="cdp-derivation-output" class="small mb-0">No derivation yet.</pre>
             </div>
         </div>
@@ -54,6 +58,16 @@
                 <input id="cdp-excluded-sources-trait" class="form-control form-control-sm mb-2" placeholder="excluded_sources trait key">
                 <input id="cdp-source-weights-trait" class="form-control form-control-sm mb-2" placeholder="source_weights trait key">
                 <input id="cdp-source-weight-prefix" class="form-control form-control-sm mb-2" placeholder="source_weight_ prefix">
+                <div class="row g-2 mb-2">
+                    <div class="col-sm-6"><input id="cdp-derivation-min-source-events" class="form-control form-control-sm" type="number" min="0" step="1" placeholder="min source events"></div>
+                    <div class="col-sm-6"><input id="cdp-derivation-min-category-events" class="form-control form-control-sm" type="number" min="0" step="1" placeholder="min category events"></div>
+                </div>
+                <div class="row g-2 mb-2">
+                    <div class="col-sm-6"><input id="cdp-derivation-max-sources" class="form-control form-control-sm" type="number" min="1" step="1" placeholder="max preferred sources"></div>
+                    <div class="col-sm-6"><input id="cdp-derivation-weight-range" class="form-control form-control-sm" placeholder="min:max source weight"></div>
+                </div>
+                <input id="cdp-derivation-allowlist" class="form-control form-control-sm mb-2" placeholder="allowlist sources (comma separated)">
+                <input id="cdp-derivation-blocklist" class="form-control form-control-sm mb-2" placeholder="blocklist sources (comma separated)">
                 <textarea id="cdp-scenario-segment-map" class="form-control form-control-sm mb-2" rows="3" placeholder='{"segment":"scenario_id"}'></textarea>
                 <textarea id="cdp-config-segment-map" class="form-control form-control-sm mb-2" rows="3" placeholder='{"segment":"config_id"}'></textarea>
                 <input id="cdp-segment-priority" class="form-control form-control-sm mb-2" placeholder="comma,separated,priority">

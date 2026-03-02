@@ -165,6 +165,7 @@ python embed.py
 - `GET /api/cdp/meiro/profiles/<external_user_id>`: Get one cached CDP profile
 - `GET /api/cdp/meiro/profiles/<external_user_id>/derive`: Preview derived recommender traits from raw Meiro attributes
 - `POST /api/cdp/meiro/profiles/<external_user_id>/derive`: Persist derived `preferred_sources`/`source_weights`/segments into cached profile
+  - persistence is guardrailed; endpoint returns `409` when guardrails fail unless `force=true`
 - `POST /api/cdp/meiro/profiles/upsert`: Upsert CDP profile payload (webhook/manual ingest)
 - `POST /api/cdp/meiro/sync`: Pull profile(s) from Meiro API by external IDs
   - supports either `request_url_template` (e.g. `.../wbs?segment=107&attribute=stitching_meiro_id&value={external_user_id}`) or `base_url + profile_endpoint_template`
@@ -173,6 +174,15 @@ python embed.py
 - `GET /api/cdp/meiro/scheduler/status`: CDP scheduler runtime state
 - `POST /api/cdp/meiro/scheduler/run-now`: Trigger one CDP sync cycle immediately
 - `GET /api/cdp/meiro/diagnostics`: CDP profile freshness, mapping hit-rate, sync reliability diagnostics
+
+Meiro mapping also supports derivation guardrails:
+- `derivation_min_source_events`
+- `derivation_min_category_events`
+- `derivation_allowed_sources`
+- `derivation_blocked_sources`
+- `derivation_max_preferred_sources`
+- `derivation_min_source_weight`
+- `derivation_max_source_weight`
 - `GET /api/connectors`: List connector definitions
 - `POST /api/connectors`: Create connector (`section_scraper` or `rss`)
 - `PUT /api/connectors/<connector_id>`: Update connector
