@@ -120,6 +120,115 @@
                         <pre id="decision-context" class="small mb-0">Loading...</pre>
                     </div>
                 </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">Engine Snapshot</h3>
+                        <button id="refresh-engine-snapshot" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body">
+                        <pre id="engine-config-snapshot" class="small mb-0">Loading...</pre>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">Reporting Workspace</h3>
+                        <div class="d-flex gap-2">
+                            <button id="refresh-reporting-workspace" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                            <button id="export-reporting-csv" class="btn btn-sm btn-outline-primary">Export CSV</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-2 mb-2">
+                            <div class="col-md-3">
+                                <label class="form-label small mb-1" for="reporting-days">Window (days)</label>
+                                <input id="reporting-days" class="form-control form-control-sm" type="number" min="1" max="365" value="30">
+                            </div>
+                            <div class="col-md-5">
+                                <label class="form-label small mb-1" for="reporting-scenario-filter">Scenarios (multi-select)</label>
+                                <select id="reporting-scenario-filter" class="form-select form-select-sm" multiple size="3"></select>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small mb-1" for="reporting-source-filter">Source</label>
+                                <input id="reporting-source-filter" class="form-control form-control-sm" placeholder="e.g., www.e15.cz">
+                            </div>
+                        </div>
+                        <div id="reporting-summary" class="small text-muted mb-2">Loading reporting metrics...</div>
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <div class="small fw-semibold mb-1">Daily Volume</div>
+                                <div style="height:240px">
+                                    <canvas id="reporting-volume-chart"></canvas>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="small fw-semibold mb-1">Daily CTR</div>
+                                <div style="height:240px">
+                                    <canvas id="reporting-ctr-chart"></canvas>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="small fw-semibold mb-1">Scenario CTR Overlay</div>
+                                <div style="height:240px">
+                                    <canvas id="reporting-scenario-overlay-chart"></canvas>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="small fw-semibold mb-1">Conversion Funnel</div>
+                                <div style="height:240px">
+                                    <canvas id="reporting-funnel-chart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="table-responsive mt-3">
+                            <table class="table table-sm mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Scenario</th>
+                                        <th>Impressions</th>
+                                        <th>Clicks</th>
+                                        <th>Conversions</th>
+                                        <th>CTR</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="reporting-scenario-table">
+                                    <tr><td colspan="5" class="text-muted">Loading...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">Recommendation Run Explorer</h3>
+                        <button id="refresh-run-explorer" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-2 mb-2">
+                            <div class="col-md-4">
+                                <label class="form-label small mb-1" for="run-limit">Recent runs</label>
+                                <input id="run-limit" class="form-control form-control-sm" type="number" min="5" max="100" value="20">
+                            </div>
+                        </div>
+                        <div class="row g-3">
+                            <div class="col-md-5">
+                                <div id="run-list" class="small text-muted">Loading runs...</div>
+                            </div>
+                            <div class="col-md-7">
+                                <div id="run-detail-summary" class="small text-muted mb-2">Select a run.</div>
+                                <pre id="run-detail-request" class="small bg-light p-2 rounded mb-2">-</pre>
+                                <div class="table-responsive">
+                                    <table class="table table-sm mb-0">
+                                        <thead><tr><th>Rank</th><th>Article</th><th>Score</th><th>Reasoning</th></tr></thead>
+                                        <tbody id="run-detail-items"><tr><td colspan="4" class="text-muted">No run selected.</td></tr></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <!-- Sidebar -->
@@ -153,6 +262,49 @@
                                 Save Source Defaults
                             </button>
                         </div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">Ranking Config Editor</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="small text-muted mb-2">
+                            Create and tune ranking weights directly from UI.
+                        </div>
+                        <input id="ranking-config-id" class="form-control form-control-sm mb-2" placeholder="config_id (e.g., homepage_v1)">
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="weight-semantic">Semantic</label>
+                                <input id="weight-semantic" class="form-control form-control-sm" type="number" min="0" step="0.01">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="weight-freshness">Freshness</label>
+                                <input id="weight-freshness" class="form-control form-control-sm" type="number" min="0" step="0.01">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="weight-topic">Topic</label>
+                                <input id="weight-topic" class="form-control form-control-sm" type="number" min="0" step="0.01">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="weight-source">Source</label>
+                                <input id="weight-source" class="form-control form-control-sm" type="number" min="0" step="0.01">
+                            </div>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small mb-1" for="ranking-time-decay-days">Time decay days</label>
+                            <input id="ranking-time-decay-days" class="form-control form-control-sm" type="number" min="1" step="1">
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small mb-1" for="ranking-source-weights-json">Source weights (JSON map)</label>
+                            <textarea id="ranking-source-weights-json" class="form-control form-control-sm" rows="3" placeholder='{"www.e15.cz": 1.1}'></textarea>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button id="save-ranking-config" class="btn btn-sm btn-outline-primary">Save Config</button>
+                            <button id="delete-ranking-config" class="btn btn-sm btn-outline-danger">Delete Config</button>
+                        </div>
+                        <div id="ranking-config-status" class="small text-muted mt-2">Select a config to inspect or edit.</div>
                     </div>
                 </div>
 
@@ -231,9 +383,47 @@
                         </div>
                         <input id="scenario-id" class="form-control form-control-sm mb-2" placeholder="scenario_id (e.g., homepage)">
                         <input id="scenario-name" class="form-control form-control-sm mb-2" placeholder="Scenario name">
+                        <input id="scenario-description" class="form-control form-control-sm mb-2" placeholder="Description (optional)">
                         <div class="form-check mb-2">
                             <input id="scenario-enabled" class="form-check-input" type="checkbox" checked>
                             <label class="form-check-label small" for="scenario-enabled">Enabled</label>
+                        </div>
+                        <div class="border rounded p-2 mb-2">
+                            <div class="small fw-semibold mb-2">Rule Builder</div>
+                            <input id="rule-include-sources" class="form-control form-control-sm mb-2" placeholder="Include sources (comma separated)">
+                            <input id="rule-exclude-sources" class="form-control form-control-sm mb-2" placeholder="Exclude sources (comma separated)">
+                            <input id="rule-include-sections" class="form-control form-control-sm mb-2" placeholder="Include sections (comma separated)">
+                            <input id="rule-exclude-sections" class="form-control form-control-sm mb-2" placeholder="Exclude sections (comma separated)">
+                            <input id="rule-include-keywords" class="form-control form-control-sm mb-2" placeholder="Include keywords (comma separated)">
+                            <input id="rule-exclude-keywords" class="form-control form-control-sm mb-2" placeholder="Exclude keywords (comma separated)">
+                            <input id="rule-exclude-article-ids" class="form-control form-control-sm mb-2" placeholder="Exclude article IDs (comma separated)">
+                            <div class="row g-2 mb-2">
+                                <div class="col-6">
+                                    <label class="form-label small mb-1" for="rule-max-age-days">Max age (days)</label>
+                                    <input id="rule-max-age-days" class="form-control form-control-sm" type="number" min="0" step="1" placeholder="7">
+                                </div>
+                                <div class="col-6">
+                                    <label class="form-label small mb-1" for="rule-min-score">Min score</label>
+                                    <input id="rule-min-score" class="form-control form-control-sm" type="number" min="0" step="0.0001" placeholder="0.1">
+                                </div>
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label small mb-1" for="rule-ranking-config-id">Override ranking config</label>
+                                <select id="rule-ranking-config-id" class="form-select form-select-sm">
+                                    <option value="">None</option>
+                                </select>
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label small mb-1" for="rule-source-boosts-json">Source boosts (JSON map)</label>
+                                <textarea id="rule-source-boosts-json" class="form-control form-control-sm" rows="3" placeholder='{"www.e15.cz": 1.2}'></textarea>
+                            </div>
+                            <div class="d-flex gap-2 mb-1">
+                                <button id="apply-rule-builder" class="btn btn-sm btn-outline-secondary">Apply to JSON</button>
+                                <button id="load-rule-builder" class="btn btn-sm btn-outline-secondary">Load from JSON</button>
+                                <button id="simulate-scenario" class="btn btn-sm btn-outline-info">Simulate</button>
+                            </div>
+                            <div id="rule-builder-status" class="small text-muted">Builder ready.</div>
+                            <div id="scenario-simulation" class="small text-muted mt-1">Simulation output appears here.</div>
                         </div>
                         <textarea id="scenario-rule-set" class="form-control form-control-sm mb-2" rows="7" placeholder='{"include_sources":["www.e15.cz"],"max_age_days":7}'></textarea>
                         <div class="d-flex gap-2">
@@ -304,6 +494,103 @@
                     </div>
                     <div class="card-body">
                         <div id="scenario-metrics" class="small text-muted">Loading scenario metrics...</div>
+                        <hr>
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <div class="small fw-semibold">Scenario Source KPIs</div>
+                            <button id="refresh-scenario-source-metrics" class="btn btn-sm btn-outline-secondary">Refresh Source KPIs</button>
+                        </div>
+                        <div id="scenario-source-metrics" class="small text-muted">Select a scenario to view source KPI breakdown.</div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">Operator Controls</h3>
+                    </div>
+                    <div class="card-body">
+                        <label for="operator-id" class="form-label">Operator ID</label>
+                        <input id="operator-id" class="form-control form-control-sm mb-2" placeholder="ops-user">
+                        <div class="form-check mb-2">
+                            <input id="persist-incidents-on-sli" class="form-check-input" type="checkbox">
+                            <label class="form-check-label small" for="persist-incidents-on-sli">Persist incidents on SLI refresh</label>
+                        </div>
+                        <div class="small text-muted">Used for audit trails and manual incident actions.</div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">SLI & Alerts</h3>
+                        <button id="refresh-sli" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="sli-overview" class="small text-muted mb-2">Loading SLI status...</div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-12">
+                                <label class="form-label small mb-1" for="threshold-p95-ms">Recommendation P95 (ms)</label>
+                                <input id="threshold-p95-ms" class="form-control form-control-sm" type="number" min="1" step="1">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="threshold-failure-rate">Connector failure max</label>
+                                <input id="threshold-failure-rate" class="form-control form-control-sm" type="number" min="0" max="1" step="0.01">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="threshold-min-ctr">CTR min</label>
+                                <input id="threshold-min-ctr" class="form-control form-control-sm" type="number" min="0" max="1" step="0.001">
+                            </div>
+                        </div>
+                        <div class="d-flex gap-2 mb-2">
+                            <button id="save-alert-thresholds" class="btn btn-sm btn-outline-primary">Save Thresholds</button>
+                            <button id="evaluate-alert-incidents" class="btn btn-sm btn-outline-warning">Evaluate Incidents</button>
+                        </div>
+                        <div id="alert-thresholds-status" class="small text-muted">Thresholds idle.</div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">Alert Incidents</h3>
+                        <button id="refresh-alert-incidents" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body">
+                        <div class="d-flex gap-2 mb-2">
+                            <select id="incident-status-filter" class="form-select form-select-sm">
+                                <option value="">All statuses</option>
+                                <option value="open">Open</option>
+                                <option value="resolved">Resolved</option>
+                            </select>
+                            <input id="incident-metric-filter" class="form-control form-control-sm" placeholder="metric (e.g. ctr)">
+                        </div>
+                        <div id="alert-incidents" class="small text-muted">Loading incidents...</div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">Maintenance</h3>
+                        <button id="refresh-cleanup-status" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="cleanup-status" class="small text-muted mb-2">Loading cleanup status...</div>
+                        <button id="run-cleanup-now" class="btn btn-sm btn-outline-danger">Run Cleanup</button>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">Audit Logs</h3>
+                        <button id="refresh-audit-logs" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <input id="audit-actor-filter" class="form-control form-control-sm" placeholder="actor_id">
+                            </div>
+                            <div class="col-6">
+                                <input id="audit-resource-filter" class="form-control form-control-sm" placeholder="resource_type">
+                            </div>
+                        </div>
+                        <div id="audit-logs-list" class="small text-muted">Loading audit logs...</div>
                     </div>
                 </div>
 

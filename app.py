@@ -8,7 +8,7 @@ import logging
 import os
 import threading
 import traceback
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, render_template, request
@@ -1618,6 +1618,7 @@ def query_recommendations():
                 "config_id": effective_config_id,
                 "effective_ranking_config": effective_ranking_config,
                 "scenario_id": scenario_id,
+                "scenario_trace": scenario_trace,
             },
             recommendations=recs,
             request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
@@ -1762,6 +1763,7 @@ def recommendations_cms():
                 "sources": selected_sources,
                 "top_n": top_n,
                 "api_surface": "cms",
+                "scenario_trace": scenario_trace,
             },
             recommendations=recs,
             request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
@@ -2090,6 +2092,147 @@ def scenario_source_metrics(scenario_id):
         return jsonify({"scenario_id": scenario_id, "window_days": days, "sources": items})
     except Exception as e:
         logger.error(f"Error computing scenario source metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/trends", methods=["GET"])
+def metrics_trends():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        limit = max(1, min(100000, int(request.args.get("limit", 50000))))
+        scenario_ids_raw = request.args.get("scenario_ids", "").strip()
+        source_filter = request.args.get("source", "").strip().lower()
+        scenario_filter = {part.strip() for part in scenario_ids_raw.split(",") if part.strip()}
+
+        scenario_catalog = {entry["scenario_id"]: entry for entry in store.list_scenarios(include_disabled=True)}
+        now = datetime.now()
+        date_labels = [
+            (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(days - 1, -1, -1)
+        ]
+        daily: Dict[str, Dict] = {
+            label: {"impressions": 0, "clicks": 0, "conversions": 0, "scenarios": {}}
+            for label in date_labels
+        }
+
+        events = store.list_events(limit=limit, days=days)
+        for event in events:
+            created_at = str(event.get("created_at") or "")
+            try:
+                day = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+            if day not in daily:
+                continue
+
+            scenario_id = event.get("scenario_id") or "default"
+            if scenario_filter and scenario_id not in scenario_filter:
+                continue
+
+            if source_filter:
+                if not recommender:
+                    continue
+                article_id = event.get("article_id")
+                source = "unknown"
+                if article_id in recommender.article_vectors:
+                    url = recommender.article_vectors[article_id].get("metadata", {}).get("url", "")
+                    source = recommender.extract_source(url)
+                if source.lower() != source_filter:
+                    continue
+
+            event_type = event.get("event_type")
+            if event_type not in {"impression", "click", "conversion"}:
+                continue
+            daily[day][f"{event_type}s"] += 1
+            scenario_bucket = daily[day]["scenarios"].setdefault(
+                scenario_id,
+                {"impressions": 0, "clicks": 0, "conversions": 0},
+            )
+            scenario_bucket[f"{event_type}s"] += 1
+
+        totals = {"impressions": 0, "clicks": 0, "conversions": 0}
+        by_scenario: Dict[str, Dict] = {}
+        for label in date_labels:
+            day_row = daily[label]
+            totals["impressions"] += day_row["impressions"]
+            totals["clicks"] += day_row["clicks"]
+            totals["conversions"] += day_row["conversions"]
+            for scenario_id, bucket in day_row["scenarios"].items():
+                scenario_state = by_scenario.setdefault(
+                    scenario_id,
+                    {
+                        "scenario_id": scenario_id,
+                        "name": scenario_catalog.get(scenario_id, {}).get("name", "Default"),
+                        "impressions": 0,
+                        "clicks": 0,
+                        "conversions": 0,
+                        "points": [],
+                    },
+                )
+                scenario_state["impressions"] += bucket["impressions"]
+                scenario_state["clicks"] += bucket["clicks"]
+                scenario_state["conversions"] += bucket["conversions"]
+
+        for scenario_state in by_scenario.values():
+            scenario_id = scenario_state["scenario_id"]
+            points: List[Dict] = []
+            for label in date_labels:
+                bucket = daily[label]["scenarios"].get(
+                    scenario_id,
+                    {"impressions": 0, "clicks": 0, "conversions": 0},
+                )
+                impressions = bucket["impressions"]
+                clicks = bucket["clicks"]
+                points.append(
+                    {
+                        "date": label,
+                        "impressions": impressions,
+                        "clicks": clicks,
+                        "conversions": bucket["conversions"],
+                        "ctr": round((clicks / impressions), 4) if impressions else 0.0,
+                    }
+                )
+            scenario_state["points"] = points
+            scenario_state["ctr"] = round(
+                (scenario_state["clicks"] / scenario_state["impressions"]),
+                4,
+            ) if scenario_state["impressions"] else 0.0
+
+        totals_by_day = []
+        for label in date_labels:
+            row = daily[label]
+            impressions = row["impressions"]
+            clicks = row["clicks"]
+            totals_by_day.append(
+                {
+                    "date": label,
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "conversions": row["conversions"],
+                    "ctr": round((clicks / impressions), 4) if impressions else 0.0,
+                }
+            )
+
+        totals["ctr"] = round((totals["clicks"] / totals["impressions"]), 4) if totals["impressions"] else 0.0
+        scenario_items = sorted(by_scenario.values(), key=lambda item: item["impressions"], reverse=True)
+        return jsonify(
+            {
+                "window_days": days,
+                "filters": {
+                    "scenario_ids": sorted(scenario_filter),
+                    "source": source_filter or None,
+                },
+                "summary": totals,
+                "dates": date_labels,
+                "totals_by_day": totals_by_day,
+                "scenarios": scenario_items,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error computing metric trends: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 

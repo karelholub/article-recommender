@@ -5,10 +5,17 @@ let sourceOptions = [];
 let rankingConfigs = {};
 let scenarios = [];
 let connectors = [];
+let alertThresholds = {};
 const connectorRunsCache = {};
 const connectorMetricsById = {};
 let connectorSearchTerm = '';
 let connectorStatusFilter = 'all';
+let reportingVolumeChart = null;
+let reportingCtrChart = null;
+let reportingScenarioOverlayChart = null;
+let reportingFunnelChart = null;
+let reportingLastPayload = null;
+let recommendationRuns = [];
 
 // Initialize the application
 document.addEventListener('DOMContentLoaded', () => {
@@ -19,10 +26,19 @@ document.addEventListener('DOMContentLoaded', () => {
     loadScenarios();
     loadOfflineMetrics();
     loadScenarioMetrics();
+    loadScenarioSourceMetrics();
+    loadAlertThresholds();
+    loadSliOverview();
+    loadAlertIncidents();
+    loadCleanupStatus();
+    loadEngineConfigSnapshot();
+    loadAuditLogs();
+    loadRecommendationRuns();
     loadConnectors();
     loadConnectorMetrics();
     loadSchedulerStatus();
     loadDecisionContext();
+    loadReportingWorkspace();
     setupEventListeners();
     setInterval(loadSchedulerStatus, 15000);
 });
@@ -617,11 +633,122 @@ async function loadRankingConfigs() {
         if (data.default_config_id && rankingConfigs[data.default_config_id]) {
             select.value = data.default_config_id;
         }
+        renderRuleBuilderConfigOptions();
+        populateRankingConfigEditor(select.value);
         loadDecisionContext();
     } catch (error) {
         console.error('Error loading ranking configs:', error);
         document.getElementById('ranking-config').innerHTML = '<option value="balanced">balanced</option>';
+        rankingConfigs = {};
+        renderRuleBuilderConfigOptions();
+        populateRankingConfigEditor('balanced');
     }
+}
+
+function renderRuleBuilderConfigOptions() {
+    const select = document.getElementById('rule-ranking-config-id');
+    if (!select) return;
+    const options = ['<option value="">None</option>'];
+    Object.keys(rankingConfigs).forEach(id => {
+        options.push(`<option value="${id}">${id}</option>`);
+    });
+    select.innerHTML = options.join('');
+}
+
+function populateRankingConfigEditor(configId) {
+    const record = rankingConfigs[configId];
+    const config = record?.config || {};
+    const weights = config.weights || {};
+    document.getElementById('ranking-config-id').value = configId || '';
+    document.getElementById('weight-semantic').value = Number(weights.semantic ?? 0.5);
+    document.getElementById('weight-freshness').value = Number(weights.freshness ?? 0.3);
+    document.getElementById('weight-topic').value = Number(weights.topic ?? 0.2);
+    document.getElementById('weight-source').value = Number(weights.source ?? 0.1);
+    document.getElementById('ranking-time-decay-days').value = Number(config.time_decay_days ?? 30);
+    document.getElementById('ranking-source-weights-json').value = JSON.stringify(config.source_weights || {}, null, 2);
+    if (record) {
+        const systemLabel = record.is_system ? 'system' : 'custom';
+        setRankingConfigStatus(`Editing ${systemLabel} config ${configId} (v${record.version}).`);
+    } else {
+        setRankingConfigStatus('Drafting a new custom ranking config.');
+    }
+}
+
+function collectRankingConfigPayloadFromEditor() {
+    const configId = (document.getElementById('ranking-config-id').value || '').trim();
+    if (!configId) {
+        throw new Error('Ranking config ID is required.');
+    }
+    const semantic = Number(document.getElementById('weight-semantic').value);
+    const freshness = Number(document.getElementById('weight-freshness').value);
+    const topic = Number(document.getElementById('weight-topic').value);
+    const source = Number(document.getElementById('weight-source').value);
+    const timeDecayDays = Number(document.getElementById('ranking-time-decay-days').value);
+    const sourceWeights = parseJsonObjectInput(
+        document.getElementById('ranking-source-weights-json').value,
+        'Source weights'
+    );
+
+    const weights = { semantic, freshness, topic, source };
+    Object.entries(weights).forEach(([name, value]) => {
+        if (!Number.isFinite(value) || value < 0) {
+            throw new Error(`Weight ${name} must be a number >= 0.`);
+        }
+    });
+    if (!Number.isFinite(timeDecayDays) || timeDecayDays < 1) {
+        throw new Error('Time decay days must be >= 1.');
+    }
+    return {
+        configId,
+        payload: {
+            config_id: configId,
+            weights,
+            time_decay_days: Math.round(timeDecayDays),
+            source_weights: sourceWeights
+        }
+    };
+}
+
+async function saveRankingConfig() {
+    const { configId, payload } = collectRankingConfigPayloadFromEditor();
+    const existing = rankingConfigs[configId];
+    setRankingConfigStatus(existing ? `Updating ${configId}...` : `Creating ${configId}...`);
+    const endpoint = existing ? `/api/ranking-configs/${encodeURIComponent(configId)}` : '/api/ranking-configs';
+    const method = existing ? 'PUT' : 'POST';
+    const response = await fetch(endpoint, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to save ranking config');
+    }
+    const result = await response.json();
+    await loadRankingConfigs();
+    document.getElementById('ranking-config').value = configId;
+    populateRankingConfigEditor(configId);
+    loadDecisionContext();
+    setRankingConfigStatus(`Saved ${configId} (version ${result.version}).`);
+}
+
+async function deleteRankingConfig() {
+    const configId = (document.getElementById('ranking-config-id').value || '').trim();
+    if (!configId) {
+        throw new Error('Ranking config ID is required.');
+    }
+    if (!window.confirm(`Delete ranking config "${configId}"?`)) {
+        return;
+    }
+    const response = await fetch(`/api/ranking-configs/${encodeURIComponent(configId)}`, { method: 'DELETE' });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to delete ranking config');
+    }
+    await loadRankingConfigs();
+    const selected = document.getElementById('ranking-config').value || 'balanced';
+    populateRankingConfigEditor(selected);
+    setRankingConfigStatus(`Deleted config ${configId}.`);
 }
 
 function getSelectedScenarioId() {
@@ -633,11 +760,63 @@ function getExternalUserId() {
     return raw.trim();
 }
 
+function getOperatorId() {
+    const raw = document.getElementById('operator-id')?.value || '';
+    return raw.trim();
+}
+
+function getOperatorHeaders() {
+    const operatorId = getOperatorId();
+    return operatorId ? { 'X-Actor-Id': operatorId } : {};
+}
+
+function parseCsvInput(value) {
+    return String(value || '')
+        .split(',')
+        .map(item => item.trim())
+        .filter(Boolean);
+}
+
+function formatCsv(values) {
+    return (Array.isArray(values) ? values : []).join(', ');
+}
+
+function parseJsonObjectInput(raw, fieldLabel) {
+    const text = String(raw || '').trim();
+    if (!text) return {};
+    let parsed = {};
+    try {
+        parsed = JSON.parse(text);
+    } catch (_error) {
+        throw new Error(`${fieldLabel} must be valid JSON`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`${fieldLabel} must be a JSON object`);
+    }
+    return parsed;
+}
+
+function setRuleBuilderStatus(message, isError = false) {
+    const el = document.getElementById('rule-builder-status');
+    if (!el) return;
+    el.className = `small ${isError ? 'text-danger' : 'text-muted'}`;
+    el.textContent = message;
+}
+
+function setRankingConfigStatus(message, isError = false) {
+    const el = document.getElementById('ranking-config-status');
+    if (!el) return;
+    el.className = `small mt-2 ${isError ? 'text-danger' : 'text-muted'}`;
+    el.textContent = message;
+}
+
 function applyScenarioToEditor(scenario) {
     document.getElementById('scenario-id').value = scenario?.scenario_id || '';
     document.getElementById('scenario-name').value = scenario?.name || '';
+    document.getElementById('scenario-description').value = scenario?.description || '';
     document.getElementById('scenario-enabled').checked = Boolean(scenario?.enabled ?? true);
     document.getElementById('scenario-rule-set').value = JSON.stringify(scenario?.rule_set || {}, null, 2);
+    populateRuleBuilderFromRuleSet(scenario?.rule_set || {});
 }
 
 async function loadScenarios() {
@@ -659,7 +838,9 @@ async function loadScenarios() {
         }
         const selected = scenarios.find(item => item.scenario_id === select.value);
         applyScenarioToEditor(selected || null);
+        renderReportingScenarioOptions();
         loadDecisionContext();
+        loadScenarioSourceMetrics();
     } catch (error) {
         console.error('Error loading scenarios:', error);
         showError(`Failed to load scenarios: ${error.message}`);
@@ -669,6 +850,7 @@ async function loadScenarios() {
 async function saveScenario() {
     const scenarioId = (document.getElementById('scenario-id').value || '').trim();
     const name = (document.getElementById('scenario-name').value || '').trim();
+    const description = (document.getElementById('scenario-description').value || '').trim();
     const enabled = document.getElementById('scenario-enabled').checked;
     const ruleSetRaw = document.getElementById('scenario-rule-set').value || '{}';
     if (!scenarioId) {
@@ -690,6 +872,7 @@ async function saveScenario() {
     const payload = {
         scenario_id: scenarioId,
         name,
+        description,
         enabled,
         rule_set: ruleSet
     };
@@ -721,6 +904,145 @@ async function deleteScenario() {
     document.getElementById('scenario-select').value = '';
     applyScenarioToEditor(null);
     loadDecisionContext();
+}
+
+function populateRuleBuilderFromRuleSet(ruleSet) {
+    const rules = ruleSet || {};
+    document.getElementById('rule-include-sources').value = formatCsv(rules.include_sources);
+    document.getElementById('rule-exclude-sources').value = formatCsv(rules.exclude_sources);
+    document.getElementById('rule-include-sections').value = formatCsv(rules.include_sections);
+    document.getElementById('rule-exclude-sections').value = formatCsv(rules.exclude_sections);
+    document.getElementById('rule-include-keywords').value = formatCsv(rules.include_keywords);
+    document.getElementById('rule-exclude-keywords').value = formatCsv(rules.exclude_keywords);
+    document.getElementById('rule-exclude-article-ids').value = formatCsv(rules.exclude_article_ids);
+    document.getElementById('rule-max-age-days').value =
+        rules.max_age_days === null || rules.max_age_days === undefined ? '' : Number(rules.max_age_days);
+    document.getElementById('rule-min-score').value =
+        rules.min_score === null || rules.min_score === undefined ? '' : Number(rules.min_score);
+    document.getElementById('rule-ranking-config-id').value = rules.ranking_config_id || '';
+    document.getElementById('rule-source-boosts-json').value = JSON.stringify(rules.source_boosts || {}, null, 2);
+}
+
+function collectRuleBuilderRuleSet() {
+    const maxAgeRaw = document.getElementById('rule-max-age-days').value;
+    const minScoreRaw = document.getElementById('rule-min-score').value;
+    const sourceBoosts = parseJsonObjectInput(
+        document.getElementById('rule-source-boosts-json').value,
+        'Rule source boosts'
+    );
+    Object.entries(sourceBoosts).forEach(([source, value]) => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            throw new Error(`Rule source boost for "${source}" must be > 0.`);
+        }
+        sourceBoosts[source] = parsed;
+    });
+    const maxAgeDays = maxAgeRaw === '' ? null : Number(maxAgeRaw);
+    if (maxAgeDays !== null && (!Number.isFinite(maxAgeDays) || maxAgeDays < 0)) {
+        throw new Error('Rule max age days must be >= 0.');
+    }
+    const minScore = minScoreRaw === '' ? null : Number(minScoreRaw);
+    if (minScore !== null && (!Number.isFinite(minScore) || minScore < 0)) {
+        throw new Error('Rule min score must be >= 0.');
+    }
+    return {
+        include_sources: parseCsvInput(document.getElementById('rule-include-sources').value),
+        exclude_sources: parseCsvInput(document.getElementById('rule-exclude-sources').value),
+        include_sections: parseCsvInput(document.getElementById('rule-include-sections').value).map(v => v.toLowerCase()),
+        exclude_sections: parseCsvInput(document.getElementById('rule-exclude-sections').value).map(v => v.toLowerCase()),
+        include_keywords: parseCsvInput(document.getElementById('rule-include-keywords').value).map(v => v.toLowerCase()),
+        exclude_keywords: parseCsvInput(document.getElementById('rule-exclude-keywords').value).map(v => v.toLowerCase()),
+        exclude_article_ids: parseCsvInput(document.getElementById('rule-exclude-article-ids').value),
+        max_age_days: maxAgeDays === null ? null : Math.round(maxAgeDays),
+        min_score: minScore,
+        source_boosts: sourceBoosts,
+        ranking_config_id: (document.getElementById('rule-ranking-config-id').value || '').trim() || null
+    };
+}
+
+function applyRuleBuilderToJson() {
+    const ruleSet = collectRuleBuilderRuleSet();
+    document.getElementById('scenario-rule-set').value = JSON.stringify(ruleSet, null, 2);
+    setRuleBuilderStatus('Rule builder applied to JSON.');
+}
+
+function loadRuleBuilderFromJson() {
+    const raw = document.getElementById('scenario-rule-set').value || '{}';
+    let parsed = {};
+    try {
+        parsed = JSON.parse(raw);
+    } catch (_error) {
+        throw new Error('Scenario rule set JSON is invalid.');
+    }
+    populateRuleBuilderFromRuleSet(parsed);
+    setRuleBuilderStatus('Rule builder loaded from JSON.');
+}
+
+async function simulateSelectedScenario() {
+    const scenarioId = (document.getElementById('scenario-id').value || '').trim();
+    if (!scenarioId) {
+        throw new Error('Scenario ID is required to run simulation.');
+    }
+    const output = document.getElementById('scenario-simulation');
+    output.textContent = 'Running simulation...';
+    const response = await fetch(`/api/scenarios/${encodeURIComponent(scenarioId)}/simulate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            user_id: 'demo_user',
+            top_n: 10,
+            sources: getSelectedSources()
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Scenario simulation failed');
+    }
+    const payload = await response.json();
+    const trace = payload.scenario_trace || {};
+    output.innerHTML = `
+        <div><strong>Base:</strong> ${payload.base_count} | <strong>After scenario:</strong> ${payload.scenario_count}</div>
+        <div><strong>Filtered out:</strong> ${trace.filtered_out ?? 0}</div>
+        <div><strong>Reasons:</strong> <code>${JSON.stringify(trace.reasons || {})}</code></div>
+    `;
+}
+
+async function loadScenarioSourceMetrics() {
+    const container = document.getElementById('scenario-source-metrics');
+    if (!container) return;
+    const scenarioId = getSelectedScenarioId() || (document.getElementById('scenario-id').value || '').trim();
+    if (!scenarioId) {
+        container.textContent = 'Select a scenario to view source KPI breakdown.';
+        return;
+    }
+    try {
+        const response = await fetch(`/api/metrics/scenarios/${encodeURIComponent(scenarioId)}/sources?days=30`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load scenario source metrics');
+        }
+        const payload = await response.json();
+        const rows = (payload.sources || []).map(item => `
+            <tr>
+                <td>${item.source}</td>
+                <td>${item.impressions}</td>
+                <td>${item.clicks}</td>
+                <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+                <td>${item.conversions}</td>
+            </tr>
+        `).join('');
+        container.innerHTML = `
+            <div class="table-responsive">
+                <table class="table table-sm mb-0">
+                    <thead><tr><th>Source</th><th>Impr.</th><th>Clicks</th><th>CTR</th><th>Conv.</th></tr></thead>
+                    <tbody>${rows || '<tr><td colspan="5" class="text-muted">No source metrics yet.</td></tr>'}</tbody>
+                </table>
+            </div>
+        `;
+    } catch (error) {
+        console.error('Error loading scenario source metrics:', error);
+        container.textContent = `Scenario source metrics unavailable: ${error.message}`;
+    }
 }
 
 async function loadScenarioMetrics() {
@@ -760,6 +1082,213 @@ async function loadScenarioMetrics() {
     }
 }
 
+async function loadAlertThresholds() {
+    try {
+        const response = await fetch('/api/alerts/thresholds');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load alert thresholds');
+        }
+        const payload = await response.json();
+        alertThresholds = payload.thresholds || {};
+        document.getElementById('threshold-p95-ms').value = Number(alertThresholds.recommendation_p95_ms ?? 500);
+        document.getElementById('threshold-failure-rate').value = Number(alertThresholds.connector_failure_rate ?? 0.05);
+        document.getElementById('threshold-min-ctr').value = Number(alertThresholds.min_ctr ?? 0.01);
+    } catch (error) {
+        console.error('Error loading alert thresholds:', error);
+        document.getElementById('alert-thresholds-status').textContent = `Threshold load failed: ${error.message}`;
+    }
+}
+
+async function saveAlertThresholds() {
+    const recommendationP95 = Number(document.getElementById('threshold-p95-ms').value);
+    const connectorFailureRate = Number(document.getElementById('threshold-failure-rate').value);
+    const minCtr = Number(document.getElementById('threshold-min-ctr').value);
+    const statusEl = document.getElementById('alert-thresholds-status');
+    statusEl.textContent = 'Saving thresholds...';
+    const response = await fetch('/api/alerts/thresholds', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            thresholds: {
+                recommendation_p95_ms: recommendationP95,
+                connector_failure_rate: connectorFailureRate,
+                min_ctr: minCtr
+            }
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to save thresholds');
+    }
+    const payload = await response.json();
+    alertThresholds = payload.thresholds || {};
+    statusEl.textContent = 'Thresholds updated.';
+}
+
+function renderSliOverview(payload) {
+    const container = document.getElementById('sli-overview');
+    if (!container) return;
+    const checks = payload.checks || [];
+    const rows = checks.map(check => {
+        const metric = check.metric;
+        const value = check.value === null || check.value === undefined ? 'n/a' : Number(check.value).toFixed(4);
+        const target = check.target_max !== undefined
+            ? `<= ${Number(check.target_max).toFixed(4)}`
+            : `>= ${Number(check.target_min ?? 0).toFixed(4)}`;
+        const statusClass = check.status === 'pass' ? 'text-success' : 'text-danger';
+        return `<tr><td>${metric}</td><td>${value}</td><td>${target}</td><td class="${statusClass}">${check.status}</td></tr>`;
+    }).join('');
+    container.innerHTML = `
+        <div><strong>Overall:</strong> <span class="${payload.overall_status === 'pass' ? 'text-success' : 'text-danger'}">${payload.overall_status}</span></div>
+        <div><strong>Window:</strong> ${payload.window_days} days</div>
+        <div class="table-responsive mt-2">
+            <table class="table table-sm mb-0">
+                <thead><tr><th>Metric</th><th>Value</th><th>Target</th><th>Status</th></tr></thead>
+                <tbody>${rows || '<tr><td colspan="4" class="text-muted">No checks available.</td></tr>'}</tbody>
+            </table>
+        </div>
+    `;
+}
+
+async function loadSliOverview() {
+    try {
+        const persist = document.getElementById('persist-incidents-on-sli')?.checked;
+        const suffix = persist ? '&persist_incidents=true' : '';
+        const response = await fetch(`/api/observability/sli?days=30${suffix}`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load SLI');
+        }
+        const payload = await response.json();
+        renderSliOverview(payload);
+        if (persist) {
+            await loadAlertIncidents();
+        }
+    } catch (error) {
+        console.error('Error loading SLI:', error);
+        document.getElementById('sli-overview').textContent = `SLI unavailable: ${error.message}`;
+    }
+}
+
+function renderAlertIncidents(payload) {
+    const container = document.getElementById('alert-incidents');
+    const incidents = payload.incidents || [];
+    if (!incidents.length) {
+        container.innerHTML = '<span>No incidents found.</span>';
+        return;
+    }
+    container.innerHTML = incidents.map(incident => `
+        <div class="border rounded p-2 mb-2">
+            <div class="d-flex justify-content-between align-items-center">
+                <strong>${incident.metric}</strong>
+                <span class="${incident.status === 'open' ? 'text-danger' : 'text-success'}">${incident.status}</span>
+            </div>
+            <div class="small text-muted">Current: ${incident.current_value ?? 'n/a'} | Threshold: ${incident.threshold_value ?? 'n/a'}</div>
+            <div class="small text-muted">Occurrences: ${incident.occurrences} | Last seen: ${incident.last_seen_at}</div>
+            ${incident.status === 'open' ? `<button class="btn btn-sm btn-outline-success mt-1 resolve-incident" data-id="${incident.incident_id}">Resolve</button>` : ''}
+        </div>
+    `).join('');
+}
+
+async function loadAlertIncidents() {
+    try {
+        const status = document.getElementById('incident-status-filter')?.value || '';
+        const metric = (document.getElementById('incident-metric-filter')?.value || '').trim();
+        const params = new URLSearchParams({ limit: '20' });
+        if (status) params.set('status', status);
+        if (metric) params.set('metric', metric);
+        const response = await fetch(`/api/alerts/incidents?${params.toString()}`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load incidents');
+        }
+        const payload = await response.json();
+        renderAlertIncidents(payload);
+    } catch (error) {
+        console.error('Error loading alert incidents:', error);
+        document.getElementById('alert-incidents').textContent = `Incidents unavailable: ${error.message}`;
+    }
+}
+
+async function evaluateAlertIncidents() {
+    const statusEl = document.getElementById('alert-thresholds-status');
+    statusEl.textContent = 'Evaluating incidents...';
+    const response = await fetch('/api/alerts/incidents/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ days: 30, actor_id: getOperatorId() || undefined })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to evaluate incidents');
+    }
+    const payload = await response.json();
+    statusEl.textContent = `Incidents evaluated. Opened/updated: ${payload.incident_sync?.opened_or_updated ?? 0}, resolved: ${payload.incident_sync?.resolved ?? 0}.`;
+    await loadAlertIncidents();
+    await loadSliOverview();
+}
+
+async function resolveIncident(incidentId) {
+    const response = await fetch(`/api/alerts/incidents/${encodeURIComponent(incidentId)}/resolve`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            actor_id: getOperatorId() || undefined,
+            note: 'Resolved from UI'
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to resolve incident');
+    }
+    await loadAlertIncidents();
+    await loadSliOverview();
+}
+
+async function loadCleanupStatus() {
+    const container = document.getElementById('cleanup-status');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/maintenance/cleanup/status');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load cleanup status');
+        }
+        const payload = await response.json();
+        container.innerHTML = `
+            <div><strong>Enabled:</strong> ${payload.enabled ? 'yes' : 'no'}</div>
+            <div><strong>Running:</strong> ${payload.running ? 'yes' : 'no'}</div>
+            <div><strong>Runs:</strong> ${payload.runs_total ?? 0}</div>
+            <div><strong>Errors:</strong> ${payload.errors_total ?? 0}</div>
+            <div><strong>Last run:</strong> ${payload.last_run_at || 'n/a'}</div>
+        `;
+    } catch (error) {
+        console.error('Error loading cleanup status:', error);
+        container.textContent = `Cleanup status unavailable: ${error.message}`;
+    }
+}
+
+async function runCleanupNow() {
+    const container = document.getElementById('cleanup-status');
+    container.textContent = 'Running cleanup...';
+    const response = await fetch('/api/maintenance/cleanup/run-now', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ actor_id: getOperatorId() || undefined })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to run cleanup');
+    }
+    const payload = await response.json();
+    container.innerHTML = `
+        <div><strong>Cleanup done.</strong></div>
+        <div>Removed idempotency: ${payload.cleanup?.removed_idempotency ?? 0}</div>
+        <div>Removed audit events: ${payload.cleanup?.removed_audit_events ?? 0}</div>
+    `;
+}
+
 async function loadDecisionContext() {
     const container = document.getElementById('decision-context');
     if (!container) return;
@@ -785,6 +1314,317 @@ async function loadDecisionContext() {
     } catch (error) {
         container.textContent = `Failed to load decision context: ${error.message}`;
     }
+}
+
+async function loadEngineConfigSnapshot() {
+    const container = document.getElementById('engine-config-snapshot');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/engine/config');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load engine config');
+        }
+        const payload = await response.json();
+        container.textContent = JSON.stringify(payload, null, 2);
+    } catch (error) {
+        container.textContent = `Failed to load engine snapshot: ${error.message}`;
+    }
+}
+
+function renderAuditLogs(payload) {
+    const container = document.getElementById('audit-logs-list');
+    const events = payload.events || [];
+    if (!events.length) {
+        container.innerHTML = '<span>No audit events found.</span>';
+        return;
+    }
+    container.innerHTML = events.map(event => `
+        <div class="border rounded p-2 mb-2">
+            <div class="d-flex justify-content-between">
+                <strong>${event.action}</strong>
+                <span class="text-muted">${event.created_at}</span>
+            </div>
+            <div class="small text-muted">${event.resource_type}:${event.resource_id} | actor: ${event.actor_id}</div>
+            <div class="small"><code>${JSON.stringify(event.extra || {})}</code></div>
+        </div>
+    `).join('');
+}
+
+async function loadAuditLogs() {
+    try {
+        const actorId = (document.getElementById('audit-actor-filter')?.value || '').trim();
+        const resourceType = (document.getElementById('audit-resource-filter')?.value || '').trim();
+        const params = new URLSearchParams({ limit: '25', offset: '0' });
+        if (actorId) params.set('actor_id', actorId);
+        if (resourceType) params.set('resource_type', resourceType);
+        const response = await fetch(`/api/audit-logs?${params.toString()}`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load audit logs');
+        }
+        const payload = await response.json();
+        renderAuditLogs(payload);
+    } catch (error) {
+        document.getElementById('audit-logs-list').textContent = `Audit logs unavailable: ${error.message}`;
+    }
+}
+
+function renderReportingScenarioOptions() {
+    const select = document.getElementById('reporting-scenario-filter');
+    if (!select) return;
+    const previous = new Set(Array.from(select.selectedOptions).map(option => option.value));
+    const options = ['<option value="default">default</option>']
+        .concat(
+            scenarios.map(item => `<option value="${item.scenario_id}">${item.name} (${item.scenario_id})</option>`)
+        );
+    select.innerHTML = options.join('');
+    Array.from(select.options).forEach(option => {
+        option.selected = previous.has(option.value);
+    });
+}
+
+function getSelectedReportingScenarioIds() {
+    const select = document.getElementById('reporting-scenario-filter');
+    if (!select) return [];
+    return Array.from(select.selectedOptions)
+        .map(option => option.value)
+        .filter(Boolean);
+}
+
+function toCsvCell(value) {
+    const raw = String(value ?? '');
+    if (raw.includes(',') || raw.includes('"') || raw.includes('\n')) {
+        return `"${raw.replace(/"/g, '""')}"`;
+    }
+    return raw;
+}
+
+function renderReportingWorkspace(payload) {
+    reportingLastPayload = payload;
+    const summary = payload.summary || {};
+    const summaryEl = document.getElementById('reporting-summary');
+    const selectedCount = (payload.filters?.scenario_ids || []).length;
+    const scopeLabel = selectedCount ? ` | filtered scenarios ${selectedCount}` : ' | all scenarios';
+    summaryEl.innerHTML = `
+        <strong>Totals (${payload.window_days} days):</strong>
+        impressions ${summary.impressions ?? 0},
+        clicks ${summary.clicks ?? 0},
+        conversions ${summary.conversions ?? 0},
+        CTR ${(Number(summary.ctr || 0) * 100).toFixed(2)}%
+        ${scopeLabel}
+    `;
+
+    const tableBody = document.getElementById('reporting-scenario-table');
+    const scenarioRows = (payload.scenarios || []).map(item => `
+        <tr>
+            <td>${item.name || item.scenario_id}</td>
+            <td>${item.impressions}</td>
+            <td>${item.clicks}</td>
+            <td>${item.conversions}</td>
+            <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+        </tr>
+    `).join('');
+    tableBody.innerHTML = scenarioRows || '<tr><td colspan="5" class="text-muted">No scenario activity in selected window.</td></tr>';
+
+    const labels = (payload.totals_by_day || []).map(item => item.date);
+    const impressions = (payload.totals_by_day || []).map(item => item.impressions);
+    const clicks = (payload.totals_by_day || []).map(item => item.clicks);
+    const ctr = (payload.totals_by_day || []).map(item => Number(item.ctr || 0) * 100);
+
+    const volumeCtx = document.getElementById('reporting-volume-chart');
+    const ctrCtx = document.getElementById('reporting-ctr-chart');
+    const overlayCtx = document.getElementById('reporting-scenario-overlay-chart');
+    const funnelCtx = document.getElementById('reporting-funnel-chart');
+    if (reportingVolumeChart) reportingVolumeChart.destroy();
+    if (reportingCtrChart) reportingCtrChart.destroy();
+    if (reportingScenarioOverlayChart) reportingScenarioOverlayChart.destroy();
+    if (reportingFunnelChart) reportingFunnelChart.destroy();
+
+    reportingVolumeChart = new Chart(volumeCtx, {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [
+                { label: 'Impressions', data: impressions, backgroundColor: '#0d6efd' },
+                { label: 'Clicks', data: clicks, backgroundColor: '#198754' }
+            ]
+        },
+        options: { responsive: true, maintainAspectRatio: false }
+    });
+    reportingCtrChart = new Chart(ctrCtx, {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'CTR %',
+                    data: ctr,
+                    borderColor: '#fd7e14',
+                    backgroundColor: 'rgba(253,126,20,0.2)',
+                    tension: 0.25,
+                    fill: true
+                }
+            ]
+        },
+        options: { responsive: true, maintainAspectRatio: false }
+    });
+
+    const palette = ['#6f42c1', '#0dcaf0', '#d63384', '#198754', '#ffc107', '#20c997'];
+    const overlayDatasets = (payload.scenarios || []).slice(0, 6).map((scenario, idx) => ({
+        label: scenario.name || scenario.scenario_id,
+        data: (scenario.points || []).map(point => Number(point.ctr || 0) * 100),
+        borderColor: palette[idx % palette.length],
+        backgroundColor: 'transparent',
+        tension: 0.25
+    }));
+    reportingScenarioOverlayChart = new Chart(overlayCtx, {
+        type: 'line',
+        data: { labels, datasets: overlayDatasets },
+        options: { responsive: true, maintainAspectRatio: false }
+    });
+    reportingFunnelChart = new Chart(funnelCtx, {
+        type: 'bar',
+        data: {
+            labels: ['Impressions', 'Clicks', 'Conversions'],
+            datasets: [{
+                label: 'Funnel',
+                data: [summary.impressions || 0, summary.clicks || 0, summary.conversions || 0],
+                backgroundColor: ['#0d6efd', '#198754', '#fd7e14']
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false
+        }
+    });
+}
+
+async function loadReportingWorkspace() {
+    try {
+        const days = Number(document.getElementById('reporting-days')?.value || 30);
+        const scenarioIds = getSelectedReportingScenarioIds();
+        const source = (document.getElementById('reporting-source-filter')?.value || '').trim();
+        const params = new URLSearchParams({
+            days: String(Number.isFinite(days) && days > 0 ? Math.round(days) : 30),
+            limit: '50000'
+        });
+        if (scenarioIds.length) params.set('scenario_ids', scenarioIds.join(','));
+        if (source) params.set('source', source);
+        const response = await fetch(`/api/metrics/trends?${params.toString()}`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load reporting trends');
+        }
+        const payload = await response.json();
+        renderReportingWorkspace(payload);
+    } catch (error) {
+        document.getElementById('reporting-summary').textContent = `Reporting unavailable: ${error.message}`;
+        document.getElementById('reporting-scenario-table').innerHTML = '<tr><td colspan="5" class="text-danger">Failed to load reporting data.</td></tr>';
+    }
+}
+
+function exportReportingCsv() {
+    if (!reportingLastPayload) {
+        showError('No reporting data loaded yet.');
+        return;
+    }
+    const rows = [['date', 'impressions', 'clicks', 'conversions', 'ctr']];
+    (reportingLastPayload.totals_by_day || []).forEach(item => {
+        rows.push([item.date, item.impressions, item.clicks, item.conversions, item.ctr]);
+    });
+    rows.push([]);
+    rows.push(['scenario_id', 'scenario_name', 'impressions', 'clicks', 'conversions', 'ctr']);
+    (reportingLastPayload.scenarios || []).forEach(item => {
+        rows.push([item.scenario_id, item.name, item.impressions, item.clicks, item.conversions, item.ctr]);
+    });
+    const csv = rows.map(row => row.map(toCsvCell).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `reporting_trends_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+}
+
+function renderRecommendationRunList() {
+    const container = document.getElementById('run-list');
+    if (!container) return;
+    if (!recommendationRuns.length) {
+        container.innerHTML = '<span>No recommendation runs available.</span>';
+        return;
+    }
+    container.innerHTML = recommendationRuns.map(run => `
+        <button class="btn btn-sm btn-outline-secondary w-100 text-start mb-1 run-item" data-id="${run.run_id}">
+            <div><strong>${run.run_id.slice(0, 8)}</strong> | ${run.config_id} v${run.config_version}</div>
+            <div class="small text-muted">${run.created_at} | items ${run.summary?.count ?? 0}</div>
+        </button>
+    `).join('');
+}
+
+async function loadRecommendationRuns() {
+    try {
+        const limitRaw = Number(document.getElementById('run-limit')?.value || 20);
+        const limit = Number.isFinite(limitRaw) ? Math.max(5, Math.min(100, Math.round(limitRaw))) : 20;
+        const response = await fetch(`/api/recommendation-runs?limit=${limit}&offset=0`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load recommendation runs');
+        }
+        const payload = await response.json();
+        recommendationRuns = payload.runs || [];
+        renderRecommendationRunList();
+    } catch (error) {
+        document.getElementById('run-list').textContent = `Run list unavailable: ${error.message}`;
+    }
+}
+
+function summarizeRunItemReasoning(item) {
+    const contrib = item.feature_contributions || {};
+    const entries = Object.entries(contrib)
+        .filter(([, value]) => typeof value === 'number')
+        .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+        .slice(0, 2)
+        .map(([name, value]) => `${name}:${value.toFixed(3)}`);
+    return entries.join(', ') || (item.explanation || '').slice(0, 80) || 'n/a';
+}
+
+function renderRecommendationRunDetail(run) {
+    const summary = document.getElementById('run-detail-summary');
+    const request = document.getElementById('run-detail-request');
+    const items = document.getElementById('run-detail-items');
+    summary.innerHTML = `
+        <div><strong>Run:</strong> ${run.run_id}</div>
+        <div><strong>User:</strong> ${run.user_id}</div>
+        <div><strong>Config:</strong> ${run.config_id} v${run.config_version}</div>
+        <div><strong>Created:</strong> ${run.created_at}</div>
+        <div><strong>Duration:</strong> ${run.summary?.duration_ms ?? 'n/a'} ms | <strong>Avg score:</strong> ${Number(run.summary?.avg_score || 0).toFixed(4)}</div>
+    `;
+    request.textContent = JSON.stringify(run.request || {}, null, 2);
+    items.innerHTML = (run.items || []).map(item => `
+        <tr>
+            <td>${item.rank}</td>
+            <td><code>${item.article_id}</code><div class="small text-muted">${item.source || 'unknown'}</div></td>
+            <td>${Number(item.score || 0).toFixed(4)}</td>
+            <td>${summarizeRunItemReasoning(item)}</td>
+        </tr>
+    `).join('') || '<tr><td colspan="4" class="text-muted">No items.</td></tr>';
+}
+
+async function loadRecommendationRunDetail(runId) {
+    const summary = document.getElementById('run-detail-summary');
+    summary.textContent = `Loading run ${runId}...`;
+    const response = await fetch(`/api/recommendation-runs/${encodeURIComponent(runId)}`);
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to load run detail');
+    }
+    const payload = await response.json();
+    renderRecommendationRunDetail(payload);
 }
 
 async function loadStats() {
@@ -1071,11 +1911,32 @@ function setupEventListeners() {
 
     document.getElementById('show-similar').addEventListener('click', showSimilarArticles);
     document.getElementById('refresh-decision-context').addEventListener('click', loadDecisionContext);
-    document.getElementById('ranking-config').addEventListener('change', loadDecisionContext);
+    document.getElementById('refresh-engine-snapshot').addEventListener('click', loadEngineConfigSnapshot);
+    document.getElementById('refresh-reporting-workspace').addEventListener('click', loadReportingWorkspace);
+    document.getElementById('export-reporting-csv').addEventListener('click', exportReportingCsv);
+    document.getElementById('reporting-days').addEventListener('change', loadReportingWorkspace);
+    document.getElementById('reporting-scenario-filter').addEventListener('change', loadReportingWorkspace);
+    document.getElementById('reporting-source-filter').addEventListener('change', loadReportingWorkspace);
+    document.getElementById('refresh-run-explorer').addEventListener('click', loadRecommendationRuns);
+    document.getElementById('run-limit').addEventListener('change', loadRecommendationRuns);
+    document.getElementById('run-list').addEventListener('click', async (event) => {
+        const button = event.target.closest('.run-item');
+        if (!button) return;
+        try {
+            await loadRecommendationRunDetail(button.dataset.id);
+        } catch (error) {
+            showError(error.message || 'Failed to load run detail');
+        }
+    });
+    document.getElementById('ranking-config').addEventListener('change', (event) => {
+        populateRankingConfigEditor(event.target.value);
+        loadDecisionContext();
+    });
     document.getElementById('scenario-select').addEventListener('change', (event) => {
         const selected = scenarios.find(item => item.scenario_id === event.target.value);
         applyScenarioToEditor(selected || null);
         loadDecisionContext();
+        loadScenarioSourceMetrics();
     });
     document.getElementById('external-user-id').addEventListener('change', loadDecisionContext);
     document.getElementById('source-filters').addEventListener('change', (event) => {
@@ -1084,6 +1945,22 @@ function setupEventListeners() {
         }
     });
     document.getElementById('save-source-settings').addEventListener('click', saveSourceSettings);
+    document.getElementById('save-ranking-config').addEventListener('click', async () => {
+        try {
+            await saveRankingConfig();
+        } catch (error) {
+            setRankingConfigStatus(error.message || 'Failed to save ranking config', true);
+            showError(error.message || 'Failed to save ranking config');
+        }
+    });
+    document.getElementById('delete-ranking-config').addEventListener('click', async () => {
+        try {
+            await deleteRankingConfig();
+        } catch (error) {
+            setRankingConfigStatus(error.message || 'Failed to delete ranking config', true);
+            showError(error.message || 'Failed to delete ranking config');
+        }
+    });
     document.getElementById('create-connector').addEventListener('click', async () => {
         try {
             await createConnector();
@@ -1104,8 +1981,10 @@ function setupEventListeners() {
     document.getElementById('connector-list').addEventListener('click', handleConnectorAction);
     document.getElementById('save-scenario').addEventListener('click', async () => {
         try {
+            applyRuleBuilderToJson();
             await saveScenario();
             await loadScenarioMetrics();
+            await loadScenarioSourceMetrics();
         } catch (error) {
             showError(error.message || 'Failed to save scenario');
         }
@@ -1114,12 +1993,78 @@ function setupEventListeners() {
         try {
             await deleteScenario();
             await loadScenarioMetrics();
+            await loadScenarioSourceMetrics();
         } catch (error) {
             showError(error.message || 'Failed to delete scenario');
         }
     });
     document.getElementById('refresh-scenarios').addEventListener('click', loadScenarios);
     document.getElementById('refresh-scenario-metrics').addEventListener('click', loadScenarioMetrics);
+    document.getElementById('refresh-scenario-source-metrics').addEventListener('click', loadScenarioSourceMetrics);
+    document.getElementById('apply-rule-builder').addEventListener('click', () => {
+        try {
+            applyRuleBuilderToJson();
+        } catch (error) {
+            setRuleBuilderStatus(error.message || 'Failed to apply builder', true);
+            showError(error.message || 'Failed to apply rule builder');
+        }
+    });
+    document.getElementById('load-rule-builder').addEventListener('click', () => {
+        try {
+            loadRuleBuilderFromJson();
+        } catch (error) {
+            setRuleBuilderStatus(error.message || 'Failed to load builder', true);
+            showError(error.message || 'Failed to load rule builder');
+        }
+    });
+    document.getElementById('simulate-scenario').addEventListener('click', async () => {
+        try {
+            await simulateSelectedScenario();
+        } catch (error) {
+            showError(error.message || 'Failed to simulate scenario');
+            document.getElementById('scenario-simulation').textContent = error.message || 'Failed to simulate scenario';
+        }
+    });
+    document.getElementById('refresh-sli').addEventListener('click', loadSliOverview);
+    document.getElementById('persist-incidents-on-sli').addEventListener('change', loadSliOverview);
+    document.getElementById('save-alert-thresholds').addEventListener('click', async () => {
+        try {
+            await saveAlertThresholds();
+            await loadSliOverview();
+        } catch (error) {
+            showError(error.message || 'Failed to save alert thresholds');
+        }
+    });
+    document.getElementById('evaluate-alert-incidents').addEventListener('click', async () => {
+        try {
+            await evaluateAlertIncidents();
+        } catch (error) {
+            showError(error.message || 'Failed to evaluate alert incidents');
+        }
+    });
+    document.getElementById('refresh-alert-incidents').addEventListener('click', loadAlertIncidents);
+    document.getElementById('incident-status-filter').addEventListener('change', loadAlertIncidents);
+    document.getElementById('incident-metric-filter').addEventListener('change', loadAlertIncidents);
+    document.getElementById('alert-incidents').addEventListener('click', async (event) => {
+        const button = event.target.closest('.resolve-incident');
+        if (!button) return;
+        try {
+            await resolveIncident(button.dataset.id);
+        } catch (error) {
+            showError(error.message || 'Failed to resolve incident');
+        }
+    });
+    document.getElementById('refresh-cleanup-status').addEventListener('click', loadCleanupStatus);
+    document.getElementById('run-cleanup-now').addEventListener('click', async () => {
+        try {
+            await runCleanupNow();
+        } catch (error) {
+            showError(error.message || 'Failed to run cleanup');
+        }
+    });
+    document.getElementById('refresh-audit-logs').addEventListener('click', loadAuditLogs);
+    document.getElementById('audit-actor-filter').addEventListener('change', loadAuditLogs);
+    document.getElementById('audit-resource-filter').addEventListener('change', loadAuditLogs);
 }
 
 function formatDate(dateString) {

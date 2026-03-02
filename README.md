@@ -13,6 +13,13 @@ A Flask-based article recommendation system that uses text embeddings to provide
   - Source priors
 - Source-aware recommendation filtering
 - Score explainability (feature values + weighted contributions)
+- UI operators console for:
+  - Source enable/weight controls
+  - Ranking config CRUD
+  - Scenario rule builder + simulation
+  - Recommendation run explorer (run history + trace inspection)
+  - SLI/alert thresholds + incidents
+  - Scenario/source KPI drilldowns
 - REST API + demo UI
 
 ## Requirements
@@ -183,6 +190,7 @@ python embed.py
   - alias: `/api/v1/events`
 - `GET /api/metrics/scenarios?days=30&top_articles=5`: Scenario-level reporting (impressions, clicks, CTR, conversions, top articles)
 - `GET /api/metrics/scenarios/<scenario_id>/sources?days=30`: Scenario KPI breakdown by source domain
+- `GET /api/metrics/trends?days=30&scenario_ids=homepage&source=www.e15.cz`: Daily trends for impressions/clicks/conversions/CTR (supports filters)
 - `GET /api/engine/config`: Full runtime engine configuration snapshot (sources/configs/scenarios/scheduler)
   - alias: `/api/v1/engine/config`
 - `GET /api/observability/overview?days=7`: SLA-oriented operational snapshot (recommendation latency stats, events throughput, connector failure rate)
