@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: article-recommender-postgres
+    environment:
+      POSTGRES_USER: recommender
+      POSTGRES_PASSWORD: recommender
+      POSTGRES_DB: article_recommender
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recommender -d article_recommender"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: article-recommender-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RECOMMENDER_DB_BACKEND: postgres
+      DATABASE_URL: postgresql://recommender:recommender@postgres:5432/article_recommender
+      API_HOST: 0.0.0.0
+      API_PORT: 5001
+      API_DEBUG: "False"
+    ports:
+      - "5001:5001"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

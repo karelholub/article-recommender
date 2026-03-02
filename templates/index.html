@@ -113,6 +113,47 @@
 
             <!-- Sidebar -->
             <div class="col-md-4">
+                <!-- Recommendation Controls -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">Recommendation Controls</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-3">
+                            <label for="ranking-config" class="form-label">Ranking Configuration</label>
+                            <select id="ranking-config" class="form-select"></select>
+                        </div>
+                        <div>
+                            <label class="form-label">Sources</label>
+                            <div id="source-filters" class="small text-muted">Loading sources...</div>
+                        </div>
+                        <div class="mt-3">
+                            <button id="save-source-settings" class="btn btn-sm btn-outline-secondary">
+                                Save Source Defaults
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Source Connectors -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">Source Connectors</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-2">
+                            <input id="connector-name" class="form-control form-control-sm mb-2" placeholder="Connector name">
+                            <select id="connector-type" class="form-select form-select-sm mb-2">
+                                <option value="section_scraper">section_scraper</option>
+                                <option value="rss">rss</option>
+                            </select>
+                            <input id="connector-url" class="form-control form-control-sm mb-2" placeholder="Base URL / Feed URL">
+                            <button id="create-connector" class="btn btn-sm btn-outline-primary">Create Connector</button>
+                        </div>
+                        <div id="connector-list" class="small text-muted">Loading connectors...</div>
+                    </div>
+                </div>
+
                 <!-- BERT Explanation -->
                 <div class="card mb-4">
                     <div class="card-header">
@@ -153,6 +194,16 @@
                                 <p class="mt-2">Loading statistics...</p>
                             </div>
                         </div>
+                    </div>
+                </div>
+
+                <!-- Offline Metrics -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h3 class="mb-0">Offline Metrics</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="offline-metrics" class="small text-muted">Loading metrics...</div>
                     </div>
                 </div>
 

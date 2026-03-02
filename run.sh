@@ -1,12 +1,12 @@
 #!/bin/bash
+set -euo pipefail
 
-# Build the frontend
-echo "Building frontend..."
-cd frontend
-npm install
-npm run build
-cd ..
+if [ -f ".venv/bin/activate" ]; then
+  source .venv/bin/activate
+fi
 
-# Start the Flask server
-echo "Starting Flask server..."
-python app.py 
+echo "Ensuring local data files exist..."
+python bootstrap_data.py
+
+echo "Starting Flask server on http://localhost:5001"
+python app.py
