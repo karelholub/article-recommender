@@ -235,3 +235,19 @@ def test_event_rollups_sqlite(tmp_path):
     assert rows
     assert rows[0]['impressions'] >= 1
     assert rows[0]['clicks'] >= 1
+
+
+def test_quality_snapshots_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    created = store.create_quality_snapshot(
+        snapshot_type='offline_quality',
+        window_days=30,
+        metrics={'avg_score': 0.5, 'runs_analyzed': 10},
+        metadata={'label': 'baseline'},
+    )
+    assert created['snapshot_id']
+    rows = store.list_quality_snapshots(snapshot_type='offline_quality', limit=10, offset=0)
+    assert rows
+    loaded = store.get_quality_snapshot(created['snapshot_id'])
+    assert loaded is not None
+    assert loaded['metrics']['avg_score'] == 0.5

@@ -187,6 +187,9 @@ python embed.py
 - `GET /api/recommendation-runs/<run_id>`: Full trace for one run
 - `GET /api/recommendation-runs/<run_id>/decision-flow`: Per-item scenario decision waterfall (kept/filtered, score before/after, boost, reason, final rank)
 - `GET /api/metrics/offline?limit_runs=100`: Offline aggregate metrics from stored runs
+- `POST /api/metrics/offline/snapshots`: Persist a quality snapshot from offline metrics (label/window/limit metadata)
+- `GET /api/metrics/offline/snapshots?snapshot_type=offline_quality&limit=30`: List persisted quality snapshots
+- `GET /api/metrics/offline/snapshots/compare?baseline_id=<id>&candidate_id=<id>`: Compare two snapshots with metric deltas
 - `POST /api/recommendations/cms`: CMS-style recommendation integration payload (external ID + placement + trace)
   - supports `Idempotency-Key` header
   - alias: `POST /api/v1/recommendations/cms`
@@ -240,6 +243,8 @@ Retention cleanup job:
 Alert/SLO thresholds are persisted and currently support:
 - `recommendation_p95_ms`
 - `connector_failure_rate`
+- `connector_blocker_rate`
+- `max_rollup_lag_hours`
 - `min_ctr`
 
 Example query endpoint payload:

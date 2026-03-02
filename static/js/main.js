@@ -20,6 +20,8 @@ let reportingLastIdentity = null;
 let reportingLastScenarioTraces = null;
 let reportingLastIdentityDiagnostics = null;
 let reportingLastExperiments = null;
+let reportingQualitySnapshots = [];
+let reportingLastQualityCompare = null;
 let recommendationRuns = [];
 
 function hasElement(id) {
@@ -53,7 +55,10 @@ document.addEventListener('DOMContentLoaded', () => {
         setInterval(loadSchedulerStatus, 15000);
     }
     if (hasElement('decision-context')) loadDecisionContext();
-    if (hasElement('reporting-summary')) loadReportingWorkspace();
+    if (hasElement('reporting-summary')) {
+        loadReportingWorkspace();
+        loadQualitySnapshotHistory();
+    }
     setupEventListeners();
 });
 
@@ -1139,6 +1144,8 @@ async function loadAlertThresholds() {
         alertThresholds = payload.thresholds || {};
         document.getElementById('threshold-p95-ms').value = Number(alertThresholds.recommendation_p95_ms ?? 500);
         document.getElementById('threshold-failure-rate').value = Number(alertThresholds.connector_failure_rate ?? 0.05);
+        document.getElementById('threshold-blocker-rate').value = Number(alertThresholds.connector_blocker_rate ?? 0.2);
+        document.getElementById('threshold-rollup-lag-hours').value = Number(alertThresholds.max_rollup_lag_hours ?? 24);
         document.getElementById('threshold-min-ctr').value = Number(alertThresholds.min_ctr ?? 0.01);
     } catch (error) {
         console.error('Error loading alert thresholds:', error);
@@ -1149,6 +1156,8 @@ async function loadAlertThresholds() {
 async function saveAlertThresholds() {
     const recommendationP95 = Number(document.getElementById('threshold-p95-ms').value);
     const connectorFailureRate = Number(document.getElementById('threshold-failure-rate').value);
+    const connectorBlockerRate = Number(document.getElementById('threshold-blocker-rate').value);
+    const maxRollupLagHours = Number(document.getElementById('threshold-rollup-lag-hours').value);
     const minCtr = Number(document.getElementById('threshold-min-ctr').value);
     const statusEl = document.getElementById('alert-thresholds-status');
     statusEl.textContent = 'Saving thresholds...';
@@ -1159,6 +1168,8 @@ async function saveAlertThresholds() {
             thresholds: {
                 recommendation_p95_ms: recommendationP95,
                 connector_failure_rate: connectorFailureRate,
+                connector_blocker_rate: connectorBlockerRate,
+                max_rollup_lag_hours: maxRollupLagHours,
                 min_ctr: minCtr
             }
         })
@@ -1734,6 +1745,111 @@ function renderScenarioTraceMetrics(payload) {
     table.innerHTML = rows || '<tr><td colspan="6" class="text-muted">No scenario trace data in selected window.</td></tr>';
 }
 
+function formatSnapshotOption(snapshot) {
+    const label = (snapshot.metadata || {}).label ? ` | ${(snapshot.metadata || {}).label}` : '';
+    return `${snapshot.created_at} | ${snapshot.snapshot_id.slice(0, 8)} | avg_score ${Number((snapshot.metrics || {}).avg_score || 0).toFixed(4)}${label}`;
+}
+
+function renderQualitySnapshotSelectors() {
+    const baseline = document.getElementById('quality-baseline');
+    const candidate = document.getElementById('quality-candidate');
+    if (!baseline || !candidate) return;
+    const options = reportingQualitySnapshots.map(snapshot => (
+        `<option value="${snapshot.snapshot_id}">${formatSnapshotOption(snapshot)}</option>`
+    )).join('');
+    baseline.innerHTML = options || '<option value="">No snapshots</option>';
+    candidate.innerHTML = options || '<option value="">No snapshots</option>';
+    if (reportingQualitySnapshots.length >= 2) {
+        baseline.value = reportingQualitySnapshots[1].snapshot_id;
+        candidate.value = reportingQualitySnapshots[0].snapshot_id;
+    } else if (reportingQualitySnapshots.length === 1) {
+        baseline.value = reportingQualitySnapshots[0].snapshot_id;
+        candidate.value = reportingQualitySnapshots[0].snapshot_id;
+    }
+}
+
+function renderQualitySnapshotCompare(payload) {
+    reportingLastQualityCompare = payload;
+    const summary = document.getElementById('reporting-quality-summary');
+    const table = document.getElementById('reporting-quality-compare-table');
+    if (summary) {
+        summary.innerHTML = `
+            <strong>Quality snapshots:</strong>
+            baseline ${payload.baseline.snapshot_id.slice(0, 8)} (${payload.baseline.created_at}),
+            candidate ${payload.candidate.snapshot_id.slice(0, 8)} (${payload.candidate.created_at})
+        `;
+    }
+    if (table) {
+        const rows = (payload.deltas || []).map(item => `
+            <tr>
+                <td>${item.metric}</td>
+                <td>${item.baseline ?? 'n/a'}</td>
+                <td>${item.candidate ?? 'n/a'}</td>
+                <td>${item.delta === null || item.delta === undefined ? 'n/a' : Number(item.delta).toFixed(6)}</td>
+                <td>${item.delta_pct === null || item.delta_pct === undefined ? 'n/a' : `${(Number(item.delta_pct) * 100).toFixed(2)}%`}</td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="5" class="text-muted">No comparable numeric metrics.</td></tr>';
+    }
+}
+
+async function loadQualitySnapshotHistory() {
+    const summary = document.getElementById('reporting-quality-summary');
+    try {
+        const response = await fetch('/api/metrics/offline/snapshots?snapshot_type=offline_quality&limit=30');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load quality snapshots');
+        }
+        const payload = await response.json();
+        reportingQualitySnapshots = payload.snapshots || [];
+        renderQualitySnapshotSelectors();
+        if (summary) {
+            summary.textContent = `Loaded ${reportingQualitySnapshots.length} quality snapshots.`;
+        }
+        const table = document.getElementById('reporting-quality-compare-table');
+        if (table && !reportingQualitySnapshots.length) {
+            table.innerHTML = '<tr><td colspan="5" class="text-muted">No quality snapshots yet.</td></tr>';
+        }
+    } catch (error) {
+        if (summary) summary.textContent = `Quality snapshots unavailable: ${error.message}`;
+    }
+}
+
+async function captureQualitySnapshot() {
+    const days = Number(document.getElementById('reporting-days')?.value || 30);
+    const response = await fetch('/api/metrics/offline/snapshots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            snapshot_type: 'offline_quality',
+            window_days: Number.isFinite(days) ? Math.max(1, Math.min(365, Math.round(days))) : 30,
+            limit_runs: 200,
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to capture quality snapshot');
+    }
+    await loadQualitySnapshotHistory();
+}
+
+async function compareQualitySnapshots() {
+    const baselineId = document.getElementById('quality-baseline')?.value || '';
+    const candidateId = document.getElementById('quality-candidate')?.value || '';
+    if (!baselineId || !candidateId) {
+        throw new Error('Select baseline and candidate snapshots');
+    }
+    const response = await fetch(`/api/metrics/offline/snapshots/compare?baseline_id=${encodeURIComponent(baselineId)}&candidate_id=${encodeURIComponent(candidateId)}`);
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to compare quality snapshots');
+    }
+    const payload = await response.json();
+    renderQualitySnapshotCompare(payload);
+}
+
 async function loadReportingWorkspace() {
     try {
         const days = Number(document.getElementById('reporting-days')?.value || 30);
@@ -1848,6 +1964,13 @@ function exportReportingCsv() {
                 item.ctr,
                 item.conversion_rate
             ]);
+        });
+    }
+    if (reportingLastQualityCompare) {
+        rows.push([]);
+        rows.push(['quality_metric', 'baseline', 'candidate', 'delta', 'delta_pct']);
+        (reportingLastQualityCompare.deltas || []).forEach(item => {
+            rows.push([item.metric, item.baseline, item.candidate, item.delta, item.delta_pct]);
         });
     }
     if (reportingLastIdentity) {
@@ -2345,6 +2468,20 @@ function setupEventListeners() {
     on('reporting-scenario-filter', 'change', loadReportingWorkspace);
     on('reporting-source-filter', 'change', loadReportingWorkspace);
     on('reporting-top-runs', 'change', loadReportingWorkspace);
+    on('capture-quality-snapshot', 'click', async () => {
+        try {
+            await captureQualitySnapshot();
+        } catch (error) {
+            showError(error.message || 'Failed to capture quality snapshot');
+        }
+    });
+    on('compare-quality-snapshots', 'click', async () => {
+        try {
+            await compareQualitySnapshots();
+        } catch (error) {
+            showError(error.message || 'Failed to compare snapshots');
+        }
+    });
     on('refresh-run-explorer', 'click', loadRecommendationRuns);
     on('run-limit', 'change', loadRecommendationRuns);
     on('run-list', 'click', async (event) => {

@@ -156,6 +156,26 @@ class BaseRecommenderStore:
     ) -> List[Dict]:
         raise NotImplementedError
 
+    def create_quality_snapshot(
+        self,
+        snapshot_type: str,
+        window_days: int,
+        metrics: Dict,
+        metadata: Optional[Dict] = None,
+    ) -> Dict:
+        raise NotImplementedError
+
+    def list_quality_snapshots(
+        self,
+        snapshot_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict]:
+        raise NotImplementedError
+
+    def get_quality_snapshot(self, snapshot_id: str) -> Optional[Dict]:
+        raise NotImplementedError
+
     def get_idempotency_record(self, endpoint: str, key: str, max_age_hours: int = 24) -> Optional[Dict]:
         raise NotImplementedError
 
@@ -276,6 +296,8 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
         "recommendation_p95_ms": 500.0,
         "connector_failure_rate": 0.05,
         "min_ctr": 0.01,
+        "max_rollup_lag_hours": 24.0,
+        "connector_blocker_rate": 0.2,
     }
 
     def __init__(self, db_path: str = "data/recommender.db"):
@@ -421,6 +443,15 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                     PRIMARY KEY (day, scenario_id, source)
                 );
 
+                CREATE TABLE IF NOT EXISTS quality_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    snapshot_type TEXT NOT NULL,
+                    window_days INTEGER NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS alert_thresholds (
                     threshold_id TEXT PRIMARY KEY,
                     thresholds_json TEXT NOT NULL,
@@ -467,6 +498,9 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
 
                 CREATE INDEX IF NOT EXISTS idx_event_rollups_scenario_source
                     ON event_rollups_daily(scenario_id, source, day);
+
+                CREATE INDEX IF NOT EXISTS idx_quality_snapshots_type_created
+                    ON quality_snapshots(snapshot_type, created_at DESC);
 
                 CREATE INDEX IF NOT EXISTS idx_api_idempotency_created_at
                     ON api_idempotency_keys(created_at);
@@ -1647,6 +1681,97 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
             for row in rows
         ]
 
+    def create_quality_snapshot(
+        self,
+        snapshot_type: str,
+        window_days: int,
+        metrics: Dict,
+        metadata: Optional[Dict] = None,
+    ) -> Dict:
+        now = self._now()
+        snapshot_id = str(uuid.uuid4())
+        payload = {
+            "snapshot_id": snapshot_id,
+            "snapshot_type": str(snapshot_type or "offline_quality"),
+            "window_days": int(window_days),
+            "metrics": metrics or {},
+            "metadata": metadata or {},
+            "created_at": now,
+        }
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO quality_snapshots
+                (snapshot_id, snapshot_type, window_days, metrics_json, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["snapshot_id"],
+                    payload["snapshot_type"],
+                    payload["window_days"],
+                    json.dumps(payload["metrics"], ensure_ascii=False),
+                    json.dumps(payload["metadata"], ensure_ascii=False),
+                    payload["created_at"],
+                ),
+            )
+        return payload
+
+    def list_quality_snapshots(
+        self,
+        snapshot_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict]:
+        params: List = []
+        where = ""
+        if snapshot_type:
+            where = "WHERE snapshot_type = ?"
+            params.append(snapshot_type)
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT snapshot_id, snapshot_type, window_days, metrics_json, metadata_json, created_at
+                FROM quality_snapshots
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                OFFSET ?
+                """,
+                (*params, int(limit), int(offset)),
+            ).fetchall()
+        return [
+            {
+                "snapshot_id": row["snapshot_id"],
+                "snapshot_type": row["snapshot_type"],
+                "window_days": int(row["window_days"]),
+                "metrics": json.loads(row["metrics_json"] or "{}"),
+                "metadata": json.loads(row["metadata_json"] or "{}"),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def get_quality_snapshot(self, snapshot_id: str) -> Optional[Dict]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT snapshot_id, snapshot_type, window_days, metrics_json, metadata_json, created_at
+                FROM quality_snapshots
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "snapshot_id": row["snapshot_id"],
+            "snapshot_type": row["snapshot_type"],
+            "window_days": int(row["window_days"]),
+            "metrics": json.loads(row["metrics_json"] or "{}"),
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+            "created_at": row["created_at"],
+        }
+
     def compute_scenario_metrics(self, days: int = 30, top_articles: int = 5) -> Dict:
         cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d %H:%M:%S")
         with self._managed_connection() as conn:
@@ -1854,6 +1979,8 @@ class PostgresRecommenderStore(BaseRecommenderStore):
         "recommendation_p95_ms": 500.0,
         "connector_failure_rate": 0.05,
         "min_ctr": 0.01,
+        "max_rollup_lag_hours": 24.0,
+        "connector_blocker_rate": 0.2,
     }
 
     def __init__(self, database_url: str):
@@ -2066,6 +2193,18 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 )
                 cur.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS quality_snapshots (
+                        snapshot_id UUID PRIMARY KEY,
+                        snapshot_type TEXT NOT NULL,
+                        window_days INTEGER NOT NULL,
+                        metrics_json JSONB NOT NULL,
+                        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL
+                    );
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_recommendation_events_created_at
                     ON recommendation_events(created_at);
                     """
@@ -2110,6 +2249,12 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                     """
                     CREATE INDEX IF NOT EXISTS idx_event_rollups_scenario_source
                     ON event_rollups_daily(scenario_id, source, day);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_quality_snapshots_type_created
+                    ON quality_snapshots(snapshot_type, created_at DESC);
                     """
                 )
                 cur.execute(
@@ -2966,6 +3111,102 @@ class PostgresRecommenderStore(BaseRecommenderStore):
             }
             for row in rows
         ]
+
+    def create_quality_snapshot(
+        self,
+        snapshot_type: str,
+        window_days: int,
+        metrics: Dict,
+        metadata: Optional[Dict] = None,
+    ) -> Dict:
+        snapshot_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        payload = {
+            "snapshot_id": snapshot_id,
+            "snapshot_type": str(snapshot_type or "offline_quality"),
+            "window_days": int(window_days),
+            "metrics": metrics or {},
+            "metadata": metadata or {},
+            "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO quality_snapshots
+                    (snapshot_id, snapshot_type, window_days, metrics_json, metadata_json, created_at)
+                    VALUES (%s::uuid, %s, %s, %s::jsonb, %s::jsonb, %s)
+                    """,
+                    (
+                        payload["snapshot_id"],
+                        payload["snapshot_type"],
+                        payload["window_days"],
+                        json.dumps(payload["metrics"], ensure_ascii=False),
+                        json.dumps(payload["metadata"], ensure_ascii=False),
+                        now,
+                    ),
+                )
+        return payload
+
+    def list_quality_snapshots(
+        self,
+        snapshot_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict]:
+        params: List = []
+        where = ""
+        if snapshot_type:
+            where = "WHERE snapshot_type = %s"
+            params.append(snapshot_type)
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT snapshot_id::text, snapshot_type, window_days, metrics_json::text, metadata_json::text, created_at
+                    FROM quality_snapshots
+                    {where}
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    OFFSET %s
+                    """,
+                    (*params, int(limit), int(offset)),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "snapshot_id": row[0],
+                "snapshot_type": row[1],
+                "window_days": int(row[2]),
+                "metrics": json.loads(row[3] or "{}"),
+                "metadata": json.loads(row[4] or "{}"),
+                "created_at": row[5].strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            for row in rows
+        ]
+
+    def get_quality_snapshot(self, snapshot_id: str) -> Optional[Dict]:
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT snapshot_id::text, snapshot_type, window_days, metrics_json::text, metadata_json::text, created_at
+                    FROM quality_snapshots
+                    WHERE snapshot_id = %s::uuid
+                    """,
+                    (snapshot_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "snapshot_id": row[0],
+            "snapshot_type": row[1],
+            "window_days": int(row[2]),
+            "metrics": json.loads(row[3] or "{}"),
+            "metadata": json.loads(row[4] or "{}"),
+            "created_at": row[5].strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
     def compute_scenario_metrics(self, days: int = 30, top_articles: int = 5) -> Dict:
         cutoff = datetime.now(UTC) - timedelta(days=max(1, int(days)))

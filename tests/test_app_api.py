@@ -233,6 +233,33 @@ def test_recommendation_context_endpoint_reflects_source_defaults():
     assert restore.status_code == 200
 
 
+def test_offline_quality_snapshot_endpoints():
+    client = app.test_client()
+    create_resp = client.post(
+        '/api/metrics/offline/snapshots',
+        json={'snapshot_type': 'offline_quality', 'window_days': 30, 'limit_runs': 100, 'actor_id': 'qa-user'},
+    )
+    assert create_resp.status_code == 201
+    created = create_resp.get_json()
+    assert created['api_version'] == 'v1'
+    snapshot_id = created['snapshot']['snapshot_id']
+
+    list_resp = client.get('/api/metrics/offline/snapshots?snapshot_type=offline_quality&limit=10')
+    assert list_resp.status_code == 200
+    listed = list_resp.get_json()
+    assert listed['api_version'] == 'v1'
+    assert any(item['snapshot_id'] == snapshot_id for item in listed['snapshots'])
+
+    compare_resp = client.get(
+        f'/api/metrics/offline/snapshots/compare?baseline_id={snapshot_id}&candidate_id={snapshot_id}'
+    )
+    assert compare_resp.status_code == 200
+    compared = compare_resp.get_json()
+    assert compared['api_version'] == 'v1'
+    assert compared['baseline']['snapshot_id'] == snapshot_id
+    assert 'deltas' in compared
+
+
 def test_disabled_source_not_used_by_default_query():
     client = app.test_client()
     sources_payload = client.get('/api/sources').get_json()
@@ -1078,6 +1105,8 @@ def test_alert_thresholds_and_sli_endpoints():
             'thresholds': {
                 'recommendation_p95_ms': 600,
                 'connector_failure_rate': 0.2,
+                'connector_blocker_rate': 0.3,
+                'max_rollup_lag_hours': 48,
                 'min_ctr': 0.0,
             }
         },
@@ -1085,6 +1114,8 @@ def test_alert_thresholds_and_sli_endpoints():
     assert put_resp.status_code == 200
     put_payload = put_resp.get_json()
     assert put_payload['thresholds']['recommendation_p95_ms'] == 600.0
+    assert put_payload['thresholds']['connector_blocker_rate'] == 0.3
+    assert put_payload['thresholds']['max_rollup_lag_hours'] == 48.0
 
     sli_resp = client.get('/api/v1/observability/sli?days=30')
     assert sli_resp.status_code == 200
@@ -1092,6 +1123,9 @@ def test_alert_thresholds_and_sli_endpoints():
     assert sli_payload['api_version'] == 'v1'
     assert 'overall_status' in sli_payload
     assert isinstance(sli_payload['checks'], list)
+    metrics = {item['metric'] for item in sli_payload['checks']}
+    assert 'connector_blocker_rate' in metrics
+    assert 'max_rollup_lag_hours' in metrics
 
 
 def test_alert_incidents_endpoints():

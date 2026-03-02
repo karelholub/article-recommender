@@ -132,6 +132,22 @@ def _safe_article_age_days(scraped_at: str) -> Optional[int]:
         return None
 
 
+def _safe_parse_timestamp(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _extract_error_code(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.split(":", 1)[0].strip().lower()
+
+
 def _resolve_experiment_assignment(
     experiment: Optional[Dict],
     effective_user_id: str,
@@ -511,21 +527,42 @@ def _compute_observability_snapshot(days: int) -> Dict:
     connectors = store.list_connectors()
     connector_run_total = 0
     connector_failures = 0
+    connector_attempted_total = 0
+    connector_blocked_total = 0
+    blocker_codes = {"blocked_cookie_wall", "blocked_paywall", "blocked_login_wall"}
     for connector in connectors:
         runs = store.list_connector_runs(connector["connector_id"], limit=100)
         for run in runs:
             started = run.get("started_at")
             if not started:
                 continue
-            started_at = datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+            started_at = _safe_parse_timestamp(started)
+            if started_at is None:
+                continue
             if started_at < cutoff:
                 continue
             connector_run_total += 1
+            connector_attempted_total += int(run.get("attempted", 0) or 0)
             if run["status"] == "failed":
                 connector_failures += 1
+            for error in (run.get("errors") or []):
+                if _extract_error_code(error) in blocker_codes:
+                    connector_blocked_total += 1
 
     ctr = round((events_by_type["click"] / events_by_type["impression"]), 4) if events_by_type["impression"] else 0.0
     connector_failure_rate = round((connector_failures / connector_run_total), 4) if connector_run_total else 0.0
+    connector_blocker_rate = (
+        round((connector_blocked_total / connector_attempted_total), 4) if connector_attempted_total else 0.0
+    )
+    rollup_rows = store.list_event_rollups(days=days)
+    latest_rollup_at = None
+    for row in rollup_rows:
+        ts = _safe_parse_timestamp(str(row.get("updated_at", "")))
+        if ts and (latest_rollup_at is None or ts > latest_rollup_at):
+            latest_rollup_at = ts
+    rollup_lag_hours = None
+    if latest_rollup_at:
+        rollup_lag_hours = max(0.0, round((datetime.now() - latest_rollup_at).total_seconds() / 3600.0, 2))
     thresholds = store.get_alert_thresholds()
 
     return {
@@ -549,6 +586,14 @@ def _compute_observability_snapshot(days: int) -> Dict:
             "runs": connector_run_total,
             "failed_runs": connector_failures,
             "failure_rate": connector_failure_rate,
+            "attempted_total": connector_attempted_total,
+            "blocked_total": connector_blocked_total,
+            "blocker_rate": connector_blocker_rate,
+        },
+        "rollups": {
+            "rows": len(rollup_rows),
+            "latest_updated_at": latest_rollup_at.strftime("%Y-%m-%d %H:%M:%S") if latest_rollup_at else None,
+            "lag_hours": rollup_lag_hours,
         },
         "slo_targets": thresholds,
     }
@@ -558,6 +603,8 @@ def _build_sli_checks(snapshot: Dict) -> list:
     thresholds = snapshot.get("slo_targets", {})
     p95 = snapshot.get("recommendation_api", {}).get("p95_duration_ms")
     failure_rate = snapshot.get("connectors", {}).get("failure_rate", 0.0)
+    blocker_rate = snapshot.get("connectors", {}).get("blocker_rate", 0.0)
+    rollup_lag_hours = snapshot.get("rollups", {}).get("lag_hours")
     ctr = snapshot.get("events", {}).get("ctr", 0.0)
     return [
         {
@@ -571,6 +618,25 @@ def _build_sli_checks(snapshot: Dict) -> list:
             "value": failure_rate,
             "target_max": float(thresholds.get("connector_failure_rate", 0.05)),
             "status": "pass" if failure_rate <= float(thresholds.get("connector_failure_rate", 0.05)) else "warn",
+        },
+        {
+            "metric": "connector_blocker_rate",
+            "value": blocker_rate,
+            "target_max": float(thresholds.get("connector_blocker_rate", 0.2)),
+            "status": "pass" if blocker_rate <= float(thresholds.get("connector_blocker_rate", 0.2)) else "warn",
+        },
+        {
+            "metric": "max_rollup_lag_hours",
+            "value": rollup_lag_hours,
+            "target_max": float(thresholds.get("max_rollup_lag_hours", 24.0)),
+            "status": (
+                "pass"
+                if (
+                    rollup_lag_hours is not None
+                    and rollup_lag_hours <= float(thresholds.get("max_rollup_lag_hours", 24.0))
+                )
+                else "warn"
+            ),
         },
         {
             "metric": "ctr",
@@ -2098,6 +2164,111 @@ def get_offline_metrics():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/metrics/offline/snapshots", methods=["GET", "POST"])
+def offline_quality_snapshots():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        if request.method == "GET":
+            snapshot_type = str(request.args.get("snapshot_type", "offline_quality")).strip() or None
+            limit = max(1, min(200, int(request.args.get("limit", 50))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            rows = store.list_quality_snapshots(
+                snapshot_type=snapshot_type,
+                limit=limit + 1,
+                offset=offset,
+            )
+            has_more = len(rows) > limit
+            snapshots = rows[:limit]
+            return jsonify(
+                {
+                    "api_version": "v1",
+                    "snapshot_type": snapshot_type,
+                    "snapshots": snapshots,
+                    "count": len(snapshots),
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": has_more,
+                    "next_offset": (offset + limit) if has_more else None,
+                }
+            )
+
+        payload = request.get_json(silent=True) or {}
+        limit_runs = max(10, min(1000, int(payload.get("limit_runs", 100))))
+        window_days = max(1, min(365, int(payload.get("window_days", 30))))
+        snapshot_type = str(payload.get("snapshot_type", "offline_quality")).strip() or "offline_quality"
+        label = str(payload.get("label", "")).strip()
+        metrics = store.compute_offline_metrics(limit_runs=limit_runs)
+        snapshot = store.create_quality_snapshot(
+            snapshot_type=snapshot_type,
+            window_days=window_days,
+            metrics=metrics,
+            metadata={"label": label, "limit_runs": limit_runs, "created_by": _request_actor_id(payload)},
+        )
+        _record_audit(
+            action="create",
+            resource_type="quality_snapshot",
+            resource_id=snapshot["snapshot_id"],
+            payload=payload,
+            extra={"snapshot_type": snapshot_type},
+        )
+        return jsonify({"api_version": "v1", "snapshot": snapshot}), 201
+    except Exception as e:
+        logger.error(f"Error handling quality snapshots: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/offline/snapshots/compare", methods=["GET"])
+def compare_offline_quality_snapshots():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        baseline_id = str(request.args.get("baseline_id", "")).strip()
+        candidate_id = str(request.args.get("candidate_id", "")).strip()
+        if not baseline_id or not candidate_id:
+            return jsonify({"error": "baseline_id and candidate_id are required"}), 400
+
+        baseline = store.get_quality_snapshot(baseline_id)
+        candidate = store.get_quality_snapshot(candidate_id)
+        if not baseline or not candidate:
+            return jsonify({"error": "Snapshot not found"}), 404
+
+        keys = sorted(set((baseline.get("metrics") or {}).keys()) | set((candidate.get("metrics") or {}).keys()))
+        deltas = []
+        for key in keys:
+            base_value = (baseline.get("metrics") or {}).get(key)
+            cand_value = (candidate.get("metrics") or {}).get(key)
+            if isinstance(base_value, (int, float)) and isinstance(cand_value, (int, float)):
+                delta = round(float(cand_value) - float(base_value), 6)
+                pct = round((delta / float(base_value)), 6) if float(base_value) != 0 else None
+            else:
+                delta = None
+                pct = None
+            deltas.append(
+                {
+                    "metric": key,
+                    "baseline": base_value,
+                    "candidate": cand_value,
+                    "delta": delta,
+                    "delta_pct": pct,
+                }
+            )
+
+        return jsonify(
+            {
+                "api_version": "v1",
+                "baseline": baseline,
+                "candidate": candidate,
+                "deltas": deltas,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error comparing quality snapshots: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/similar/<article_id>")
 def get_similar_articles(article_id):
     if not recommender:
@@ -3183,17 +3354,29 @@ def alerts_thresholds():
     try:
         payload = request.get_json() or {}
         threshold_values = payload.get("thresholds", payload)
-        validated = {
-            "recommendation_p95_ms": float(threshold_values.get("recommendation_p95_ms")),
-            "connector_failure_rate": float(threshold_values.get("connector_failure_rate")),
-            "min_ctr": float(threshold_values.get("min_ctr")),
-        }
-        if validated["recommendation_p95_ms"] <= 0:
+        current = store.get_alert_thresholds()
+        validated = dict(current)
+        if "recommendation_p95_ms" in threshold_values:
+            validated["recommendation_p95_ms"] = float(threshold_values.get("recommendation_p95_ms"))
+        if "connector_failure_rate" in threshold_values:
+            validated["connector_failure_rate"] = float(threshold_values.get("connector_failure_rate"))
+        if "min_ctr" in threshold_values:
+            validated["min_ctr"] = float(threshold_values.get("min_ctr"))
+        if "max_rollup_lag_hours" in threshold_values:
+            validated["max_rollup_lag_hours"] = float(threshold_values.get("max_rollup_lag_hours"))
+        if "connector_blocker_rate" in threshold_values:
+            validated["connector_blocker_rate"] = float(threshold_values.get("connector_blocker_rate"))
+
+        if float(validated["recommendation_p95_ms"]) <= 0:
             return jsonify({"error": "recommendation_p95_ms must be > 0"}), 400
-        if not (0 <= validated["connector_failure_rate"] <= 1):
+        if not (0 <= float(validated["connector_failure_rate"]) <= 1):
             return jsonify({"error": "connector_failure_rate must be in [0, 1]"}), 400
-        if not (0 <= validated["min_ctr"] <= 1):
+        if not (0 <= float(validated["min_ctr"]) <= 1):
             return jsonify({"error": "min_ctr must be in [0, 1]"}), 400
+        if float(validated.get("max_rollup_lag_hours", 24.0)) <= 0:
+            return jsonify({"error": "max_rollup_lag_hours must be > 0"}), 400
+        if not (0 <= float(validated.get("connector_blocker_rate", 0.2)) <= 1):
+            return jsonify({"error": "connector_blocker_rate must be in [0, 1]"}), 400
 
         stored = store.upsert_alert_thresholds(validated)
         _record_audit(
