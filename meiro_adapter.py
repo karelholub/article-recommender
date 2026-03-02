@@ -59,6 +59,15 @@ class MeiroAdapter:
         raise RuntimeError(f"Meiro request failed: {last_exc}")
 
     def fetch_profile_payload(self, external_user_id: str) -> Dict[str, Any]:
+        request_url_template = str(self.config.get("request_url_template", "")).strip()
+        if request_url_template:
+            return self._fetch_json(
+                request_url_template.format(
+                    external_user_id=external_user_id,
+                    value=external_user_id,
+                )
+            )
+
         base_url = str(self.config.get("base_url", "")).strip().rstrip("/")
         if not base_url:
             raise ValueError("Meiro base_url is required")
@@ -79,9 +88,12 @@ class MeiroAdapter:
         fallback_external_user_id: str = "",
     ) -> MeiroProfile:
         cfg = mapping or {}
-        external_id_path = str(cfg.get("external_id_path", "external_id")).strip()
-        traits_path = str(cfg.get("traits_path", "traits")).strip()
-        segments_path = str(cfg.get("segments_path", "segments")).strip()
+        external_id_path = str(cfg.get("external_id_path", "customer_entity_id")).strip()
+        traits_path = str(cfg.get("traits_path", "returned_attributes")).strip()
+        segments_path = str(cfg.get("segments_path", "")).strip()
+        fixed_segments = cfg.get("fixed_segments") or []
+        if not isinstance(fixed_segments, list):
+            fixed_segments = []
 
         external_user_id = str(_get_by_path(payload, external_id_path, fallback_external_user_id) or "").strip()
         if not external_user_id:
@@ -97,6 +109,10 @@ class MeiroAdapter:
             segments = [str(item).strip() for item in segments_raw if str(item).strip()]
         elif isinstance(segments_raw, str):
             segments = [part.strip() for part in segments_raw.split(",") if part.strip()]
+        for segment in fixed_segments:
+            value = str(segment).strip()
+            if value and value not in segments:
+                segments.append(value)
 
         return MeiroProfile(
             external_user_id=external_user_id,

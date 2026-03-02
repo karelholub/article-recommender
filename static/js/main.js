@@ -1344,10 +1344,15 @@ async function loadCdpConfig() {
         cdpIntegration = payload;
         document.getElementById('cdp-enabled').checked = Boolean(payload.enabled);
         document.getElementById('cdp-base-url').value = payload.config?.base_url || '';
+        document.getElementById('cdp-request-url-template').value = payload.config?.request_url_template || '';
         document.getElementById('cdp-profile-endpoint-template').value = payload.config?.profile_endpoint_template || '/profiles/{external_user_id}';
         document.getElementById('cdp-api-key').value = payload.config?.api_key || '';
         document.getElementById('cdp-timeout-seconds').value = Number(payload.config?.timeout_seconds ?? 5);
         document.getElementById('cdp-request-retries').value = Number(payload.config?.request_retries ?? 2);
+        document.getElementById('cdp-external-id-path').value = payload.mapping?.external_id_path || 'customer_entity_id';
+        document.getElementById('cdp-traits-path').value = payload.mapping?.traits_path || 'returned_attributes';
+        document.getElementById('cdp-segments-path').value = payload.mapping?.segments_path || '';
+        document.getElementById('cdp-fixed-segments').value = (payload.mapping?.fixed_segments || []).join(', ');
         document.getElementById('cdp-preferred-sources-trait').value = payload.mapping?.preferred_sources_trait || 'preferred_sources';
         document.getElementById('cdp-excluded-sources-trait').value = payload.mapping?.excluded_sources_trait || 'excluded_sources';
         document.getElementById('cdp-source-weights-trait').value = payload.mapping?.source_weights_trait || 'source_weights';
@@ -1375,12 +1380,17 @@ async function saveCdpConfig() {
         enabled: document.getElementById('cdp-enabled').checked,
         config: {
             base_url: (document.getElementById('cdp-base-url').value || '').trim(),
+            request_url_template: (document.getElementById('cdp-request-url-template').value || '').trim(),
             profile_endpoint_template: (document.getElementById('cdp-profile-endpoint-template').value || '').trim(),
             api_key: (document.getElementById('cdp-api-key').value || '').trim(),
             timeout_seconds: Number(document.getElementById('cdp-timeout-seconds').value || 5),
             request_retries: Number(document.getElementById('cdp-request-retries').value || 2)
         },
         mapping: {
+            external_id_path: (document.getElementById('cdp-external-id-path').value || '').trim(),
+            traits_path: (document.getElementById('cdp-traits-path').value || '').trim(),
+            segments_path: (document.getElementById('cdp-segments-path').value || '').trim(),
+            fixed_segments: (document.getElementById('cdp-fixed-segments').value || '').split(',').map(item => item.trim()).filter(Boolean),
             preferred_sources_trait: (document.getElementById('cdp-preferred-sources-trait').value || '').trim(),
             excluded_sources_trait: (document.getElementById('cdp-excluded-sources-trait').value || '').trim(),
             source_weights_trait: (document.getElementById('cdp-source-weights-trait').value || '').trim(),

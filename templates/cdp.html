@@ -13,6 +13,7 @@
                     <label class="form-check-label">Enabled</label>
                 </div>
                 <input id="cdp-base-url" class="form-control form-control-sm mb-2" placeholder="Base URL (https://...)">
+                <input id="cdp-request-url-template" class="form-control form-control-sm mb-2" placeholder="Full request URL template (...value={external_user_id})">
                 <input id="cdp-profile-endpoint-template" class="form-control form-control-sm mb-2" placeholder="/profiles/{external_user_id}">
                 <input id="cdp-api-key" class="form-control form-control-sm mb-2" placeholder="API Key (kept if left ***)">
                 <input id="cdp-timeout-seconds" class="form-control form-control-sm mb-2" type="number" min="1" max="30" step="1" placeholder="Timeout seconds">
@@ -26,6 +27,10 @@
         <div class="card">
             <div class="card-header"><strong>Engine Mapping</strong></div>
             <div class="card-body">
+                <input id="cdp-external-id-path" class="form-control form-control-sm mb-2" placeholder="external_id path (e.g. customer_entity_id)">
+                <input id="cdp-traits-path" class="form-control form-control-sm mb-2" placeholder="traits path (e.g. returned_attributes)">
+                <input id="cdp-segments-path" class="form-control form-control-sm mb-2" placeholder="segments path (optional)">
+                <input id="cdp-fixed-segments" class="form-control form-control-sm mb-2" placeholder="fixed segments (comma separated)">
                 <input id="cdp-preferred-sources-trait" class="form-control form-control-sm mb-2" placeholder="preferred_sources trait key">
                 <input id="cdp-excluded-sources-trait" class="form-control form-control-sm mb-2" placeholder="excluded_sources trait key">
                 <input id="cdp-source-weights-trait" class="form-control form-control-sm mb-2" placeholder="source_weights trait key">

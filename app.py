@@ -66,9 +66,10 @@ _cleanup_state = {
 _WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
 _MEIRO_PROVIDER = "meiro"
 _DEFAULT_MEIRO_MAPPING = {
-    "external_id_path": "external_id",
-    "traits_path": "traits",
-    "segments_path": "segments",
+    "external_id_path": "customer_entity_id",
+    "traits_path": "returned_attributes",
+    "segments_path": "",
+    "fixed_segments": [],
     "preferred_sources_trait": "preferred_sources",
     "excluded_sources_trait": "excluded_sources",
     "source_weights_trait": "source_weights",
@@ -181,8 +182,11 @@ def _normalize_meiro_mapping(mapping: Optional[Dict[str, Any]]) -> Dict[str, Any
         merged["scenario_segment_map"] = {}
     if not isinstance(merged.get("config_segment_map"), dict):
         merged["config_segment_map"] = {}
+    if not isinstance(merged.get("fixed_segments"), list):
+        merged["fixed_segments"] = []
     if not isinstance(merged.get("segment_priority"), list):
         merged["segment_priority"] = []
+    merged["fixed_segments"] = [str(item).strip() for item in merged["fixed_segments"] if str(item).strip()]
     merged["segment_priority"] = [str(item).strip() for item in merged["segment_priority"] if str(item).strip()]
     return merged
 
