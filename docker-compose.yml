@@ -32,7 +32,12 @@ services:
       API_DEBUG: "False"
     ports:
       - "5001:5001"
+    volumes:
+      - app_embeddings:/app/embeddings
+      - app_profiles:/app/profiles
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  app_embeddings:
+  app_profiles:

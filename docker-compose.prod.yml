@@ -46,6 +46,8 @@ services:
       RECOMMENDER_DB_BACKEND: postgres
       DATABASE_URL: postgresql://recommender:recommender@postgres:5432/article_recommender
       RUN_MIGRATIONS: "false"
+      CONNECTOR_SCHEDULER_ENABLED: "true"
+      CONNECTOR_SCHEDULER_INTERVAL_SECONDS: "60"
       API_HOST: 0.0.0.0
       API_PORT: 5001
       API_DEBUG: "False"
@@ -55,7 +57,7 @@ services:
         "--bind",
         "0.0.0.0:5001",
         "--workers",
-        "2",
+        "1",
         "--threads",
         "4",
         "--timeout",
@@ -64,6 +66,9 @@ services:
       ]
     ports:
       - "5001:5001"
+    volumes:
+      - app_embeddings_prod:/app/embeddings
+      - app_profiles_prod:/app/profiles
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5001/readyz || exit 1"]
       interval: 10s
@@ -74,3 +79,5 @@ services:
 
 volumes:
   postgres_data_prod:
+  app_embeddings_prod:
+  app_profiles_prod:

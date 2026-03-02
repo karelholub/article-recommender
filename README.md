@@ -120,6 +120,12 @@ Services:
 - `migrate`: one-shot migration job
 - `app`: Gunicorn server (`app:app`)
 
+Persistent app data volumes are configured for:
+- `/app/embeddings`
+- `/app/profiles`
+
+This keeps scraped/embedded article data across container rebuilds/restarts.
+
 Health endpoints:
 - `GET /healthz` (liveness)
 - `GET /readyz` (readiness)

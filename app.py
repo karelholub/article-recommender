@@ -30,6 +30,7 @@ _scheduler_state_lock = threading.Lock()
 _scheduler_stop_event = threading.Event()
 _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_lock_file_handle = None
+_last_embed_mtime = 0.0
 _scheduler_state = {
     "enabled": False,
     "running": False,
@@ -53,6 +54,7 @@ try:
         cluster_weight=0.2,
     )
     store = RecommenderStore()
+    _last_embed_mtime = recommender.embed_file.stat().st_mtime if recommender.embed_file.exists() else 0.0
 
     # Seed system configs from recommender presets.
     for cfg_id, cfg in recommender.get_ranking_configs().items():
@@ -80,6 +82,30 @@ def _load_sources_with_settings() -> Tuple[list, Dict[str, Dict]]:
     store.sync_sources(source_names)
     settings = store.list_source_settings()
     return sources, settings
+
+
+def _maybe_reload_recommender_if_changed() -> None:
+    global _last_embed_mtime
+    if not recommender:
+        return
+    embed_file = recommender.embed_file
+    if not embed_file.exists():
+        return
+    try:
+        mtime = embed_file.stat().st_mtime
+    except OSError:
+        return
+    if mtime <= _last_embed_mtime:
+        return
+    with _recommender_reload_lock:
+        try:
+            mtime_now = embed_file.stat().st_mtime
+        except OSError:
+            return
+        if mtime_now <= _last_embed_mtime:
+            return
+        recommender._load_data()
+        _last_embed_mtime = mtime_now
 
 
 def _merge_source_settings(sources: list, settings: Dict[str, Dict]) -> list:
@@ -267,6 +293,9 @@ def _build_decision_context(
 
 @app.before_request
 def before_request():
+    if request.endpoint != "static":
+        _maybe_reload_recommender_if_changed()
+
     if request.is_json:
         try:
             request.get_json(silent=False)
