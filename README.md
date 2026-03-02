@@ -159,6 +159,12 @@ python embed.py
 - `GET /api/sources`: Available source domains and article counts
 - `GET /api/source-settings`: Source defaults (`enabled`, `default_weight`)
 - `PUT /api/source-settings/<source>`: Update source defaults
+- `GET /api/cdp/meiro`: Meiro CDP integration config (API key masked)
+- `PUT /api/cdp/meiro`: Update Meiro integration settings + mapping rules
+- `GET /api/cdp/meiro/profiles?limit=50`: List cached CDP profiles
+- `GET /api/cdp/meiro/profiles/<external_user_id>`: Get one cached CDP profile
+- `POST /api/cdp/meiro/profiles/upsert`: Upsert CDP profile payload (webhook/manual ingest)
+- `POST /api/cdp/meiro/sync`: Pull profile(s) from Meiro API by external IDs
 - `GET /api/connectors`: List connector definitions
 - `POST /api/connectors`: Create connector (`section_scraper` or `rss`)
 - `PUT /api/connectors/<connector_id>`: Update connector
@@ -183,6 +189,7 @@ python embed.py
 - `GET /api/similar/<article_id>?sources=...&config_id=...&top_n=...`: Similar articles with filters/config
 - `POST /api/recommendations/query`: Structured recommendation query
 - `POST /api/recommendation-context`: Resolve effective source/config context without executing ranking
+  - if `external_user_id` is provided, engine applies CDP mapping and returns `cdp_context`
 - `GET /api/recommendation-runs?limit=20`: Recent recommendation runs
 - `GET /api/recommendation-runs/<run_id>`: Full trace for one run
 - `GET /api/recommendation-runs/<run_id>/decision-flow`: Per-item scenario decision waterfall (kept/filtered, score before/after, boost, reason, final rank)

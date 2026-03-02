@@ -67,6 +67,35 @@ class BaseRecommenderStore:
     def set_source_setting(self, source: str, enabled: bool, default_weight: float) -> None:
         raise NotImplementedError
 
+    def get_cdp_integration(self, provider: str = "meiro") -> Dict:
+        raise NotImplementedError
+
+    def upsert_cdp_integration(
+        self,
+        provider: str,
+        config: Optional[Dict] = None,
+        mapping: Optional[Dict] = None,
+        enabled: Optional[bool] = None,
+    ) -> Dict:
+        raise NotImplementedError
+
+    def upsert_cdp_profile(
+        self,
+        provider: str,
+        external_user_id: str,
+        traits: Dict,
+        segments: List[str],
+        raw_payload: Optional[Dict] = None,
+        synced_at: Optional[str] = None,
+    ) -> Dict:
+        raise NotImplementedError
+
+    def get_cdp_profile(self, provider: str, external_user_id: str) -> Optional[Dict]:
+        raise NotImplementedError
+
+    def list_cdp_profiles(self, provider: str, limit: int = 50, offset: int = 0) -> List[Dict]:
+        raise NotImplementedError
+
     def list_connectors(self) -> List[Dict]:
         raise NotImplementedError
 
@@ -362,6 +391,27 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS cdp_integrations (
+                    provider TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    mapping_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cdp_profiles (
+                    provider TEXT NOT NULL,
+                    external_user_id TEXT NOT NULL,
+                    traits_json TEXT NOT NULL DEFAULT '{}',
+                    segments_json TEXT NOT NULL DEFAULT '[]',
+                    raw_json TEXT NOT NULL DEFAULT '{}',
+                    synced_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (provider, external_user_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS source_connectors (
                     connector_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -492,6 +542,9 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
 
                 CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
                     ON recommendation_runs(created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_cdp_profiles_synced_at
+                    ON cdp_profiles(provider, synced_at DESC);
 
                 CREATE INDEX IF NOT EXISTS idx_event_rollups_day
                     ON event_rollups_daily(day);
@@ -1193,6 +1246,167 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                 """,
                 (source, 1 if enabled else 0, float(default_weight), self._now()),
             )
+
+    def get_cdp_integration(self, provider: str = "meiro") -> Dict:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT provider, enabled, config_json, mapping_json, created_at, updated_at
+                FROM cdp_integrations
+                WHERE provider = ?
+                """,
+                (provider_value,),
+            ).fetchone()
+        if not row:
+            now = self._now()
+            return {
+                "provider": provider_value,
+                "enabled": False,
+                "config": {},
+                "mapping": {},
+                "created_at": now,
+                "updated_at": now,
+            }
+        return {
+            "provider": row["provider"],
+            "enabled": bool(row["enabled"]),
+            "config": json.loads(row["config_json"] or "{}"),
+            "mapping": json.loads(row["mapping_json"] or "{}"),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_cdp_integration(
+        self,
+        provider: str,
+        config: Optional[Dict] = None,
+        mapping: Optional[Dict] = None,
+        enabled: Optional[bool] = None,
+    ) -> Dict:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        current = self.get_cdp_integration(provider_value)
+        next_enabled = current["enabled"] if enabled is None else bool(enabled)
+        next_config = current["config"] if config is None else dict(config or {})
+        next_mapping = current["mapping"] if mapping is None else dict(mapping or {})
+        now = self._now()
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO cdp_integrations (provider, enabled, config_json, mapping_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    config_json = excluded.config_json,
+                    mapping_json = excluded.mapping_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    provider_value,
+                    1 if next_enabled else 0,
+                    json.dumps(next_config, ensure_ascii=False),
+                    json.dumps(next_mapping, ensure_ascii=False),
+                    current.get("created_at") or now,
+                    now,
+                ),
+            )
+        return self.get_cdp_integration(provider_value)
+
+    def upsert_cdp_profile(
+        self,
+        provider: str,
+        external_user_id: str,
+        traits: Dict,
+        segments: List[str],
+        raw_payload: Optional[Dict] = None,
+        synced_at: Optional[str] = None,
+    ) -> Dict:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        external_value = str(external_user_id or "").strip()
+        if not external_value:
+            raise ValueError("external_user_id is required")
+        now = self._now()
+        synced_value = synced_at or now
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO cdp_profiles
+                (provider, external_user_id, traits_json, segments_json, raw_json, synced_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, external_user_id) DO UPDATE SET
+                    traits_json = excluded.traits_json,
+                    segments_json = excluded.segments_json,
+                    raw_json = excluded.raw_json,
+                    synced_at = excluded.synced_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    provider_value,
+                    external_value,
+                    json.dumps(traits or {}, ensure_ascii=False),
+                    json.dumps(segments or [], ensure_ascii=False),
+                    json.dumps(raw_payload or {}, ensure_ascii=False),
+                    synced_value,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_cdp_profile(provider_value, external_value) or {}
+
+    def get_cdp_profile(self, provider: str, external_user_id: str) -> Optional[Dict]:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        external_value = str(external_user_id or "").strip()
+        if not external_value:
+            return None
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT provider, external_user_id, traits_json, segments_json, raw_json, synced_at, created_at, updated_at
+                FROM cdp_profiles
+                WHERE provider = ? AND external_user_id = ?
+                """,
+                (provider_value, external_value),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "provider": row["provider"],
+            "external_user_id": row["external_user_id"],
+            "traits": json.loads(row["traits_json"] or "{}"),
+            "segments": json.loads(row["segments_json"] or "[]"),
+            "raw": json.loads(row["raw_json"] or "{}"),
+            "synced_at": row["synced_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_cdp_profiles(self, provider: str, limit: int = 50, offset: int = 0) -> List[Dict]:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT provider, external_user_id, traits_json, segments_json, raw_json, synced_at, created_at, updated_at
+                FROM cdp_profiles
+                WHERE provider = ?
+                ORDER BY synced_at DESC
+                LIMIT ?
+                OFFSET ?
+                """,
+                (provider_value, int(limit), int(offset)),
+            ).fetchall()
+        return [
+            {
+                "provider": row["provider"],
+                "external_user_id": row["external_user_id"],
+                "traits": json.loads(row["traits_json"] or "{}"),
+                "segments": json.loads(row["segments_json"] or "[]"),
+                "raw": json.loads(row["raw_json"] or "{}"),
+                "synced_at": row["synced_at"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
 
     def list_connectors(self) -> List[Dict]:
         with self._managed_connection() as conn:
@@ -2062,6 +2276,33 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 )
                 cur.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS cdp_integrations (
+                        provider TEXT PRIMARY KEY,
+                        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        mapping_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cdp_profiles (
+                        provider TEXT NOT NULL,
+                        external_user_id TEXT NOT NULL,
+                        traits_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        segments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        synced_at TIMESTAMPTZ NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (provider, external_user_id)
+                    );
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS source_connectors (
                         connector_id TEXT PRIMARY KEY,
                         name TEXT NOT NULL,
@@ -2237,6 +2478,12 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                     """
                     CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
                     ON recommendation_runs(created_at);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_cdp_profiles_synced_at
+                    ON cdp_profiles(provider, synced_at DESC);
                     """
                 )
                 cur.execute(
@@ -2613,6 +2860,181 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                     """,
                     (source, bool(enabled), float(default_weight), datetime.now(UTC)),
                 )
+
+    def get_cdp_integration(self, provider: str = "meiro") -> Dict:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT provider, enabled, config_json::text, mapping_json::text, created_at, updated_at
+                    FROM cdp_integrations
+                    WHERE provider = %s
+                    """,
+                    (provider_value,),
+                )
+                row = cur.fetchone()
+        if not row:
+            now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+            return {
+                "provider": provider_value,
+                "enabled": False,
+                "config": {},
+                "mapping": {},
+                "created_at": now,
+                "updated_at": now,
+            }
+        return {
+            "provider": row[0],
+            "enabled": bool(row[1]),
+            "config": json.loads(row[2] or "{}"),
+            "mapping": json.loads(row[3] or "{}"),
+            "created_at": row[4].strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": row[5].strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def upsert_cdp_integration(
+        self,
+        provider: str,
+        config: Optional[Dict] = None,
+        mapping: Optional[Dict] = None,
+        enabled: Optional[bool] = None,
+    ) -> Dict:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        current = self.get_cdp_integration(provider_value)
+        next_enabled = current["enabled"] if enabled is None else bool(enabled)
+        next_config = current["config"] if config is None else dict(config or {})
+        next_mapping = current["mapping"] if mapping is None else dict(mapping or {})
+        now = datetime.now(UTC)
+        created_at = current.get("created_at")
+        created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC) if created_at else now
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO cdp_integrations (provider, enabled, config_json, mapping_json, created_at, updated_at)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s)
+                    ON CONFLICT (provider) DO UPDATE SET
+                        enabled = EXCLUDED.enabled,
+                        config_json = EXCLUDED.config_json,
+                        mapping_json = EXCLUDED.mapping_json,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        provider_value,
+                        next_enabled,
+                        json.dumps(next_config, ensure_ascii=False),
+                        json.dumps(next_mapping, ensure_ascii=False),
+                        created_dt,
+                        now,
+                    ),
+                )
+        return self.get_cdp_integration(provider_value)
+
+    def upsert_cdp_profile(
+        self,
+        provider: str,
+        external_user_id: str,
+        traits: Dict,
+        segments: List[str],
+        raw_payload: Optional[Dict] = None,
+        synced_at: Optional[str] = None,
+    ) -> Dict:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        external_value = str(external_user_id or "").strip()
+        if not external_value:
+            raise ValueError("external_user_id is required")
+        now = datetime.now(UTC)
+        synced_dt = (
+            datetime.strptime(synced_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if synced_at
+            else now
+        )
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO cdp_profiles
+                    (provider, external_user_id, traits_json, segments_json, raw_json, synced_at, created_at, updated_at)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s)
+                    ON CONFLICT (provider, external_user_id) DO UPDATE SET
+                        traits_json = EXCLUDED.traits_json,
+                        segments_json = EXCLUDED.segments_json,
+                        raw_json = EXCLUDED.raw_json,
+                        synced_at = EXCLUDED.synced_at,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        provider_value,
+                        external_value,
+                        json.dumps(traits or {}, ensure_ascii=False),
+                        json.dumps(segments or [], ensure_ascii=False),
+                        json.dumps(raw_payload or {}, ensure_ascii=False),
+                        synced_dt,
+                        now,
+                        now,
+                    ),
+                )
+        return self.get_cdp_profile(provider_value, external_value) or {}
+
+    def get_cdp_profile(self, provider: str, external_user_id: str) -> Optional[Dict]:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        external_value = str(external_user_id or "").strip()
+        if not external_value:
+            return None
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT provider, external_user_id, traits_json::text, segments_json::text, raw_json::text, synced_at, created_at, updated_at
+                    FROM cdp_profiles
+                    WHERE provider = %s AND external_user_id = %s
+                    """,
+                    (provider_value, external_value),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "provider": row[0],
+            "external_user_id": row[1],
+            "traits": json.loads(row[2] or "{}"),
+            "segments": json.loads(row[3] or "[]"),
+            "raw": json.loads(row[4] or "{}"),
+            "synced_at": row[5].strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": row[6].strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": row[7].strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def list_cdp_profiles(self, provider: str, limit: int = 50, offset: int = 0) -> List[Dict]:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT provider, external_user_id, traits_json::text, segments_json::text, raw_json::text, synced_at, created_at, updated_at
+                    FROM cdp_profiles
+                    WHERE provider = %s
+                    ORDER BY synced_at DESC
+                    LIMIT %s
+                    OFFSET %s
+                    """,
+                    (provider_value, int(limit), int(offset)),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "provider": row[0],
+                "external_user_id": row[1],
+                "traits": json.loads(row[2] or "{}"),
+                "segments": json.loads(row[3] or "[]"),
+                "raw": json.loads(row[4] or "{}"),
+                "synced_at": row[5].strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": row[6].strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": row[7].strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            for row in rows
+        ]
 
     def list_connectors(self) -> List[Dict]:
         with self._managed_connection() as conn:

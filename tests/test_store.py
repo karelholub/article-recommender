@@ -251,3 +251,27 @@ def test_quality_snapshots_sqlite(tmp_path):
     loaded = store.get_quality_snapshot(created['snapshot_id'])
     assert loaded is not None
     assert loaded['metrics']['avg_score'] == 0.5
+
+
+def test_cdp_integration_and_profiles_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    integration = store.upsert_cdp_integration(
+        provider='meiro',
+        enabled=True,
+        config={'base_url': 'https://example.cdp'},
+        mapping={'preferred_sources_trait': 'preferred_sources'},
+    )
+    assert integration['enabled'] is True
+    assert integration['config']['base_url'] == 'https://example.cdp'
+
+    profile = store.upsert_cdp_profile(
+        provider='meiro',
+        external_user_id='ext-123',
+        traits={'preferred_sources': ['example.com']},
+        segments=['vip'],
+        raw_payload={'external_id': 'ext-123'},
+    )
+    assert profile['external_user_id'] == 'ext-123'
+    assert profile['segments'] == ['vip']
+    listed = store.list_cdp_profiles(provider='meiro', limit=10, offset=0)
+    assert listed

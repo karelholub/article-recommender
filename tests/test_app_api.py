@@ -260,6 +260,73 @@ def test_offline_quality_snapshot_endpoints():
     assert 'deltas' in compared
 
 
+def test_cdp_meiro_endpoints_and_context():
+    client = app.test_client()
+    source_payload = client.get('/api/sources').get_json()
+    assert source_payload['sources']
+    source = source_payload['sources'][0]['source']
+    scenario_id = f"cdp_{uuid.uuid4().hex[:8]}"
+    created = client.post(
+        '/api/scenarios',
+        json={
+            'scenario_id': scenario_id,
+            'name': 'CDP Scenario',
+            'enabled': True,
+            'rule_set': {},
+            'actor_id': 'qa-user',
+        },
+    )
+    assert created.status_code == 201
+
+    get_resp = client.get('/api/cdp/meiro')
+    assert get_resp.status_code == 200
+    cfg = get_resp.get_json()
+    assert cfg['provider'] == 'meiro'
+
+    put_resp = client.put(
+        '/api/cdp/meiro',
+        json={
+            'enabled': True,
+            'config': {'base_url': 'https://example.cdp', 'profile_endpoint_template': '/profiles/{external_user_id}'},
+            'mapping': {
+                'external_id_path': 'external_id',
+                'traits_path': 'traits',
+                'segments_path': 'segments',
+                'preferred_sources_trait': 'preferred_sources',
+                'excluded_sources_trait': 'excluded_sources',
+                'source_weights_trait': 'source_weights',
+                'source_weight_trait_prefix': 'source_weight_',
+                'scenario_segment_map': {'vip': scenario_id},
+                'config_segment_map': {},
+                'segment_priority': ['vip'],
+            },
+        },
+    )
+    assert put_resp.status_code == 200
+    updated = put_resp.get_json()
+    assert updated['enabled'] is True
+
+    upsert_profile = client.post(
+        '/api/cdp/meiro/profiles/upsert',
+        json={
+            'external_id': 'ext-cdp-1',
+            'traits': {'preferred_sources': [source], 'source_weights': {source: 1.8}},
+            'segments': ['vip'],
+        },
+    )
+    assert upsert_profile.status_code == 201
+
+    context_resp = client.post(
+        '/api/recommendation-context',
+        json={'external_user_id': 'ext-cdp-1', 'sources': []},
+    )
+    assert context_resp.status_code == 200
+    context = context_resp.get_json()
+    assert context['cdp_context']['profile_found'] is True
+    assert scenario_id == context['scenario_id']
+    assert source in context['selected_sources']
+
+
 def test_disabled_source_not_used_by_default_query():
     client = app.test_client()
     sources_payload = client.get('/api/sources').get_json()

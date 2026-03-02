@@ -8,7 +8,7 @@ import logging
 import os
 import threading
 import traceback
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, render_template, request
@@ -16,6 +16,7 @@ from flask import Flask, abort, jsonify, render_template, request
 from store import RecommenderStore
 from bootstrap_data import ensure_data_files
 from connector_pipeline import ConnectorIngestionService
+from meiro_adapter import MeiroAdapter
 from config.logging_config import setup_logging
 from recommend import RecommenderFactory
 
@@ -63,6 +64,19 @@ _cleanup_state = {
 }
 
 _WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+_MEIRO_PROVIDER = "meiro"
+_DEFAULT_MEIRO_MAPPING = {
+    "external_id_path": "external_id",
+    "traits_path": "traits",
+    "segments_path": "segments",
+    "preferred_sources_trait": "preferred_sources",
+    "excluded_sources_trait": "excluded_sources",
+    "source_weights_trait": "source_weights",
+    "source_weight_trait_prefix": "source_weight_",
+    "scenario_segment_map": {},
+    "config_segment_map": {},
+    "segment_priority": [],
+}
 
 
 # Initialize recommender
@@ -146,6 +160,156 @@ def _extract_error_code(value: str) -> str:
     if not text:
         return ""
     return text.split(":", 1)[0].strip().lower()
+
+
+def _normalize_meiro_mapping(mapping: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = dict(_DEFAULT_MEIRO_MAPPING)
+    if isinstance(mapping, dict):
+        for key, value in mapping.items():
+            merged[str(key)] = value
+    for key in (
+        "external_id_path",
+        "traits_path",
+        "segments_path",
+        "preferred_sources_trait",
+        "excluded_sources_trait",
+        "source_weights_trait",
+        "source_weight_trait_prefix",
+    ):
+        merged[key] = str(merged.get(key, "")).strip()
+    if not isinstance(merged.get("scenario_segment_map"), dict):
+        merged["scenario_segment_map"] = {}
+    if not isinstance(merged.get("config_segment_map"), dict):
+        merged["config_segment_map"] = {}
+    if not isinstance(merged.get("segment_priority"), list):
+        merged["segment_priority"] = []
+    merged["segment_priority"] = [str(item).strip() for item in merged["segment_priority"] if str(item).strip()]
+    return merged
+
+
+def _list_from_profile_trait(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _float_map_from_profile_trait(value: Any) -> Dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for key, raw in value.items():
+        source = str(key).strip()
+        if not source:
+            continue
+        try:
+            out[source] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _resolve_cdp_personalization(
+    external_user_id: Optional[str],
+    requested_sources: List[str],
+    scenario_id: Optional[str],
+    config_id: str,
+    scenario_explicit: bool,
+    config_explicit: bool,
+) -> Dict[str, Any]:
+    external = str(external_user_id or "").strip()
+    base = {
+        "applied": False,
+        "provider": _MEIRO_PROVIDER,
+        "external_user_id": external or None,
+        "profile_found": False,
+        "segments": [],
+        "preferred_sources": [],
+        "excluded_sources": [],
+        "source_weight_overrides": {},
+        "selected_scenario_id": scenario_id,
+        "selected_config_id": config_id,
+        "requested_sources": list(requested_sources or []),
+        "mapping": _DEFAULT_MEIRO_MAPPING,
+    }
+    if not store:
+        return base
+    integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+    mapping = _normalize_meiro_mapping(integration.get("mapping"))
+    base["mapping"] = mapping
+    if not integration.get("enabled"):
+        return base
+    if not external:
+        return base
+    profile = store.get_cdp_profile(_MEIRO_PROVIDER, external)
+    if not profile:
+        return base
+    base["profile_found"] = True
+    traits = profile.get("traits") or {}
+    if not isinstance(traits, dict):
+        traits = {}
+    segments = [str(item).strip() for item in (profile.get("segments") or []) if str(item).strip()]
+    base["segments"] = segments
+
+    preferred_sources = _list_from_profile_trait(traits.get(mapping.get("preferred_sources_trait")))
+    excluded_sources = _list_from_profile_trait(traits.get(mapping.get("excluded_sources_trait")))
+    source_weight_overrides = _float_map_from_profile_trait(traits.get(mapping.get("source_weights_trait")))
+    prefix = mapping.get("source_weight_trait_prefix")
+    if prefix:
+        for key, value in traits.items():
+            trait_key = str(key)
+            if not trait_key.startswith(prefix):
+                continue
+            source = trait_key[len(prefix):].strip()
+            if not source:
+                continue
+            try:
+                source_weight_overrides[source] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+    source_set = set(requested_sources or [])
+    source_set.update(preferred_sources)
+    source_set.difference_update(excluded_sources)
+    merged_sources = sorted(source_set)
+
+    scenario_segment_map = {str(k): str(v).strip() for k, v in (mapping.get("scenario_segment_map") or {}).items() if str(v).strip()}
+    config_segment_map = {str(k): str(v).strip() for k, v in (mapping.get("config_segment_map") or {}).items() if str(v).strip()}
+    segment_priority = mapping.get("segment_priority") or []
+    segment_order = segment_priority + [seg for seg in segments if seg not in segment_priority]
+
+    selected_scenario_id = scenario_id
+    if not scenario_explicit and not selected_scenario_id:
+        for segment in segment_order:
+            candidate = scenario_segment_map.get(segment)
+            if candidate:
+                selected_scenario_id = candidate
+                break
+
+    selected_config_id = config_id
+    if not config_explicit:
+        for segment in segment_order:
+            candidate = config_segment_map.get(segment)
+            if candidate:
+                selected_config_id = candidate
+                break
+
+    base.update(
+        {
+            "applied": bool(profile),
+            "preferred_sources": preferred_sources,
+            "excluded_sources": excluded_sources,
+            "source_weight_overrides": source_weight_overrides,
+            "selected_scenario_id": selected_scenario_id,
+            "selected_config_id": selected_config_id,
+            "requested_sources": merged_sources,
+            "profile_synced_at": profile.get("synced_at"),
+        }
+    )
+    return base
 
 
 def _resolve_experiment_assignment(
@@ -287,6 +451,7 @@ def _is_protected_request() -> bool:
         or request.path.startswith("/api/ranking-configs")
         or request.path.startswith("/api/connectors")
         or request.path.startswith("/api/source-settings")
+        or request.path.startswith("/api/cdp")
         or request.path.startswith("/api/metrics/rollups")
     )
     return protected_paths and request.method in _WRITE_METHODS.union({"GET"})
@@ -367,6 +532,7 @@ def _rate_limit_for_endpoint(path: str) -> int:
             "/api/v1/events": 120,
             "/api/scenarios": 30,
             "/api/ranking-configs": 30,
+            "/api/cdp": 60,
             "/api/metrics/rollups": 10,
         }
 
@@ -1132,6 +1298,11 @@ def runs_page():
     return render_template("runs.html", active_page="runs", title="Run Explorer")
 
 
+@app.route("/cdp")
+def cdp_page():
+    return render_template("cdp.html", active_page="cdp", title="CDP Integration")
+
+
 @app.route("/healthz")
 def healthz():
     """Liveness probe: process is running."""
@@ -1227,6 +1398,196 @@ def update_source_setting(source):
         return jsonify({"source": source, "enabled": enabled, "default_weight": default_weight})
     except Exception as e:
         logger.error(f"Error updating source setting: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro", methods=["GET", "PUT"])
+def cdp_meiro_config():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        if request.method == "GET":
+            integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+            config = dict(integration.get("config") or {})
+            if config.get("api_key"):
+                config["api_key"] = "***"
+            return jsonify(
+                {
+                    "provider": _MEIRO_PROVIDER,
+                    "enabled": bool(integration.get("enabled")),
+                    "config": config,
+                    "mapping": _normalize_meiro_mapping(integration.get("mapping")),
+                    "updated_at": integration.get("updated_at"),
+                }
+            )
+
+        payload = request.get_json() or {}
+        integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+        current_config = dict(integration.get("config") or {})
+        current_mapping = _normalize_meiro_mapping(integration.get("mapping"))
+        next_enabled = payload.get("enabled")
+        next_config = payload.get("config") if isinstance(payload.get("config"), dict) else current_config
+        next_mapping = payload.get("mapping") if isinstance(payload.get("mapping"), dict) else current_mapping
+        # Keep existing secret if UI sends masked value.
+        if str(next_config.get("api_key", "")).strip() == "***":
+            next_config["api_key"] = current_config.get("api_key", "")
+        stored = store.upsert_cdp_integration(
+            provider=_MEIRO_PROVIDER,
+            config=next_config,
+            mapping=_normalize_meiro_mapping(next_mapping),
+            enabled=(bool(next_enabled) if next_enabled is not None else None),
+        )
+        _record_audit(
+            action="update",
+            resource_type="cdp_integration",
+            resource_id=_MEIRO_PROVIDER,
+            payload=payload,
+            extra={"enabled": stored.get("enabled")},
+        )
+        safe_config = dict(stored.get("config") or {})
+        if safe_config.get("api_key"):
+            safe_config["api_key"] = "***"
+        return jsonify(
+            {
+                "provider": _MEIRO_PROVIDER,
+                "enabled": bool(stored.get("enabled")),
+                "config": safe_config,
+                "mapping": _normalize_meiro_mapping(stored.get("mapping")),
+                "updated_at": stored.get("updated_at"),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error handling CDP config: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro/profiles", methods=["GET"])
+def cdp_meiro_profiles():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        limit = max(1, min(200, int(request.args.get("limit", 50))))
+        offset = max(0, int(request.args.get("offset", 0)))
+        rows = store.list_cdp_profiles(_MEIRO_PROVIDER, limit=limit + 1, offset=offset)
+        has_more = len(rows) > limit
+        profiles = rows[:limit]
+        return jsonify(
+            {
+                "provider": _MEIRO_PROVIDER,
+                "profiles": profiles,
+                "count": len(profiles),
+                "limit": limit,
+                "offset": offset,
+                "has_more": has_more,
+                "next_offset": (offset + limit) if has_more else None,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error listing CDP profiles: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro/profiles/<external_user_id>", methods=["GET"])
+def cdp_meiro_profile_detail(external_user_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    profile = store.get_cdp_profile(_MEIRO_PROVIDER, external_user_id)
+    if not profile:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify(profile)
+
+
+@app.route("/api/cdp/meiro/profiles/upsert", methods=["POST"])
+def cdp_meiro_profile_upsert():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json() or {}
+        integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+        mapping = _normalize_meiro_mapping(integration.get("mapping"))
+        adapter = MeiroAdapter(integration.get("config") or {})
+        profile = adapter.normalize_profile(
+            payload,
+            mapping=mapping,
+            fallback_external_user_id=str(payload.get("external_user_id", "")).strip(),
+        )
+        stored = store.upsert_cdp_profile(
+            provider=_MEIRO_PROVIDER,
+            external_user_id=profile.external_user_id,
+            traits=profile.traits,
+            segments=profile.segments,
+            raw_payload=profile.raw,
+        )
+        _record_audit(
+            action="upsert",
+            resource_type="cdp_profile",
+            resource_id=profile.external_user_id,
+            payload=payload,
+            extra={"provider": _MEIRO_PROVIDER},
+        )
+        return jsonify({"provider": _MEIRO_PROVIDER, "profile": stored}), 201
+    except Exception as e:
+        logger.error(f"Error upserting CDP profile: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro/sync", methods=["POST"])
+def cdp_meiro_sync_profiles():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json() or {}
+        external_user_ids = [str(item).strip() for item in (payload.get("external_user_ids") or []) if str(item).strip()]
+        if not external_user_ids:
+            return jsonify({"error": "external_user_ids is required"}), 400
+
+        integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+        if not integration.get("enabled"):
+            return jsonify({"error": "Meiro integration is disabled"}), 400
+        adapter = MeiroAdapter(integration.get("config") or {})
+        mapping = _normalize_meiro_mapping(integration.get("mapping"))
+        synced = []
+        errors = []
+        for external_user_id in external_user_ids:
+            try:
+                raw_payload = adapter.fetch_profile_payload(external_user_id)
+                profile = adapter.normalize_profile(
+                    raw_payload,
+                    mapping=mapping,
+                    fallback_external_user_id=external_user_id,
+                )
+                stored = store.upsert_cdp_profile(
+                    provider=_MEIRO_PROVIDER,
+                    external_user_id=profile.external_user_id,
+                    traits=profile.traits,
+                    segments=profile.segments,
+                    raw_payload=profile.raw,
+                )
+                synced.append(stored)
+            except Exception as exc:
+                errors.append({"external_user_id": external_user_id, "error": str(exc)})
+        _record_audit(
+            action="sync",
+            resource_type="cdp_profile",
+            resource_id=_MEIRO_PROVIDER,
+            payload=payload,
+            extra={"synced": len(synced), "errors": len(errors)},
+        )
+        return jsonify(
+            {
+                "provider": _MEIRO_PROVIDER,
+                "synced": synced,
+                "errors": errors,
+                "synced_count": len(synced),
+                "error_count": len(errors),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error syncing CDP profiles: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
 
@@ -1798,13 +2159,29 @@ def query_recommendations():
             user_reads = recommender.user_profiles.get(user_id, [])
         top_n = int(payload.get("top_n", 5))
         requested_sources = payload.get("sources") or []
-        config_id = payload.get("config_id", "balanced")
+        config_explicit = bool(str(payload.get("config_id", "")).strip())
+        config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
         ranking_config = payload.get("ranking_config")
         experiment = payload.get("experiment")
         scenario_id = (payload.get("scenario_id") or "").strip() or None
+        scenario_explicit = bool(scenario_id)
         scenario_ids = payload.get("scenario_ids") or []
         if scenario_ids and not scenario_id:
             scenario_id = str(scenario_ids[0]).strip() or None
+            scenario_explicit = bool(scenario_id)
+        cdp_context = _resolve_cdp_personalization(
+            external_user_id=external_user_id,
+            requested_sources=requested_sources,
+            scenario_id=scenario_id,
+            config_id=config_id,
+            scenario_explicit=scenario_explicit,
+            config_explicit=config_explicit,
+        )
+        requested_sources = cdp_context.get("requested_sources") or requested_sources
+        if not scenario_explicit and cdp_context.get("selected_scenario_id"):
+            scenario_id = cdp_context.get("selected_scenario_id")
+        if not config_explicit and cdp_context.get("selected_config_id"):
+            config_id = cdp_context.get("selected_config_id")
         scenario = None
         if scenario_id:
             scenario = store.get_scenario(scenario_id)
@@ -1834,6 +2211,13 @@ def query_recommendations():
         selected_sources = decision_context["selected_sources"]
         source_defaults = decision_context["source_defaults_applied"]
         effective_ranking_config = decision_context["effective_ranking_config"]
+        cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
+        if cdp_source_overrides:
+            source_weights = dict(effective_ranking_config.get("source_weights") or {})
+            for source, weight in cdp_source_overrides.items():
+                if source in selected_sources and weight > 0:
+                    source_weights[source] = float(weight)
+            effective_ranking_config["source_weights"] = source_weights
         if scenario:
             excluded_sources = set(_normalize_string_list(scenario.get("rule_set", {}).get("exclude_sources")))
             if excluded_sources:
@@ -1870,6 +2254,7 @@ def query_recommendations():
                 "scenario_id": scenario_id,
                 "scenario_trace": scenario_trace,
                 "experiment_assignment": experiment_assignment,
+                "cdp_context": cdp_context,
             },
             recommendations=recs,
             request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
@@ -1907,6 +2292,7 @@ def query_recommendations():
                 "scenario_id": scenario_id,
                 "scenario_trace": scenario_trace,
                 "experiment_assignment": experiment_assignment,
+                "cdp_context": cdp_context,
                 "recommendations": recs,
             }
         )
@@ -1991,9 +2377,24 @@ def recommendations_cms():
         if not user_reads:
             user_reads = recommender.user_profiles.get(user_id, [])
         requested_sources = data.get("sources") or []
+        config_explicit = bool(str(data.get("config_id", "")).strip())
         config_id = str(data.get("config_id", "balanced")).strip() or "balanced"
         experiment = data.get("experiment")
         scenario_id = str(data.get("scenario_id", "")).strip() or None
+        scenario_explicit = bool(scenario_id)
+        cdp_context = _resolve_cdp_personalization(
+            external_user_id=external_user_id,
+            requested_sources=requested_sources,
+            scenario_id=scenario_id,
+            config_id=config_id,
+            scenario_explicit=scenario_explicit,
+            config_explicit=config_explicit,
+        )
+        requested_sources = cdp_context.get("requested_sources") or requested_sources
+        if not scenario_explicit and cdp_context.get("selected_scenario_id"):
+            scenario_id = cdp_context.get("selected_scenario_id")
+        if not config_explicit and cdp_context.get("selected_config_id"):
+            config_id = cdp_context.get("selected_config_id")
         scenario = store.get_scenario(scenario_id) if scenario_id else None
         if scenario and scenario.get("rule_set", {}).get("include_sources") and not requested_sources:
             requested_sources = scenario["rule_set"]["include_sources"]
@@ -2013,6 +2414,13 @@ def recommendations_cms():
         decision_context = _build_decision_context(requested_sources, config_id, None)
         selected_sources = decision_context["selected_sources"]
         effective_ranking_config = decision_context["effective_ranking_config"]
+        cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
+        if cdp_source_overrides:
+            source_weights = dict(effective_ranking_config.get("source_weights") or {})
+            for source, weight in cdp_source_overrides.items():
+                if source in selected_sources and weight > 0:
+                    source_weights[source] = float(weight)
+            effective_ranking_config["source_weights"] = source_weights
         recs = recommender.recommend_for_user(
             effective_user_id,
             recommender.article_vectors,
@@ -2039,6 +2447,7 @@ def recommendations_cms():
                 "api_surface": "cms",
                 "scenario_trace": scenario_trace,
                 "experiment_assignment": experiment_assignment,
+                "cdp_context": cdp_context,
             },
             recommendations=recs,
             request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
@@ -2090,6 +2499,7 @@ def recommendations_cms():
                 "source_defaults_applied": decision_context["source_defaults_applied"],
                 "scenario_trace": scenario_trace,
                 "experiment_assignment": experiment_assignment,
+                "cdp_context": cdp_context,
             },
         }
         if idempotency_key:
@@ -2316,17 +2726,41 @@ def recommendation_context():
     try:
         payload = request.get_json() or {}
         requested_sources = payload.get("sources") or []
-        config_id = payload.get("config_id", "balanced")
+        config_explicit = bool(str(payload.get("config_id", "")).strip())
+        config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
         ranking_config = payload.get("ranking_config")
+        external_user_id = str(payload.get("external_user_id", "")).strip() or None
         scenario_id = (payload.get("scenario_id") or "").strip() or None
+        scenario_explicit = bool(scenario_id)
+        cdp_context = _resolve_cdp_personalization(
+            external_user_id=external_user_id,
+            requested_sources=requested_sources,
+            scenario_id=scenario_id,
+            config_id=config_id,
+            scenario_explicit=scenario_explicit,
+            config_explicit=config_explicit,
+        )
+        requested_sources = cdp_context.get("requested_sources") or requested_sources
+        if not scenario_explicit and cdp_context.get("selected_scenario_id"):
+            scenario_id = cdp_context.get("selected_scenario_id")
+        if not config_explicit and cdp_context.get("selected_config_id"):
+            config_id = cdp_context.get("selected_config_id")
         scenario = store.get_scenario(scenario_id) if scenario_id else None
         if scenario and scenario.get("rule_set", {}).get("include_sources") and not requested_sources:
             requested_sources = scenario["rule_set"]["include_sources"]
         if scenario and scenario.get("rule_set", {}).get("ranking_config_id") and not ranking_config:
             config_id = scenario["rule_set"]["ranking_config_id"]
         context = _build_decision_context(requested_sources, config_id, ranking_config)
+        cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
+        if cdp_source_overrides:
+            source_weights = dict(context["effective_ranking_config"].get("source_weights") or {})
+            for source, weight in cdp_source_overrides.items():
+                if source in context["selected_sources"] and weight > 0:
+                    source_weights[source] = float(weight)
+            context["effective_ranking_config"]["source_weights"] = source_weights
         context["scenario_id"] = scenario_id
         context["scenario"] = scenario
+        context["cdp_context"] = cdp_context
         if scenario:
             context["scenario_rule_set"] = scenario.get("rule_set", {})
         return jsonify(context)
@@ -3554,12 +3988,22 @@ def engine_config():
         sources, settings = _load_sources_with_settings()
         scenarios = store.list_scenarios(include_disabled=True)
         configs = store.list_latest_configs()
+        cdp = store.get_cdp_integration(_MEIRO_PROVIDER)
+        cdp_safe_config = dict(cdp.get("config") or {})
+        if cdp_safe_config.get("api_key"):
+            cdp_safe_config["api_key"] = "***"
         return jsonify(
             {
                 "api_version": "v1",
                 "ranking_configs": configs,
                 "sources": _merge_source_settings(sources, settings),
                 "scenarios": scenarios,
+                "cdp": {
+                    "provider": _MEIRO_PROVIDER,
+                    "enabled": bool(cdp.get("enabled")),
+                    "config": cdp_safe_config,
+                    "mapping": _normalize_meiro_mapping(cdp.get("mapping")),
+                },
                 "scheduler": dict(_scheduler_state),
                 "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }

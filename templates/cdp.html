@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Meiro Integration</strong>
+                <button id="refresh-cdp-config" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="form-check mb-2">
+                    <input id="cdp-enabled" class="form-check-input" type="checkbox">
+                    <label class="form-check-label">Enabled</label>
+                </div>
+                <input id="cdp-base-url" class="form-control form-control-sm mb-2" placeholder="Base URL (https://...)">
+                <input id="cdp-profile-endpoint-template" class="form-control form-control-sm mb-2" placeholder="/profiles/{external_user_id}">
+                <input id="cdp-api-key" class="form-control form-control-sm mb-2" placeholder="API Key (kept if left ***)">
+                <input id="cdp-timeout-seconds" class="form-control form-control-sm mb-2" type="number" min="1" max="30" step="1" placeholder="Timeout seconds">
+                <input id="cdp-request-retries" class="form-control form-control-sm mb-2" type="number" min="0" max="5" step="1" placeholder="Request retries">
+                <button id="save-cdp-config" class="btn btn-sm btn-outline-primary">Save Integration</button>
+                <div id="cdp-config-status" class="small text-muted mt-2">Idle.</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header"><strong>Engine Mapping</strong></div>
+            <div class="card-body">
+                <input id="cdp-preferred-sources-trait" class="form-control form-control-sm mb-2" placeholder="preferred_sources trait key">
+                <input id="cdp-excluded-sources-trait" class="form-control form-control-sm mb-2" placeholder="excluded_sources trait key">
+                <input id="cdp-source-weights-trait" class="form-control form-control-sm mb-2" placeholder="source_weights trait key">
+                <input id="cdp-source-weight-prefix" class="form-control form-control-sm mb-2" placeholder="source_weight_ prefix">
+                <textarea id="cdp-scenario-segment-map" class="form-control form-control-sm mb-2" rows="3" placeholder='{"segment":"scenario_id"}'></textarea>
+                <textarea id="cdp-config-segment-map" class="form-control form-control-sm mb-2" rows="3" placeholder='{"segment":"config_id"}'></textarea>
+                <input id="cdp-segment-priority" class="form-control form-control-sm mb-2" placeholder="comma,separated,priority">
+                <button id="save-cdp-mapping" class="btn btn-sm btn-outline-primary">Save Mapping</button>
+            </div>
+        </div>
+    </div>
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Profile Sync</strong>
+                <button id="refresh-cdp-profiles" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="row g-2 mb-2">
+                    <div class="col-md-9">
+                        <input id="cdp-sync-external-ids" class="form-control form-control-sm" placeholder="external IDs, comma separated">
+                    </div>
+                    <div class="col-md-3 d-grid">
+                        <button id="sync-cdp-profiles" class="btn btn-sm btn-outline-success">Sync Profiles</button>
+                    </div>
+                </div>
+                <div id="cdp-sync-status" class="small text-muted mb-2">No sync yet.</div>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr><th>External ID</th><th>Segments</th><th>Traits</th><th>Synced At</th></tr>
+                        </thead>
+                        <tbody id="cdp-profiles-table"><tr><td colspan="4" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -52,6 +52,9 @@
                     <a class="nav-link {% if active_page == 'operations' %}active{% endif %}" href="{{ url_for('operations_page') }}">
                         <i class="fas fa-sliders-h me-2"></i>Operations
                     </a>
+                    <a class="nav-link {% if active_page == 'cdp' %}active{% endif %}" href="{{ url_for('cdp_page') }}">
+                        <i class="fas fa-id-card me-2"></i>CDP
+                    </a>
                     <a class="nav-link {% if active_page == 'runs' %}active{% endif %}" href="{{ url_for('runs_page') }}">
                         <i class="fas fa-history me-2"></i>Run Explorer
                     </a>

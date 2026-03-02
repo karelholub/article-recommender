@@ -23,6 +23,7 @@ let reportingLastExperiments = null;
 let reportingLastExperimentComparison = null;
 let reportingQualitySnapshots = [];
 let reportingLastQualityCompare = null;
+let cdpIntegration = null;
 let recommendationRuns = [];
 
 function hasElement(id) {
@@ -54,6 +55,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('scheduler-status')) {
         loadSchedulerStatus();
         setInterval(loadSchedulerStatus, 15000);
+    }
+    if (hasElement('cdp-base-url')) {
+        loadCdpConfig();
+        loadCdpProfiles();
     }
     if (hasElement('decision-context')) loadDecisionContext();
     if (hasElement('reporting-summary')) {
@@ -1325,6 +1330,126 @@ async function loadCleanupStatus() {
         console.error('Error loading cleanup status:', error);
         container.textContent = `Cleanup status unavailable: ${error.message}`;
     }
+}
+
+async function loadCdpConfig() {
+    const statusEl = document.getElementById('cdp-config-status');
+    try {
+        const response = await fetch('/api/cdp/meiro');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load CDP config');
+        }
+        const payload = await response.json();
+        cdpIntegration = payload;
+        document.getElementById('cdp-enabled').checked = Boolean(payload.enabled);
+        document.getElementById('cdp-base-url').value = payload.config?.base_url || '';
+        document.getElementById('cdp-profile-endpoint-template').value = payload.config?.profile_endpoint_template || '/profiles/{external_user_id}';
+        document.getElementById('cdp-api-key').value = payload.config?.api_key || '';
+        document.getElementById('cdp-timeout-seconds').value = Number(payload.config?.timeout_seconds ?? 5);
+        document.getElementById('cdp-request-retries').value = Number(payload.config?.request_retries ?? 2);
+        document.getElementById('cdp-preferred-sources-trait').value = payload.mapping?.preferred_sources_trait || 'preferred_sources';
+        document.getElementById('cdp-excluded-sources-trait').value = payload.mapping?.excluded_sources_trait || 'excluded_sources';
+        document.getElementById('cdp-source-weights-trait').value = payload.mapping?.source_weights_trait || 'source_weights';
+        document.getElementById('cdp-source-weight-prefix').value = payload.mapping?.source_weight_trait_prefix || 'source_weight_';
+        document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(payload.mapping?.scenario_segment_map || {}, null, 2);
+        document.getElementById('cdp-config-segment-map').value = JSON.stringify(payload.mapping?.config_segment_map || {}, null, 2);
+        document.getElementById('cdp-segment-priority').value = (payload.mapping?.segment_priority || []).join(', ');
+        if (statusEl) statusEl.textContent = `Loaded. Updated at ${payload.updated_at || 'n/a'}.`;
+    } catch (error) {
+        if (statusEl) statusEl.textContent = `CDP config unavailable: ${error.message}`;
+    }
+}
+
+async function saveCdpConfig() {
+    const statusEl = document.getElementById('cdp-config-status');
+    let scenarioMap = {};
+    let configMap = {};
+    try {
+        scenarioMap = JSON.parse(document.getElementById('cdp-scenario-segment-map').value || '{}');
+        configMap = JSON.parse(document.getElementById('cdp-config-segment-map').value || '{}');
+    } catch (error) {
+        throw new Error('Invalid JSON in mapping fields');
+    }
+    const payload = {
+        enabled: document.getElementById('cdp-enabled').checked,
+        config: {
+            base_url: (document.getElementById('cdp-base-url').value || '').trim(),
+            profile_endpoint_template: (document.getElementById('cdp-profile-endpoint-template').value || '').trim(),
+            api_key: (document.getElementById('cdp-api-key').value || '').trim(),
+            timeout_seconds: Number(document.getElementById('cdp-timeout-seconds').value || 5),
+            request_retries: Number(document.getElementById('cdp-request-retries').value || 2)
+        },
+        mapping: {
+            preferred_sources_trait: (document.getElementById('cdp-preferred-sources-trait').value || '').trim(),
+            excluded_sources_trait: (document.getElementById('cdp-excluded-sources-trait').value || '').trim(),
+            source_weights_trait: (document.getElementById('cdp-source-weights-trait').value || '').trim(),
+            source_weight_trait_prefix: (document.getElementById('cdp-source-weight-prefix').value || '').trim(),
+            scenario_segment_map: scenarioMap,
+            config_segment_map: configMap,
+            segment_priority: (document.getElementById('cdp-segment-priority').value || '').split(',').map(item => item.trim()).filter(Boolean)
+        },
+        actor_id: getOperatorId() || undefined
+    };
+    if (statusEl) statusEl.textContent = 'Saving CDP config...';
+    const response = await fetch('/api/cdp/meiro', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to save CDP config');
+    }
+    const saved = await response.json();
+    cdpIntegration = saved;
+    if (statusEl) statusEl.textContent = 'CDP config saved.';
+}
+
+async function loadCdpProfiles() {
+    const table = document.getElementById('cdp-profiles-table');
+    if (!table) return;
+    try {
+        const response = await fetch('/api/cdp/meiro/profiles?limit=50');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load CDP profiles');
+        }
+        const payload = await response.json();
+        const rows = (payload.profiles || []).map(item => `
+            <tr>
+                <td><code>${item.external_user_id}</code></td>
+                <td class="small">${(item.segments || []).join(', ') || 'n/a'}</td>
+                <td class="small">${Object.keys(item.traits || {}).slice(0, 6).join(', ') || 'n/a'}</td>
+                <td>${item.synced_at || 'n/a'}</td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="4" class="text-muted">No CDP profiles ingested yet.</td></tr>';
+    } catch (error) {
+        table.innerHTML = `<tr><td colspan="4" class="text-danger">CDP profiles unavailable: ${error.message}</td></tr>`;
+    }
+}
+
+async function syncCdpProfiles() {
+    const statusEl = document.getElementById('cdp-sync-status');
+    const raw = document.getElementById('cdp-sync-external-ids').value || '';
+    const externalIds = raw.split(',').map(item => item.trim()).filter(Boolean);
+    if (!externalIds.length) {
+        throw new Error('Enter at least one external ID');
+    }
+    if (statusEl) statusEl.textContent = 'Sync in progress...';
+    const response = await fetch('/api/cdp/meiro/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ external_user_ids: externalIds, actor_id: getOperatorId() || undefined })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to sync profiles');
+    }
+    const payload = await response.json();
+    if (statusEl) statusEl.textContent = `Sync finished. Synced: ${payload.synced_count || 0}, errors: ${payload.error_count || 0}.`;
+    await loadCdpProfiles();
 }
 
 async function runCleanupNow() {
@@ -2729,6 +2854,29 @@ function setupEventListeners() {
             await runCleanupNow();
         } catch (error) {
             showError(error.message || 'Failed to run cleanup');
+        }
+    });
+    on('refresh-cdp-config', 'click', loadCdpConfig);
+    on('save-cdp-config', 'click', async () => {
+        try {
+            await saveCdpConfig();
+        } catch (error) {
+            showError(error.message || 'Failed to save CDP config');
+        }
+    });
+    on('save-cdp-mapping', 'click', async () => {
+        try {
+            await saveCdpConfig();
+        } catch (error) {
+            showError(error.message || 'Failed to save CDP mapping');
+        }
+    });
+    on('refresh-cdp-profiles', 'click', loadCdpProfiles);
+    on('sync-cdp-profiles', 'click', async () => {
+        try {
+            await syncCdpProfiles();
+        } catch (error) {
+            showError(error.message || 'Failed to sync CDP profiles');
         }
     });
     on('refresh-audit-logs', 'click', loadAuditLogs);
