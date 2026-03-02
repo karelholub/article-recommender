@@ -1,5 +1,8 @@
 import uuid
 import time
+import json
+import hmac
+import hashlib
 
 from app import app, recommender
 from connector_pipeline import IngestResult
@@ -498,3 +501,419 @@ def test_connector_metrics_endpoint():
     assert 'total_runs' in payload
     assert 'overall_success_rate' in payload
     assert 'connectors' in payload
+
+
+def test_scenario_crud_and_context_application():
+    client = app.test_client()
+    scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
+
+    created = client.post(
+        '/api/scenarios',
+        json={
+            'scenario_id': scenario_id,
+            'name': 'Fresh Source Focus',
+            'description': 'Prefer one source and recent content',
+            'enabled': True,
+            'rule_set': {
+                'include_sources': ['www.e15.cz'],
+                'max_age_days': 3650,
+                'source_boosts': {'www.e15.cz': 1.2},
+                'min_score': 0.0,
+            },
+        },
+    )
+    assert created.status_code == 201
+    created_payload = created.get_json()
+    assert created_payload['scenario_id'] == scenario_id
+    assert created_payload['enabled'] is True
+
+    listed = client.get('/api/scenarios')
+    assert listed.status_code == 200
+    listed_payload = listed.get_json()
+    assert any(item['scenario_id'] == scenario_id for item in listed_payload['scenarios'])
+
+    context = client.post(
+        '/api/recommendation-context',
+        json={'config_id': 'balanced', 'scenario_id': scenario_id},
+    )
+    assert context.status_code == 200
+    context_payload = context.get_json()
+    assert context_payload['scenario_id'] == scenario_id
+    assert context_payload['scenario']['name'] == 'Fresh Source Focus'
+
+    deleted = client.delete(f'/api/scenarios/{scenario_id}')
+    assert deleted.status_code == 200
+
+
+def test_external_user_id_and_event_metrics():
+    client = app.test_client()
+    article_id = next(iter(recommender.article_vectors.keys()))
+    source = recommender.extract_source(
+        recommender.article_vectors[article_id].get('metadata', {}).get('url', '')
+    )
+
+    scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
+    create_scenario = client.post(
+        '/api/scenarios',
+        json={
+            'scenario_id': scenario_id,
+            'name': 'Event Tracking Scenario',
+            'enabled': True,
+            'rule_set': {'include_sources': [source]},
+        },
+    )
+    assert create_scenario.status_code == 201
+
+    rec_resp = client.post(
+        '/api/recommendations/query',
+        json={
+            'user_id': 'registered_user',
+            'external_user_id': 'customer-123',
+            'user_reads': [article_id],
+            'top_n': 3,
+            'sources': [source],
+            'config_id': 'balanced',
+            'scenario_id': scenario_id,
+            'track_impressions': True,
+        },
+    )
+    assert rec_resp.status_code == 200
+    rec_payload = rec_resp.get_json()
+    assert rec_payload['external_user_id'] == 'customer-123'
+    assert rec_payload['effective_user_id'] == 'ext:customer-123'
+    assert rec_payload['scenario_trace']['applied'] is True
+    assert rec_payload['run_id']
+
+    if rec_payload['recommendations']:
+        clicked_article = rec_payload['recommendations'][0]['article_id']
+        event_resp = client.post(
+            '/api/events',
+            json={
+                'events': [
+                    {
+                        'event_type': 'click',
+                        'run_id': rec_payload['run_id'],
+                        'article_id': clicked_article,
+                        'scenario_id': scenario_id,
+                        'external_user_id': 'customer-123',
+                    },
+                    {
+                        'event_type': 'conversion',
+                        'run_id': rec_payload['run_id'],
+                        'article_id': clicked_article,
+                        'scenario_id': scenario_id,
+                        'external_user_id': 'customer-123',
+                    },
+                ]
+            },
+        )
+        assert event_resp.status_code == 201
+        assert event_resp.get_json()['inserted'] == 2
+
+    events_resp = client.get(f'/api/events?scenario_id={scenario_id}&limit=20')
+    assert events_resp.status_code == 200
+    events_payload = events_resp.get_json()
+    assert 'events' in events_payload
+
+    metrics_resp = client.get('/api/metrics/scenarios?days=3650')
+    assert metrics_resp.status_code == 200
+    metrics_payload = metrics_resp.get_json()
+    assert 'scenarios' in metrics_payload
+    assert any(item['scenario_id'] == scenario_id for item in metrics_payload['scenarios'])
+
+
+def test_cms_endpoint_and_scenario_simulation():
+    client = app.test_client()
+    article_id = next(iter(recommender.article_vectors.keys()))
+    source = recommender.extract_source(
+        recommender.article_vectors[article_id].get('metadata', {}).get('url', '')
+    )
+
+    scenario_id = f"scenario_{uuid.uuid4().hex[:8]}"
+    created = client.post(
+        '/api/scenarios',
+        json={
+            'scenario_id': scenario_id,
+            'name': 'CMS Scenario',
+            'enabled': True,
+            'rule_set': {'include_sources': [source], 'source_boosts': {source: 1.1}},
+        },
+    )
+    assert created.status_code == 201
+
+    cms_resp = client.post(
+        '/api/recommendations/cms',
+        json={
+            'request': {
+                'user_id': 'u1',
+                'external_user_id': 'ext-1',
+                'user_reads': [article_id],
+                'limit': 3,
+                'scenario_id': scenario_id,
+                'sources': [source],
+                'placement': 'homepage_top',
+            }
+        },
+    )
+    assert cms_resp.status_code == 200
+    cms_payload = cms_resp.get_json()
+    assert 'request_id' in cms_payload
+    assert cms_payload['user']['effective_user_id'] == 'ext:ext-1'
+    assert cms_payload['scenario_id'] == scenario_id
+    assert 'trace' in cms_payload
+
+    sim_resp = client.post(
+        f'/api/scenarios/{scenario_id}/simulate',
+        json={
+            'user_id': 'u1',
+            'user_reads': [article_id],
+            'top_n': 5,
+            'sources': [source],
+        },
+    )
+    assert sim_resp.status_code == 200
+    sim_payload = sim_resp.get_json()
+    assert sim_payload['scenario_id'] == scenario_id
+    assert 'scenario_trace' in sim_payload
+    assert 'decisions' in sim_payload['scenario_trace']
+
+    source_metrics = client.get(f'/api/metrics/scenarios/{scenario_id}/sources?days=3650')
+    assert source_metrics.status_code == 200
+    source_metrics_payload = source_metrics.get_json()
+    assert source_metrics_payload['scenario_id'] == scenario_id
+    assert 'sources' in source_metrics_payload
+
+
+def test_engine_config_endpoint():
+    client = app.test_client()
+    response = client.get('/api/engine/config')
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert 'ranking_configs' in payload
+    assert 'sources' in payload
+    assert 'scenarios' in payload
+    assert 'scheduler' in payload
+
+
+def test_events_idempotency_and_pagination():
+    client = app.test_client()
+    idempotency_key = f"idemp_{uuid.uuid4().hex}"
+    payload = {
+        'event_type': 'impression',
+        'scenario_id': None,
+        'article_id': 'demo_article_1',
+        'user_id': 'u1',
+    }
+
+    first = client.post('/api/events', json=payload, headers={'Idempotency-Key': idempotency_key})
+    assert first.status_code == 201
+    assert first.get_json()['inserted'] == 1
+
+    second = client.post('/api/events', json=payload, headers={'Idempotency-Key': idempotency_key})
+    assert second.status_code == 201
+    assert second.headers.get('X-Idempotent-Replay') == 'true'
+    assert second.get_json()['inserted'] == 1
+
+    listed = client.get('/api/events?limit=1&offset=0')
+    assert listed.status_code == 200
+    listed_payload = listed.get_json()
+    assert 'has_more' in listed_payload
+    assert listed_payload['limit'] == 1
+
+
+def test_cms_idempotency_and_observability():
+    client = app.test_client()
+    idempotency_key = f"cms_{uuid.uuid4().hex}"
+    response = client.post(
+        '/api/recommendations/cms',
+        json={
+            'request': {
+                'user_id': 'demo_user',
+                'external_user_id': 'customer-abc',
+                'user_reads': ['demo_article_1'],
+                'limit': 2,
+            }
+        },
+        headers={'Idempotency-Key': idempotency_key},
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['api_version'] == 'v1'
+    request_id = payload['request_id']
+
+    replay = client.post(
+        '/api/recommendations/cms',
+        json={
+            'request': {
+                'user_id': 'demo_user',
+                'external_user_id': 'customer-abc',
+                'user_reads': ['demo_article_1'],
+                'limit': 2,
+            }
+        },
+        headers={'Idempotency-Key': idempotency_key},
+    )
+    assert replay.status_code == 200
+    assert replay.headers.get('X-Idempotent-Replay') == 'true'
+    assert replay.get_json()['request_id'] == request_id
+
+    observability = client.get('/api/observability/overview?days=30')
+    assert observability.status_code == 200
+    obs_payload = observability.get_json()
+    assert obs_payload['api_version'] == 'v1'
+    assert 'recommendation_api' in obs_payload
+
+
+def test_audit_logs_endpoint_records_config_changes():
+    client = app.test_client()
+    scenario_id = f"audit_{uuid.uuid4().hex[:8]}"
+    created = client.post(
+        '/api/scenarios',
+        json={
+            'scenario_id': scenario_id,
+            'name': 'Audit Scenario',
+            'enabled': True,
+            'rule_set': {},
+            'actor_id': 'qa-user',
+        },
+        headers={'X-Actor-Id': 'qa-user'},
+    )
+    assert created.status_code == 201
+
+    logs = client.get('/api/audit-logs?resource_type=scenario&actor_id=qa-user&limit=5')
+    assert logs.status_code == 200
+    payload = logs.get_json()
+    assert payload['api_version'] == 'v1'
+    assert any(item['resource_id'] == scenario_id for item in payload['events'])
+
+
+def test_api_key_auth_toggle(monkeypatch):
+    client = app.test_client()
+    monkeypatch.setenv('API_AUTH_ENABLED', 'true')
+    monkeypatch.setenv('API_AUTH_KEYS', 'secret123')
+
+    no_key = client.get('/api/v1/engine/config')
+    assert no_key.status_code == 401
+
+    bad_key = client.get('/api/v1/engine/config', headers={'X-API-Key': 'bad'})
+    assert bad_key.status_code == 403
+
+    good_key = client.get('/api/v1/engine/config', headers={'X-API-Key': 'secret123'})
+    assert good_key.status_code == 200
+
+    monkeypatch.setenv('API_AUTH_ENABLED', 'false')
+    monkeypatch.delenv('API_AUTH_KEYS', raising=False)
+
+
+def test_rate_limit_toggle(monkeypatch):
+    client = app.test_client()
+    actor = f"rate-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv('API_AUTH_ENABLED', 'false')
+    monkeypatch.setenv('API_RATE_LIMIT_ENABLED', 'true')
+    monkeypatch.setenv('API_RATE_LIMIT_PER_MINUTE', '1')
+
+    first = client.get('/api/v1/engine/config', headers={'X-Actor-Id': actor})
+    assert first.status_code == 200
+
+    second = client.get('/api/v1/engine/config', headers={'X-Actor-Id': actor})
+    assert second.status_code == 429
+
+    monkeypatch.setenv('API_RATE_LIMIT_ENABLED', 'false')
+
+
+def test_hmac_signature_toggle(monkeypatch):
+    client = app.test_client()
+    monkeypatch.setenv('API_AUTH_ENABLED', 'false')
+    monkeypatch.setenv('API_SIGNATURE_ENABLED', 'true')
+    monkeypatch.setenv('API_SIGNATURE_SECRET', 'topsecret')
+    monkeypatch.setenv('API_SIGNATURE_MAX_SKEW_SECONDS', '300')
+
+    body = {'event_type': 'impression', 'article_id': 'demo_article_1', 'user_id': 'u1'}
+    raw = json.dumps(body, separators=(',', ':'))
+
+    missing = client.post('/api/events', data=raw, content_type='application/json')
+    assert missing.status_code == 401
+
+    ts = str(int(time.time()))
+    payload = f"{ts}\n{raw}".encode()
+    signature = hmac.new(b'topsecret', payload, hashlib.sha256).hexdigest()
+    valid = client.post(
+        '/api/events',
+        data=raw,
+        content_type='application/json',
+        headers={'X-Timestamp': ts, 'X-Signature': signature},
+    )
+    assert valid.status_code == 201
+
+    monkeypatch.setenv('API_SIGNATURE_ENABLED', 'false')
+    monkeypatch.delenv('API_SIGNATURE_SECRET', raising=False)
+
+
+def test_cleanup_endpoints():
+    client = app.test_client()
+    status = client.get('/api/maintenance/cleanup/status')
+    assert status.status_code == 200
+    status_payload = status.get_json()
+    assert status_payload['api_version'] == 'v1'
+    assert 'enabled' in status_payload
+
+    run_now = client.post('/api/maintenance/cleanup/run-now')
+    assert run_now.status_code == 200
+    run_payload = run_now.get_json()
+    assert run_payload['api_version'] == 'v1'
+    assert 'cleanup' in run_payload
+
+
+def test_alert_thresholds_and_sli_endpoints():
+    client = app.test_client()
+    get_resp = client.get('/api/alerts/thresholds')
+    assert get_resp.status_code == 200
+    get_payload = get_resp.get_json()
+    assert get_payload['api_version'] == 'v1'
+    assert 'thresholds' in get_payload
+
+    put_resp = client.put(
+        '/api/alerts/thresholds',
+        json={
+            'thresholds': {
+                'recommendation_p95_ms': 600,
+                'connector_failure_rate': 0.2,
+                'min_ctr': 0.0,
+            }
+        },
+    )
+    assert put_resp.status_code == 200
+    put_payload = put_resp.get_json()
+    assert put_payload['thresholds']['recommendation_p95_ms'] == 600.0
+
+    sli_resp = client.get('/api/v1/observability/sli?days=30')
+    assert sli_resp.status_code == 200
+    sli_payload = sli_resp.get_json()
+    assert sli_payload['api_version'] == 'v1'
+    assert 'overall_status' in sli_payload
+    assert isinstance(sli_payload['checks'], list)
+
+
+def test_alert_incidents_endpoints():
+    client = app.test_client()
+    evaluate = client.post('/api/alerts/incidents/evaluate', json={'days': 30, 'actor_id': 'ops-user'})
+    assert evaluate.status_code == 200
+    evaluate_payload = evaluate.get_json()
+    assert evaluate_payload['api_version'] == 'v1'
+    assert 'incident_sync' in evaluate_payload
+
+    listed = client.get('/api/alerts/incidents?status=open&limit=20')
+    assert listed.status_code == 200
+    listed_payload = listed.get_json()
+    assert listed_payload['api_version'] == 'v1'
+    assert 'incidents' in listed_payload
+
+    if listed_payload['incidents']:
+        incident_id = listed_payload['incidents'][0]['incident_id']
+        resolved = client.put(
+            f'/api/alerts/incidents/{incident_id}/resolve',
+            json={'actor_id': 'ops-user', 'note': 'handled'},
+        )
+        assert resolved.status_code == 200
+        resolved_payload = resolved.get_json()
+        assert resolved_payload['resolved'] is True

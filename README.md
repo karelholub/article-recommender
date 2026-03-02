@@ -162,29 +162,82 @@ python embed.py
 - `POST /api/ranking-configs`: Create custom ranking config (new version starts at 1)
 - `PUT /api/ranking-configs/<config_id>`: Create a new version for an existing custom config
 - `DELETE /api/ranking-configs/<config_id>`: Delete custom config versions (system configs are protected)
+- `GET /api/scenarios?include_disabled=true|false`: List recommendation scenarios/rule sets
+- `POST /api/scenarios`: Create scenario rule configuration
+- `GET /api/scenarios/<scenario_id>`: Get scenario detail
+- `PUT /api/scenarios/<scenario_id>`: Update scenario rule configuration
+- `DELETE /api/scenarios/<scenario_id>`: Delete scenario
 - `GET /api/similar/<article_id>?sources=...&config_id=...&top_n=...`: Similar articles with filters/config
 - `POST /api/recommendations/query`: Structured recommendation query
 - `POST /api/recommendation-context`: Resolve effective source/config context without executing ranking
 - `GET /api/recommendation-runs?limit=20`: Recent recommendation runs
 - `GET /api/recommendation-runs/<run_id>`: Full trace for one run
 - `GET /api/metrics/offline?limit_runs=100`: Offline aggregate metrics from stored runs
+- `POST /api/recommendations/cms`: CMS-style recommendation integration payload (external ID + placement + trace)
+  - supports `Idempotency-Key` header
+  - alias: `POST /api/v1/recommendations/cms`
+- `POST /api/scenarios/<scenario_id>/simulate`: Preview scenario filtering/boosting over recommendations
+- `POST /api/events`: Record impression/click/conversion events
+- `GET /api/events?scenario_id=...&event_type=...&limit=...&offset=...&days=...`: Inspect event stream (paginated)
+  - `POST /api/events` supports `Idempotency-Key`
+  - alias: `/api/v1/events`
+- `GET /api/metrics/scenarios?days=30&top_articles=5`: Scenario-level reporting (impressions, clicks, CTR, conversions, top articles)
+- `GET /api/metrics/scenarios/<scenario_id>/sources?days=30`: Scenario KPI breakdown by source domain
+- `GET /api/engine/config`: Full runtime engine configuration snapshot (sources/configs/scenarios/scheduler)
+  - alias: `/api/v1/engine/config`
+- `GET /api/observability/overview?days=7`: SLA-oriented operational snapshot (recommendation latency stats, events throughput, connector failure rate)
+- `GET /api/observability/sli?days=7`: SLI check status (`pass|warn`) against configured thresholds
+- `GET /api/alerts/thresholds`: current alert/SLO threshold config
+- `PUT /api/alerts/thresholds`: update alert/SLO thresholds
+- `GET /api/alerts/incidents`: list alert incidents (`open|resolved`) with pagination/filters
+- `POST /api/alerts/incidents/evaluate`: evaluate current SLI checks and open/resolve incidents
+- `PUT /api/alerts/incidents/<incident_id>/resolve`: manually resolve incident
+- `GET /api/recommendation-runs?limit=...&offset=...`: paginated run history
+- `GET /api/audit-logs?limit=...&offset=...&actor_id=...&resource_type=...`: audit trail for config/scenario/source/connector changes
+- `GET /api/maintenance/cleanup/status`: retention cleanup scheduler state
+- `POST /api/maintenance/cleanup/run-now`: trigger retention cleanup job now
 - `GET /api/stats`: Dataset statistics
+
+Auth/rate-limit controls (disabled by default):
+- `API_AUTH_ENABLED=true`
+- `API_AUTH_KEYS=key1,key2` (header `X-API-Key`)
+- `API_RATE_LIMIT_ENABLED=true`
+- `API_RATE_LIMIT_PER_MINUTE=120` (keyed by `X-Actor-Id` + endpoint)
+- `API_RATE_LIMIT_RULES='{\"/api/recommendations/cms\":60,\"/api/events\":120}'` (optional per-prefix overrides)
+- `API_SIGNATURE_ENABLED=true`
+- `API_SIGNATURE_SECRET=...` (headers: `X-Timestamp`, `X-Signature`)
+- `API_SIGNATURE_MAX_SKEW_SECONDS=300`
+
+Retention cleanup job:
+- `CLEANUP_SCHEDULER_ENABLED=true`
+- `CLEANUP_SCHEDULER_INTERVAL_SECONDS=3600`
+- `IDEMPOTENCY_RETENTION_HOURS=72`
+- `AUDIT_RETENTION_DAYS=90`
+
+Alert/SLO thresholds are persisted and currently support:
+- `recommendation_p95_ms`
+- `connector_failure_rate`
+- `min_ctr`
 
 Example query endpoint payload:
 
 ```json
 {
   "user_id": "demo_user",
+  "external_user_id": "customer-123",
   "user_reads": ["article_id_1"],
   "top_n": 5,
   "sources": ["www.e15.cz"],
-  "config_id": "balanced"
+  "config_id": "balanced",
+  "scenario_id": "homepage"
 }
 ```
 
 The `POST /api/recommendations/query` response also includes:
 - `source_defaults_applied`
 - `effective_ranking_config`
+- `effective_user_id` (uses `external_user_id` when provided for cross-device identity)
+- `scenario_trace` (rule-level filtering/boosting trace)
 
 These show exactly which source weights and ranking config were used during scoring.
 

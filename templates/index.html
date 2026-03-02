@@ -134,6 +134,16 @@
                             <label for="ranking-config" class="form-label">Ranking Configuration</label>
                             <select id="ranking-config" class="form-select"></select>
                         </div>
+                        <div class="mb-3">
+                            <label for="scenario-select" class="form-label">Scenario</label>
+                            <select id="scenario-select" class="form-select">
+                                <option value="">No scenario</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label for="external-user-id" class="form-label">External User ID</label>
+                            <input id="external-user-id" class="form-control" placeholder="customer-123">
+                        </div>
                         <div>
                             <label class="form-label">Sources</label>
                             <div id="source-filters" class="small text-muted">Loading sources...</div>
@@ -213,6 +223,30 @@
                 <!-- BERT Explanation -->
                 <div class="card mb-4">
                     <div class="card-header">
+                        <h3 class="mb-0">Scenario Config</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="small text-muted mb-2">
+                            Configure recommendation rules without redeploying backend code.
+                        </div>
+                        <input id="scenario-id" class="form-control form-control-sm mb-2" placeholder="scenario_id (e.g., homepage)">
+                        <input id="scenario-name" class="form-control form-control-sm mb-2" placeholder="Scenario name">
+                        <div class="form-check mb-2">
+                            <input id="scenario-enabled" class="form-check-input" type="checkbox" checked>
+                            <label class="form-check-label small" for="scenario-enabled">Enabled</label>
+                        </div>
+                        <textarea id="scenario-rule-set" class="form-control form-control-sm mb-2" rows="7" placeholder='{"include_sources":["www.e15.cz"],"max_age_days":7}'></textarea>
+                        <div class="d-flex gap-2">
+                            <button id="save-scenario" class="btn btn-sm btn-outline-primary">Save Scenario</button>
+                            <button id="delete-scenario" class="btn btn-sm btn-outline-danger">Delete</button>
+                            <button id="refresh-scenarios" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                        </div>
+                        <div id="scenario-editor-hint" class="small text-muted mt-2">Rule set must be valid JSON.</div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header">
                         <h3 class="mb-0">How It Works</h3>
                     </div>
                     <div class="card-body">
@@ -260,6 +294,16 @@
                     </div>
                     <div class="card-body">
                         <div id="offline-metrics" class="small text-muted">Loading metrics...</div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h3 class="mb-0">Scenario Metrics</h3>
+                        <button id="refresh-scenario-metrics" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="scenario-metrics" class="small text-muted">Loading scenario metrics...</div>
                     </div>
                 </div>
 

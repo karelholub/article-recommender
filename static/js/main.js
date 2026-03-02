@@ -3,6 +3,7 @@ let currentArticle = null;
 let articles = [];
 let sourceOptions = [];
 let rankingConfigs = {};
+let scenarios = [];
 let connectors = [];
 const connectorRunsCache = {};
 const connectorMetricsById = {};
@@ -15,7 +16,9 @@ document.addEventListener('DOMContentLoaded', () => {
     loadStats();
     loadSources();
     loadRankingConfigs();
+    loadScenarios();
     loadOfflineMetrics();
+    loadScenarioMetrics();
     loadConnectors();
     loadConnectorMetrics();
     loadSchedulerStatus();
@@ -621,18 +624,156 @@ async function loadRankingConfigs() {
     }
 }
 
+function getSelectedScenarioId() {
+    return document.getElementById('scenario-select')?.value || '';
+}
+
+function getExternalUserId() {
+    const raw = document.getElementById('external-user-id')?.value || '';
+    return raw.trim();
+}
+
+function applyScenarioToEditor(scenario) {
+    document.getElementById('scenario-id').value = scenario?.scenario_id || '';
+    document.getElementById('scenario-name').value = scenario?.name || '';
+    document.getElementById('scenario-enabled').checked = Boolean(scenario?.enabled ?? true);
+    document.getElementById('scenario-rule-set').value = JSON.stringify(scenario?.rule_set || {}, null, 2);
+}
+
+async function loadScenarios() {
+    try {
+        const response = await fetch('/api/scenarios?include_disabled=true');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load scenarios');
+        }
+        const data = await response.json();
+        scenarios = data.scenarios || [];
+        const select = document.getElementById('scenario-select');
+        const current = select.value;
+        select.innerHTML = '<option value="">No scenario</option>' + scenarios
+            .map(item => `<option value="${item.scenario_id}">${item.name} (${item.scenario_id})${item.enabled ? '' : ' [disabled]'}</option>`)
+            .join('');
+        if (current && scenarios.some(item => item.scenario_id === current)) {
+            select.value = current;
+        }
+        const selected = scenarios.find(item => item.scenario_id === select.value);
+        applyScenarioToEditor(selected || null);
+        loadDecisionContext();
+    } catch (error) {
+        console.error('Error loading scenarios:', error);
+        showError(`Failed to load scenarios: ${error.message}`);
+    }
+}
+
+async function saveScenario() {
+    const scenarioId = (document.getElementById('scenario-id').value || '').trim();
+    const name = (document.getElementById('scenario-name').value || '').trim();
+    const enabled = document.getElementById('scenario-enabled').checked;
+    const ruleSetRaw = document.getElementById('scenario-rule-set').value || '{}';
+    if (!scenarioId) {
+        throw new Error('Scenario ID is required');
+    }
+    if (!name) {
+        throw new Error('Scenario name is required');
+    }
+    let ruleSet = {};
+    try {
+        ruleSet = JSON.parse(ruleSetRaw);
+    } catch (_err) {
+        throw new Error('Scenario rule set must be valid JSON');
+    }
+
+    const existing = scenarios.find(item => item.scenario_id === scenarioId);
+    const method = existing ? 'PUT' : 'POST';
+    const url = existing ? `/api/scenarios/${encodeURIComponent(scenarioId)}` : '/api/scenarios';
+    const payload = {
+        scenario_id: scenarioId,
+        name,
+        enabled,
+        rule_set: ruleSet
+    };
+    const response = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to save scenario');
+    }
+    await loadScenarios();
+    document.getElementById('scenario-select').value = scenarioId;
+    loadDecisionContext();
+}
+
+async function deleteScenario() {
+    const scenarioId = (document.getElementById('scenario-id').value || '').trim();
+    if (!scenarioId) {
+        throw new Error('Select a scenario first');
+    }
+    const response = await fetch(`/api/scenarios/${encodeURIComponent(scenarioId)}`, { method: 'DELETE' });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to delete scenario');
+    }
+    await loadScenarios();
+    document.getElementById('scenario-select').value = '';
+    applyScenarioToEditor(null);
+    loadDecisionContext();
+}
+
+async function loadScenarioMetrics() {
+    const container = document.getElementById('scenario-metrics');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/metrics/scenarios?days=30&top_articles=5');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load scenario metrics');
+        }
+        const payload = await response.json();
+        const scenariosRows = (payload.scenarios || []).map(item => `
+            <tr>
+                <td>${item.name || item.scenario_id}</td>
+                <td>${item.impressions}</td>
+                <td>${item.clicks}</td>
+                <td>${(Number(item.ctr || 0) * 100).toFixed(1)}%</td>
+                <td>${item.conversions}</td>
+            </tr>
+        `).join('');
+        container.innerHTML = `
+            <div><strong>Window:</strong> ${payload.window_days} days</div>
+            <div><strong>Total impressions:</strong> ${payload.totals?.impressions ?? 0}</div>
+            <div><strong>Total clicks:</strong> ${payload.totals?.clicks ?? 0}</div>
+            <div><strong>Total CTR:</strong> ${(Number(payload.totals?.ctr || 0) * 100).toFixed(2)}%</div>
+            <div class="table-responsive mt-2">
+                <table class="table table-sm mb-0">
+                    <thead><tr><th>Scenario</th><th>Impr.</th><th>Clicks</th><th>CTR</th><th>Conv.</th></tr></thead>
+                    <tbody>${scenariosRows || '<tr><td colspan="5" class="text-muted">No scenario events yet.</td></tr>'}</tbody>
+                </table>
+            </div>
+        `;
+    } catch (error) {
+        console.error('Error loading scenario metrics:', error);
+        container.innerHTML = `Scenario metrics unavailable: ${error.message}`;
+    }
+}
+
 async function loadDecisionContext() {
     const container = document.getElementById('decision-context');
     if (!container) return;
     try {
         const configId = document.getElementById('ranking-config')?.value || 'balanced';
         const selectedSources = getSelectedSources();
+        const scenarioId = getSelectedScenarioId();
         const response = await fetch('/api/recommendation-context', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config_id: configId,
-                sources: selectedSources
+                sources: selectedSources,
+                scenario_id: scenarioId || undefined
             })
         });
         if (!response.ok) {
@@ -746,6 +887,8 @@ async function showSimilarArticles() {
     try {
         const selectedSources = getSelectedSources();
         const configId = document.getElementById('ranking-config').value || 'balanced';
+        const scenarioId = getSelectedScenarioId();
+        const externalUserId = getExternalUserId();
 
         const similarList = document.getElementById('similar-list');
         similarList.innerHTML = `
@@ -766,7 +909,9 @@ async function showSimilarArticles() {
                 user_reads: [currentArticle.article_id],
                 top_n: 5,
                 sources: selectedSources,
-                config_id: configId
+                config_id: configId,
+                scenario_id: scenarioId || undefined,
+                external_user_id: externalUserId || undefined
             })
         });
         if (!response.ok) {
@@ -834,9 +979,14 @@ async function showSimilarArticles() {
         }).join('');
         similarList.insertAdjacentHTML(
             'afterbegin',
-            `<div class="alert alert-secondary py-2">Run ID: <code>${responsePayload.run_id}</code></div>`
+            `<div class="alert alert-secondary py-2">
+                Run ID: <code>${responsePayload.run_id}</code>
+                ${responsePayload.external_user_id ? `<span class="ms-2">External User ID: <code>${responsePayload.external_user_id}</code></span>` : ''}
+                ${responsePayload.scenario_id ? `<span class="ms-2">Scenario: <code>${responsePayload.scenario_id}</code></span>` : ''}
+            </div>`
         );
         loadOfflineMetrics();
+        loadScenarioMetrics();
     } catch (error) {
         console.error('Error loading similar articles:', error);
         showError('Failed to load similar articles: ' + error.message);
@@ -922,6 +1072,12 @@ function setupEventListeners() {
     document.getElementById('show-similar').addEventListener('click', showSimilarArticles);
     document.getElementById('refresh-decision-context').addEventListener('click', loadDecisionContext);
     document.getElementById('ranking-config').addEventListener('change', loadDecisionContext);
+    document.getElementById('scenario-select').addEventListener('change', (event) => {
+        const selected = scenarios.find(item => item.scenario_id === event.target.value);
+        applyScenarioToEditor(selected || null);
+        loadDecisionContext();
+    });
+    document.getElementById('external-user-id').addEventListener('change', loadDecisionContext);
     document.getElementById('source-filters').addEventListener('change', (event) => {
         if (event.target.classList.contains('source-filter')) {
             loadDecisionContext();
@@ -946,6 +1102,24 @@ function setupEventListeners() {
     document.getElementById('sync-due-connectors').addEventListener('click', syncDueConnectors);
     document.getElementById('run-scheduler-now').addEventListener('click', runSchedulerNow);
     document.getElementById('connector-list').addEventListener('click', handleConnectorAction);
+    document.getElementById('save-scenario').addEventListener('click', async () => {
+        try {
+            await saveScenario();
+            await loadScenarioMetrics();
+        } catch (error) {
+            showError(error.message || 'Failed to save scenario');
+        }
+    });
+    document.getElementById('delete-scenario').addEventListener('click', async () => {
+        try {
+            await deleteScenario();
+            await loadScenarioMetrics();
+        } catch (error) {
+            showError(error.message || 'Failed to delete scenario');
+        }
+    });
+    document.getElementById('refresh-scenarios').addEventListener('click', loadScenarios);
+    document.getElementById('refresh-scenario-metrics').addEventListener('click', loadScenarioMetrics);
 }
 
 function formatDate(dateString) {

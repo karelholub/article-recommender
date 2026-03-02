@@ -55,3 +55,128 @@ def test_connector_run_lifecycle_sqlite(tmp_path):
     runs = store.list_connector_runs(connector_id, limit=5)
     assert runs
     assert runs[0]['run_id'] == run_id
+
+
+def test_scenario_and_event_metrics_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    scenario = store.upsert_scenario(
+        scenario_id='homepage',
+        name='Homepage',
+        rule_set={'include_sources': ['example.com']},
+        enabled=True,
+    )
+    assert scenario['scenario_id'] == 'homepage'
+
+    scenarios = store.list_scenarios()
+    assert any(item['scenario_id'] == 'homepage' for item in scenarios)
+
+    inserted = store.record_events(
+        [
+            {
+                'event_type': 'impression',
+                'run_id': None,
+                'article_id': 'a1',
+                'scenario_id': 'homepage',
+                'user_id': 'u1',
+            },
+            {
+                'event_type': 'click',
+                'run_id': None,
+                'article_id': 'a1',
+                'scenario_id': 'homepage',
+                'user_id': 'u1',
+            },
+        ]
+    )
+    assert inserted == 2
+
+    events = store.list_events(limit=10, scenario_id='homepage')
+    assert len(events) == 2
+
+    metrics = store.compute_scenario_metrics(days=30, top_articles=3)
+    assert metrics['totals']['impressions'] == 1
+    assert metrics['totals']['clicks'] == 1
+    assert any(item['scenario_id'] == 'homepage' for item in metrics['scenarios'])
+
+
+def test_idempotency_record_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    store.save_idempotency_record(
+        endpoint='events_ingest',
+        key='key-1',
+        status_code=201,
+        response_payload={'inserted': 2},
+    )
+    loaded = store.get_idempotency_record(endpoint='events_ingest', key='key-1')
+    assert loaded is not None
+    assert loaded['status_code'] == 201
+    assert loaded['response']['inserted'] == 2
+
+
+def test_audit_events_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    event_id = store.record_audit_event(
+        actor_id='tester',
+        action='update',
+        resource_type='scenario',
+        resource_id='homepage',
+        metadata={'field': 'value'},
+    )
+    assert event_id
+    events = store.list_audit_events(limit=10, offset=0, actor_id='tester', resource_type='scenario')
+    assert len(events) == 1
+    assert events[0]['resource_id'] == 'homepage'
+    assert events[0]['metadata']['field'] == 'value'
+
+
+def test_purge_retention_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    store.save_idempotency_record(
+        endpoint='events_ingest',
+        key='purge-key',
+        status_code=201,
+        response_payload={'inserted': 1},
+    )
+    store.record_audit_event(
+        actor_id='tester',
+        action='update',
+        resource_type='scenario',
+        resource_id='cleanup',
+    )
+    removed_idem = store.purge_idempotency_records(older_than_hours=0)
+    removed_audit = store.purge_audit_events(older_than_days=0)
+    assert removed_idem >= 1
+    assert removed_audit >= 1
+
+
+def test_alert_thresholds_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    defaults = store.get_alert_thresholds()
+    assert 'recommendation_p95_ms' in defaults
+    updated = store.upsert_alert_thresholds(
+        {
+            'recommendation_p95_ms': 420,
+            'connector_failure_rate': 0.08,
+            'min_ctr': 0.02,
+        }
+    )
+    assert updated['recommendation_p95_ms'] == 420.0
+    assert updated['connector_failure_rate'] == 0.08
+    assert updated['min_ctr'] == 0.02
+
+
+def test_alert_incident_lifecycle_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    incident = store.upsert_alert_incident(
+        metric='ctr',
+        current_value=0.0,
+        threshold_value=0.01,
+        details={'status': 'warn'},
+    )
+    assert incident['status'] == 'open'
+    listed = store.list_alert_incidents(limit=10, offset=0, status='open', metric='ctr')
+    assert len(listed) == 1
+    resolved = store.resolve_alert_incident(incident['incident_id'], resolved_by='tester', note='ack')
+    assert resolved is True
+    listed_resolved = store.list_alert_incidents(limit=10, offset=0, status='resolved', metric='ctr')
+    assert listed_resolved

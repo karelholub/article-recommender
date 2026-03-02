@@ -104,6 +104,8 @@ class BaseRecommender(ABC):
                         vector = vector + [0] * (expected_length - len(vector))
                     else:
                         vector = vector[:expected_length]
+                    # Persist normalized dimensionality back into canonical in-memory payload.
+                    self.article_vectors[aid]["vector"] = vector
                 vectors.append(vector)
 
             self.vector_array = np.array(vectors, dtype=np.float32)

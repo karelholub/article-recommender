@@ -115,3 +115,49 @@ def test_factory_rejects_unknown_recommender():
         assert False, "Expected ValueError for unknown recommender"
     except ValueError as exc:
         assert "Unknown recommender type" in str(exc)
+
+
+def test_mixed_embedding_dimensions_are_normalized_for_scoring(tmp_path):
+    embeddings = {
+        "a1": {
+            "metadata": {
+                "title": "A1",
+                "content": "alpha",
+                "url": "https://example.com/a1",
+                "scraped_at": "2026-03-02 10:00:00",
+            },
+            "cluster": 0,
+            "vector": [0.1, 0.2, 0.3],
+        },
+        "a2": {
+            "metadata": {
+                "title": "A2",
+                "content": "beta",
+                "url": "https://example.com/a2",
+                "scraped_at": "2026-03-01 10:00:00",
+            },
+            "cluster": 1,
+            "vector": [0.4, 0.5, 0.6, 0.7, 0.8],
+        },
+    }
+    profiles = {"u1": ["a1"]}
+    embed_file = tmp_path / "article_vectors.json"
+    profile_file = tmp_path / "user_profiles.json"
+    output_file = tmp_path / "recommendations.json"
+    embed_file.write_text(json.dumps(embeddings), encoding="utf-8")
+    profile_file.write_text(json.dumps(profiles), encoding="utf-8")
+
+    recommender = AdvancedRecommender(
+        embed_file=str(embed_file),
+        profile_file=str(profile_file),
+        output_file=str(output_file),
+    )
+
+    recommendations = recommender.recommend_for_user(
+        "u1",
+        recommender.article_vectors,
+        ["a1"],
+        top_n=1,
+    )
+    assert len(recommendations) == 1
+    assert recommendations[0]["article_id"] == "a2"

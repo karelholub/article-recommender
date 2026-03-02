@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import fcntl
+import hashlib
+import hmac
+import json
 import logging
 import os
 import threading
@@ -31,6 +34,11 @@ _scheduler_stop_event = threading.Event()
 _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_lock_file_handle = None
 _last_embed_mtime = 0.0
+_rate_limit_lock = threading.Lock()
+_rate_limit_counters: Dict[str, Dict] = {}
+_cleanup_state_lock = threading.Lock()
+_cleanup_thread: Optional[threading.Thread] = None
+_cleanup_stop_event = threading.Event()
 _scheduler_state = {
     "enabled": False,
     "running": False,
@@ -42,6 +50,19 @@ _scheduler_state = {
     "last_result": None,
     "last_error": None,
 }
+
+_cleanup_state = {
+    "enabled": False,
+    "running": False,
+    "interval_seconds": int(os.getenv("CLEANUP_SCHEDULER_INTERVAL_SECONDS", "3600")),
+    "runs_total": 0,
+    "errors_total": 0,
+    "last_run_at": None,
+    "last_result": None,
+    "last_error": None,
+}
+
+_WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
 
 
 # Initialize recommender
@@ -72,6 +93,557 @@ def _parse_sources_param(value: str):
     if not value:
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _normalize_string_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+    elif isinstance(value, list):
+        items = [str(part).strip() for part in value]
+    else:
+        return []
+    return [item for item in items if item]
+
+
+def _extract_sections(metadata: Dict, url: str) -> list:
+    sections = []
+    for key in ("section", "rubrika", "category", "categories"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            sections.append(value.strip().lower())
+        elif isinstance(value, list):
+            sections.extend(str(item).strip().lower() for item in value if str(item).strip())
+    parsed = urlparse(url or "")
+    path_parts = [segment for segment in parsed.path.split("/") if segment]
+    if path_parts:
+        sections.append(path_parts[0].lower())
+    return sorted(set(sections))
+
+
+def _safe_article_age_days(scraped_at: str) -> Optional[int]:
+    if not scraped_at:
+        return None
+    try:
+        ts = datetime.strptime(scraped_at, "%Y-%m-%d %H:%M:%S")
+        return max(0, (datetime.now() - ts).days)
+    except ValueError:
+        return None
+
+
+def _validate_scenario_rule_set(rule_set: Dict) -> Dict:
+    candidate = dict(rule_set or {})
+    normalized = {
+        "include_sources": _normalize_string_list(candidate.get("include_sources")),
+        "exclude_sources": _normalize_string_list(candidate.get("exclude_sources")),
+        "include_sections": [value.lower() for value in _normalize_string_list(candidate.get("include_sections"))],
+        "exclude_sections": [value.lower() for value in _normalize_string_list(candidate.get("exclude_sections"))],
+        "include_keywords": [value.lower() for value in _normalize_string_list(candidate.get("include_keywords"))],
+        "exclude_keywords": [value.lower() for value in _normalize_string_list(candidate.get("exclude_keywords"))],
+        "exclude_article_ids": _normalize_string_list(candidate.get("exclude_article_ids")),
+        "max_age_days": candidate.get("max_age_days"),
+        "min_score": candidate.get("min_score"),
+        "source_boosts": {
+            str(key): float(value)
+            for key, value in (candidate.get("source_boosts") or {}).items()
+        },
+        "ranking_config_id": str(candidate.get("ranking_config_id", "")).strip() or None,
+    }
+
+    if normalized["max_age_days"] is not None:
+        normalized["max_age_days"] = max(0, int(normalized["max_age_days"]))
+    if normalized["min_score"] is not None:
+        normalized["min_score"] = float(normalized["min_score"])
+    for source, boost in normalized["source_boosts"].items():
+        if boost <= 0:
+            raise ValueError(f"source_boosts[{source}] must be greater than 0")
+
+    return normalized
+
+
+def _resolve_effective_user_id(user_id: str, external_user_id: Optional[str]) -> str:
+    external = (external_user_id or "").strip()
+    if external:
+        return f"ext:{external}"
+    return user_id
+
+
+def _read_idempotency_key(payload: Optional[Dict]) -> Optional[str]:
+    header_key = (request.headers.get("Idempotency-Key") or "").strip()
+    if header_key:
+        return header_key
+    if payload and isinstance(payload, dict):
+        body_key = str(payload.get("idempotency_key", "")).strip()
+        if body_key:
+            return body_key
+    return None
+
+
+def _request_actor_id(payload: Optional[Dict] = None) -> str:
+    header_actor = (request.headers.get("X-Actor-Id") or "").strip()
+    if header_actor:
+        return header_actor
+    if payload and isinstance(payload, dict):
+        actor = str(payload.get("actor_id", "")).strip()
+        if actor:
+            return actor
+    return "system"
+
+
+def _is_protected_request() -> bool:
+    protected_paths = (
+        request.path.startswith("/api/v1/")
+        or request.path.startswith("/api/recommendations/cms")
+        or request.path.startswith("/api/events")
+        or request.path.startswith("/api/scenarios")
+        or request.path.startswith("/api/ranking-configs")
+        or request.path.startswith("/api/connectors")
+        or request.path.startswith("/api/source-settings")
+    )
+    return protected_paths and request.method in _WRITE_METHODS.union({"GET"})
+
+
+def _enforce_api_key_if_enabled() -> Optional[Tuple[Dict, int]]:
+    enabled = os.getenv("API_AUTH_ENABLED", "false").strip().lower() == "true"
+    if not enabled:
+        return None
+    if not _is_protected_request():
+        return None
+
+    configured = [part.strip() for part in os.getenv("API_AUTH_KEYS", "").split(",") if part.strip()]
+    if not configured:
+        return {"error": "API auth enabled but API_AUTH_KEYS is empty"}, 503
+
+    provided = (request.headers.get("X-API-Key") or "").strip()
+    if not provided:
+        return {"error": "Missing API key"}, 401
+    if provided not in configured:
+        return {"error": "Invalid API key"}, 403
+    return None
+
+
+def _enforce_hmac_signature_if_enabled() -> Optional[Tuple[Dict, int]]:
+    enabled = os.getenv("API_SIGNATURE_ENABLED", "false").strip().lower() == "true"
+    if not enabled:
+        return None
+    if request.method not in _WRITE_METHODS:
+        return None
+    if not _is_protected_request():
+        return None
+
+    secret = os.getenv("API_SIGNATURE_SECRET", "").strip()
+    if not secret:
+        return {"error": "API signature enabled but API_SIGNATURE_SECRET is empty"}, 503
+
+    signature = (request.headers.get("X-Signature") or "").strip()
+    timestamp = (request.headers.get("X-Timestamp") or "").strip()
+    if not signature or not timestamp:
+        return {"error": "Missing signature headers"}, 401
+
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return {"error": "Invalid X-Timestamp"}, 400
+
+    skew = max(1, int(os.getenv("API_SIGNATURE_MAX_SKEW_SECONDS", "300")))
+    now_ts = int(datetime.now().timestamp())
+    if abs(now_ts - ts) > skew:
+        return {"error": "Signature timestamp outside allowed skew"}, 401
+
+    raw_body = request.get_data(cache=True) or b""
+    payload = timestamp.encode("utf-8") + b"\n" + raw_body
+    expected = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return {"error": "Invalid signature"}, 403
+    return None
+
+
+def _rate_limit_for_endpoint(path: str) -> int:
+    default_limit = max(1, int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "120")))
+    rules_env = os.getenv("API_RATE_LIMIT_RULES", "").strip()
+    rules: Dict[str, int] = {}
+    if rules_env:
+        try:
+            parsed = json.loads(rules_env)
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    rules[str(key)] = int(value)
+        except Exception:
+            logger.warning("Invalid API_RATE_LIMIT_RULES JSON; falling back to defaults")
+    if not rules:
+        rules = {
+            "/api/recommendations/cms": 60,
+            "/api/v1/recommendations/cms": 60,
+            "/api/events": 120,
+            "/api/v1/events": 120,
+            "/api/scenarios": 30,
+            "/api/ranking-configs": 30,
+        }
+
+    matched_limit = default_limit
+    best_len = -1
+    for prefix, limit in rules.items():
+        if path.startswith(prefix) and len(prefix) > best_len:
+            matched_limit = max(1, int(limit))
+            best_len = len(prefix)
+    return matched_limit
+
+
+def _enforce_rate_limit_if_enabled() -> Optional[Tuple[Dict, int]]:
+    enabled = os.getenv("API_RATE_LIMIT_ENABLED", "false").strip().lower() == "true"
+    if not enabled:
+        return None
+    if not _is_protected_request():
+        return None
+    limit = _rate_limit_for_endpoint(request.path)
+    actor = (request.headers.get("X-Actor-Id") or request.remote_addr or "unknown").strip() or "unknown"
+    endpoint = request.path
+    now = datetime.now()
+    bucket = now.strftime("%Y-%m-%d %H:%M")
+    key = f"{actor}|{endpoint}|{bucket}"
+
+    with _rate_limit_lock:
+        counter = _rate_limit_counters.get(key)
+        if not counter:
+            counter = {"count": 0, "created_at": now}
+            _rate_limit_counters[key] = counter
+        counter["count"] += 1
+        count = counter["count"]
+
+        stale_before = now - timedelta(minutes=2)
+        stale_keys = [k for k, v in _rate_limit_counters.items() if v["created_at"] < stale_before]
+        for stale_key in stale_keys:
+            _rate_limit_counters.pop(stale_key, None)
+
+    if count > limit:
+        return {
+            "error": "Rate limit exceeded",
+            "limit_per_minute": limit,
+            "actor": actor,
+            "endpoint": endpoint,
+        }, 429
+    return None
+
+
+def _run_cleanup_cycle() -> Dict:
+    if not store:
+        raise ValueError("Store unavailable")
+    idempotency_hours = max(0, int(os.getenv("IDEMPOTENCY_RETENTION_HOURS", "72")))
+    audit_days = max(0, int(os.getenv("AUDIT_RETENTION_DAYS", "90")))
+    removed_idempotency = store.purge_idempotency_records(older_than_hours=idempotency_hours)
+    removed_audit = store.purge_audit_events(older_than_days=audit_days)
+    return {
+        "idempotency_hours": idempotency_hours,
+        "audit_days": audit_days,
+        "removed_idempotency": removed_idempotency,
+        "removed_audit_events": removed_audit,
+    }
+
+
+def _cleanup_loop() -> None:
+    while not _cleanup_stop_event.is_set():
+        try:
+            result = _run_cleanup_cycle()
+            with _cleanup_state_lock:
+                _cleanup_state["runs_total"] += 1
+                _cleanup_state["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _cleanup_state["last_result"] = result
+                _cleanup_state["last_error"] = None
+        except Exception as exc:
+            with _cleanup_state_lock:
+                _cleanup_state["runs_total"] += 1
+                _cleanup_state["errors_total"] += 1
+                _cleanup_state["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _cleanup_state["last_error"] = str(exc)
+            logger.error(f"Cleanup cycle failed: {str(exc)}")
+            logger.error(traceback.format_exc())
+        _cleanup_stop_event.wait(_cleanup_state["interval_seconds"])
+
+
+def _start_cleanup_scheduler_if_enabled() -> None:
+    global _cleanup_thread
+    enabled = os.getenv("CLEANUP_SCHEDULER_ENABLED", "true").strip().lower() == "true"
+    with _cleanup_state_lock:
+        _cleanup_state["enabled"] = enabled
+    if not enabled:
+        return
+    if not store:
+        return
+    if _cleanup_thread and _cleanup_thread.is_alive():
+        return
+    _cleanup_thread = threading.Thread(target=_cleanup_loop, name="cleanup-scheduler", daemon=True)
+    _cleanup_thread.start()
+    with _cleanup_state_lock:
+        _cleanup_state["running"] = True
+
+
+def _record_audit(
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    payload: Optional[Dict] = None,
+    extra: Optional[Dict] = None,
+) -> None:
+    if not store:
+        return
+    actor_id = _request_actor_id(payload)
+    metadata = {
+        "method": request.method,
+        "path": request.path,
+        "remote_addr": request.remote_addr,
+    }
+    if extra:
+        metadata.update(extra)
+    try:
+        store.record_audit_event(
+            actor_id=actor_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception("Failed to record audit event")
+
+
+def _compute_observability_snapshot(days: int) -> Dict:
+    if not store:
+        raise ValueError("Store unavailable")
+    days = max(1, min(365, int(days)))
+    rec_rows = store.list_runs(limit=2000, offset=0)
+    duration_samples = []
+    cutoff = datetime.now() - timedelta(days=days)
+    rec_count_window = 0
+    for run in rec_rows:
+        created_at = datetime.strptime(run["created_at"], "%Y-%m-%d %H:%M:%S")
+        if created_at < cutoff:
+            continue
+        rec_count_window += 1
+        duration = run.get("summary", {}).get("duration_ms")
+        if isinstance(duration, (int, float)):
+            duration_samples.append(float(duration))
+    duration_samples.sort()
+    p95_idx = int(0.95 * (len(duration_samples) - 1)) if duration_samples else 0
+    p95_ms = duration_samples[p95_idx] if duration_samples else None
+    avg_ms = (sum(duration_samples) / len(duration_samples)) if duration_samples else None
+
+    event_rows = store.list_events(limit=5000, offset=0, days=days)
+    events_total = len(event_rows)
+    events_by_type = {"impression": 0, "click": 0, "conversion": 0}
+    for event in event_rows:
+        if event["event_type"] in events_by_type:
+            events_by_type[event["event_type"]] += 1
+
+    connectors = store.list_connectors()
+    connector_run_total = 0
+    connector_failures = 0
+    for connector in connectors:
+        runs = store.list_connector_runs(connector["connector_id"], limit=100)
+        for run in runs:
+            started = run.get("started_at")
+            if not started:
+                continue
+            started_at = datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+            if started_at < cutoff:
+                continue
+            connector_run_total += 1
+            if run["status"] == "failed":
+                connector_failures += 1
+
+    ctr = round((events_by_type["click"] / events_by_type["impression"]), 4) if events_by_type["impression"] else 0.0
+    connector_failure_rate = round((connector_failures / connector_run_total), 4) if connector_run_total else 0.0
+    thresholds = store.get_alert_thresholds()
+
+    return {
+        "api_version": "v1",
+        "window_days": days,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "recommendation_api": {
+            "runs": rec_count_window,
+            "avg_duration_ms": round(avg_ms, 2) if avg_ms is not None else None,
+            "p95_duration_ms": round(p95_ms, 2) if p95_ms is not None else None,
+        },
+        "events": {
+            "total": events_total,
+            "impressions": events_by_type["impression"],
+            "clicks": events_by_type["click"],
+            "conversions": events_by_type["conversion"],
+            "ctr": ctr,
+        },
+        "connectors": {
+            "total_connectors": len(connectors),
+            "runs": connector_run_total,
+            "failed_runs": connector_failures,
+            "failure_rate": connector_failure_rate,
+        },
+        "slo_targets": thresholds,
+    }
+
+
+def _build_sli_checks(snapshot: Dict) -> list:
+    thresholds = snapshot.get("slo_targets", {})
+    p95 = snapshot.get("recommendation_api", {}).get("p95_duration_ms")
+    failure_rate = snapshot.get("connectors", {}).get("failure_rate", 0.0)
+    ctr = snapshot.get("events", {}).get("ctr", 0.0)
+    return [
+        {
+            "metric": "recommendation_p95_ms",
+            "value": p95,
+            "target_max": float(thresholds.get("recommendation_p95_ms", 500.0)),
+            "status": "pass" if (p95 is not None and p95 <= float(thresholds.get("recommendation_p95_ms", 500.0))) else "warn",
+        },
+        {
+            "metric": "connector_failure_rate",
+            "value": failure_rate,
+            "target_max": float(thresholds.get("connector_failure_rate", 0.05)),
+            "status": "pass" if failure_rate <= float(thresholds.get("connector_failure_rate", 0.05)) else "warn",
+        },
+        {
+            "metric": "ctr",
+            "value": ctr,
+            "target_min": float(thresholds.get("min_ctr", 0.01)),
+            "status": "pass" if ctr >= float(thresholds.get("min_ctr", 0.01)) else "warn",
+        },
+    ]
+
+
+def _sync_alert_incidents_from_checks(checks: list, actor_id: str = "system") -> Dict:
+    if not store:
+        return {"opened_or_updated": 0, "resolved": 0}
+    opened_or_updated = 0
+    resolved = 0
+    for check in checks:
+        metric = check.get("metric")
+        value = check.get("value")
+        threshold_value = check.get("target_max", check.get("target_min"))
+        if check.get("status") == "warn":
+            store.upsert_alert_incident(
+                metric=metric,
+                current_value=float(value) if value is not None else None,
+                threshold_value=float(threshold_value) if threshold_value is not None else None,
+                details={"check": check},
+            )
+            opened_or_updated += 1
+        else:
+            resolved += store.resolve_open_alert_incidents(
+                metric=metric,
+                resolved_by=actor_id,
+                note="SLI back within threshold",
+            )
+    return {"opened_or_updated": opened_or_updated, "resolved": resolved}
+
+
+def _apply_scenario_rules(
+    recommendations: list,
+    scenario: Optional[Dict],
+    include_decisions: bool = False,
+) -> Tuple[list, Dict]:
+    if not scenario:
+        trace = {"applied": False, "scenario_id": None, "filtered_out": 0, "reasons": {}}
+        if include_decisions:
+            trace["decisions"] = []
+        return recommendations, trace
+
+    rule_set = scenario.get("rule_set") or {}
+    include_sources = set(_normalize_string_list(rule_set.get("include_sources")))
+    exclude_sources = set(_normalize_string_list(rule_set.get("exclude_sources")))
+    include_sections = set(value.lower() for value in _normalize_string_list(rule_set.get("include_sections")))
+    exclude_sections = set(value.lower() for value in _normalize_string_list(rule_set.get("exclude_sections")))
+    include_keywords = [value.lower() for value in _normalize_string_list(rule_set.get("include_keywords"))]
+    exclude_keywords = [value.lower() for value in _normalize_string_list(rule_set.get("exclude_keywords"))]
+    exclude_article_ids = set(_normalize_string_list(rule_set.get("exclude_article_ids")))
+    source_boosts = {key: float(value) for key, value in (rule_set.get("source_boosts") or {}).items()}
+    max_age_days = rule_set.get("max_age_days")
+    min_score = rule_set.get("min_score")
+    if max_age_days is not None:
+        max_age_days = max(0, int(max_age_days))
+    if min_score is not None:
+        min_score = float(min_score)
+
+    kept = []
+    filtered = 0
+    reasons: Dict[str, int] = {}
+    decisions = []
+
+    for rec in recommendations:
+        article_id = rec.get("article_id")
+        article_meta = recommender.article_vectors.get(article_id, {}).get("metadata", {})
+        source = rec.get("source", "unknown")
+        title = str(article_meta.get("title", rec.get("title", ""))).lower()
+        content = str(article_meta.get("content", rec.get("content", ""))).lower()
+        url = str(article_meta.get("url", rec.get("url", "")))
+        sections = _extract_sections(article_meta, url)
+        scraped_at = str(article_meta.get("scraped_at", ""))
+        age_days = _safe_article_age_days(scraped_at)
+
+        deny_reason = None
+        if include_sources and source not in include_sources:
+            deny_reason = "source_not_included"
+        elif source in exclude_sources:
+            deny_reason = "source_excluded"
+        elif include_sections and not any(section in include_sections for section in sections):
+            deny_reason = "section_not_included"
+        elif exclude_sections and any(section in exclude_sections for section in sections):
+            deny_reason = "section_excluded"
+        elif exclude_article_ids and article_id in exclude_article_ids:
+            deny_reason = "article_excluded"
+        elif include_keywords and not any(keyword in f"{title} {content}" for keyword in include_keywords):
+            deny_reason = "keyword_not_included"
+        elif exclude_keywords and any(keyword in f"{title} {content}" for keyword in exclude_keywords):
+            deny_reason = "keyword_excluded"
+        elif max_age_days is not None and age_days is not None and age_days > max_age_days:
+            deny_reason = "too_old"
+        elif min_score is not None and float(rec.get("score", 0.0)) < min_score:
+            deny_reason = "below_min_score"
+
+        if deny_reason:
+            filtered += 1
+            reasons[deny_reason] = reasons.get(deny_reason, 0) + 1
+            if include_decisions:
+                decisions.append(
+                    {
+                        "article_id": article_id,
+                        "source": source,
+                        "status": "filtered",
+                        "reason": deny_reason,
+                        "score_before": round(float(rec.get("score", 0.0)), 4),
+                    }
+                )
+            continue
+
+        boost = float(source_boosts.get(source, 1.0))
+        updated = dict(rec)
+        original_score = float(updated.get("score", 0.0))
+        boosted_score = original_score * boost
+        updated["score_before_scenario"] = round(original_score, 4)
+        updated["score"] = round(boosted_score, 4)
+        updated["scenario_boost"] = round(boost, 4)
+        updated["scenario_id"] = scenario["scenario_id"]
+        kept.append(updated)
+        if include_decisions:
+            decisions.append(
+                {
+                    "article_id": article_id,
+                    "source": source,
+                    "status": "kept",
+                    "reason": "passed",
+                    "score_before": round(original_score, 4),
+                    "score_after": round(boosted_score, 4),
+                    "boost": round(boost, 4),
+                }
+            )
+
+    kept.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return kept, {
+        "applied": True,
+        "scenario_id": scenario["scenario_id"],
+        "scenario_name": scenario.get("name"),
+        "filtered_out": filtered,
+        "remaining": len(kept),
+        "reasons": reasons,
+        "decisions": decisions if include_decisions else None,
+    }
 
 
 def _load_sources_with_settings() -> Tuple[list, Dict[str, Dict]]:
@@ -296,6 +868,21 @@ def before_request():
     if request.endpoint != "static":
         _maybe_reload_recommender_if_changed()
 
+    auth_error = _enforce_api_key_if_enabled()
+    if auth_error:
+        body, status = auth_error
+        return jsonify(body), status
+
+    signature_error = _enforce_hmac_signature_if_enabled()
+    if signature_error:
+        body, status = signature_error
+        return jsonify(body), status
+
+    rate_error = _enforce_rate_limit_if_enabled()
+    if rate_error:
+        body, status = rate_error
+        return jsonify(body), status
+
     if request.is_json:
         try:
             request.get_json(silent=False)
@@ -404,6 +991,13 @@ def update_source_setting(source):
         if default_weight <= 0:
             return jsonify({"error": "default_weight must be greater than 0"}), 400
         store.set_source_setting(source, enabled=enabled, default_weight=default_weight)
+        _record_audit(
+            action="update",
+            resource_type="source_setting",
+            resource_id=source,
+            payload=payload,
+            extra={"enabled": enabled, "default_weight": default_weight},
+        )
         return jsonify({"source": source, "enabled": enabled, "default_weight": default_weight})
     except Exception as e:
         logger.error(f"Error updating source setting: {str(e)}")
@@ -444,6 +1038,13 @@ def connectors():
             config=config,
             enabled=enabled,
         )
+        _record_audit(
+            action="create",
+            resource_type="connector",
+            resource_id=connector.get("connector_id", ""),
+            payload=payload,
+            extra={"name": name, "connector_type": connector_type},
+        )
         return jsonify(connector), 201
     except Exception as e:
         logger.error(f"Error creating connector: {str(e)}")
@@ -460,6 +1061,12 @@ def connector_detail(connector_id):
         deleted = store.delete_connector(connector_id)
         if not deleted:
             return jsonify({"error": "Connector not found"}), 404
+        _record_audit(
+            action="delete",
+            resource_type="connector",
+            resource_id=connector_id,
+            extra={},
+        )
         return jsonify({"deleted": True, "connector_id": connector_id})
 
     try:
@@ -482,6 +1089,13 @@ def connector_detail(connector_id):
             connector_type=effective_type,
             config=effective_config,
             enabled=payload.get("enabled"),
+        )
+        _record_audit(
+            action="update",
+            resource_type="connector",
+            resource_id=connector_id,
+            payload=payload,
+            extra={"connector_type": effective_type},
         )
         return jsonify(connector)
     except Exception as e:
@@ -742,6 +1356,7 @@ def _enqueue_due_connector_syncs(trigger_label: str = "scheduled") -> Dict:
 
 
 _start_connector_scheduler_if_enabled()
+_start_cleanup_scheduler_if_enabled()
 
 
 @app.route("/api/ranking-configs", methods=["GET", "POST"])
@@ -780,6 +1395,13 @@ def ranking_configs():
         recommender._resolve_config(config_id=config_id, ranking_config=config_payload)
 
         version = store.create_or_update_config(config_id, config_payload, is_system=False)
+        _record_audit(
+            action="create",
+            resource_type="ranking_config",
+            resource_id=config_id,
+            payload=payload,
+            extra={"version": version},
+        )
         return jsonify({"config_id": config_id, "version": version}), 201
     except Exception as e:
         logger.error(f"Error creating ranking config: {str(e)}")
@@ -796,6 +1418,12 @@ def ranking_config_detail(config_id):
         deleted = store.delete_config(config_id)
         if not deleted:
             return jsonify({"error": "Config not found or is system config"}), 400
+        _record_audit(
+            action="delete",
+            resource_type="ranking_config",
+            resource_id=config_id,
+            extra={},
+        )
         return jsonify({"deleted": True, "config_id": config_id})
 
     # PUT: create new version
@@ -810,9 +1438,107 @@ def ranking_config_detail(config_id):
         recommender._resolve_config(config_id=config_id, ranking_config=config_payload)
 
         version = store.create_or_update_config(config_id, config_payload, is_system=False)
+        _record_audit(
+            action="update",
+            resource_type="ranking_config",
+            resource_id=config_id,
+            payload=payload,
+            extra={"version": version},
+        )
         return jsonify({"config_id": config_id, "version": version})
     except Exception as e:
         logger.error(f"Error updating ranking config: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/scenarios", methods=["GET", "POST"])
+def scenarios():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+
+    if request.method == "GET":
+        include_disabled = request.args.get("include_disabled", "true").lower() == "true"
+        scenario_items = store.list_scenarios(include_disabled=include_disabled)
+        return jsonify({"scenarios": scenario_items, "count": len(scenario_items)})
+
+    try:
+        payload = request.get_json() or {}
+        scenario_id = str(payload.get("scenario_id", "")).strip()
+        name = str(payload.get("name", "")).strip()
+        if not scenario_id:
+            return jsonify({"error": "scenario_id is required"}), 400
+        if not name:
+            return jsonify({"error": "name is required"}), 400
+        rule_set = _validate_scenario_rule_set(payload.get("rule_set") or {})
+        scenario = store.upsert_scenario(
+            scenario_id=scenario_id,
+            name=name,
+            description=str(payload.get("description", "")).strip(),
+            enabled=bool(payload.get("enabled", True)),
+            rule_set=rule_set,
+            metadata=payload.get("metadata") or {},
+        )
+        _record_audit(
+            action="create",
+            resource_type="scenario",
+            resource_id=scenario_id,
+            payload=payload,
+            extra={"enabled": bool(payload.get("enabled", True))},
+        )
+        return jsonify(scenario), 201
+    except Exception as e:
+        logger.error(f"Error creating scenario: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/scenarios/<scenario_id>", methods=["GET", "PUT", "DELETE"])
+def scenario_detail(scenario_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+
+    if request.method == "GET":
+        scenario = store.get_scenario(scenario_id)
+        if not scenario:
+            return jsonify({"error": "Scenario not found"}), 404
+        return jsonify(scenario)
+
+    if request.method == "DELETE":
+        deleted = store.delete_scenario(scenario_id)
+        if not deleted:
+            return jsonify({"error": "Scenario not found"}), 404
+        _record_audit(
+            action="delete",
+            resource_type="scenario",
+            resource_id=scenario_id,
+            extra={},
+        )
+        return jsonify({"deleted": True, "scenario_id": scenario_id})
+
+    try:
+        current = store.get_scenario(scenario_id)
+        if not current:
+            return jsonify({"error": "Scenario not found"}), 404
+        payload = request.get_json() or {}
+        scenario = store.upsert_scenario(
+            scenario_id=scenario_id,
+            name=str(payload.get("name", current["name"])).strip(),
+            description=str(payload.get("description", current.get("description", ""))).strip(),
+            enabled=bool(payload.get("enabled", current.get("enabled", True))),
+            rule_set=_validate_scenario_rule_set(payload.get("rule_set") or current.get("rule_set") or {}),
+            metadata=payload.get("metadata") if "metadata" in payload else current.get("metadata", {}),
+        )
+        _record_audit(
+            action="update",
+            resource_type="scenario",
+            resource_id=scenario_id,
+            payload=payload,
+            extra={"enabled": scenario.get("enabled")},
+        )
+        return jsonify(scenario)
+    except Exception as e:
+        logger.error(f"Error updating scenario: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
 
@@ -823,23 +1549,49 @@ def query_recommendations():
         return jsonify({"error": "Recommender not initialized"}), 500
 
     try:
+        started_at = datetime.now()
         payload = request.get_json() or {}
         user_id = payload.get("user_id", "demo_user")
-        user_reads = payload.get("user_reads") or recommender.user_profiles.get(user_id, [])
+        external_user_id = str(payload.get("external_user_id", "")).strip() or None
+        effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
+        user_reads = payload.get("user_reads") or recommender.user_profiles.get(effective_user_id, [])
+        if not user_reads:
+            user_reads = recommender.user_profiles.get(user_id, [])
         top_n = int(payload.get("top_n", 5))
         requested_sources = payload.get("sources") or []
         config_id = payload.get("config_id", "balanced")
         ranking_config = payload.get("ranking_config")
+        scenario_id = (payload.get("scenario_id") or "").strip() or None
+        scenario_ids = payload.get("scenario_ids") or []
+        if scenario_ids and not scenario_id:
+            scenario_id = str(scenario_ids[0]).strip() or None
+        scenario = None
+        if scenario_id:
+            scenario = store.get_scenario(scenario_id)
+            if not scenario:
+                return jsonify({"error": f"Scenario not found: {scenario_id}"}), 404
+            if not scenario.get("enabled", True):
+                return jsonify({"error": f"Scenario is disabled: {scenario_id}"}), 400
+            scenario_rule_set = scenario.get("rule_set") or {}
+            if not requested_sources and scenario_rule_set.get("include_sources"):
+                requested_sources = scenario_rule_set.get("include_sources") or []
+            if not ranking_config and scenario_rule_set.get("ranking_config_id"):
+                config_id = scenario_rule_set.get("ranking_config_id")
+
         decision_context = _build_decision_context(requested_sources, config_id, ranking_config)
         effective_config_id = decision_context["effective_config_id"]
         config_version = decision_context["config_version"]
         selected_sources = decision_context["selected_sources"]
         source_defaults = decision_context["source_defaults_applied"]
         effective_ranking_config = decision_context["effective_ranking_config"]
+        if scenario:
+            excluded_sources = set(_normalize_string_list(scenario.get("rule_set", {}).get("exclude_sources")))
+            if excluded_sources:
+                selected_sources = [source for source in selected_sources if source not in excluded_sources]
 
         if selected_sources:
             recs = recommender.recommend_for_user(
-                user_id,
+                effective_user_id,
                 recommender.article_vectors,
                 user_reads,
                 top_n=top_n,
@@ -849,32 +1601,59 @@ def query_recommendations():
             )
         else:
             recs = []
+        recs, scenario_trace = _apply_scenario_rules(recs, scenario)
+        recs = recs[: max(1, top_n)]
 
         run_id = store.persist_recommendation_run(
-            user_id=user_id,
+            user_id=effective_user_id,
             config_id=effective_config_id,
             config_version=config_version,
             request_payload={
                 "user_id": user_id,
+                "effective_user_id": effective_user_id,
+                "external_user_id": external_user_id,
                 "user_reads": user_reads,
                 "top_n": top_n,
                 "sources": selected_sources,
                 "config_id": effective_config_id,
                 "effective_ranking_config": effective_ranking_config,
+                "scenario_id": scenario_id,
             },
             recommendations=recs,
+            request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
         )
+        track_impressions = bool(payload.get("track_impressions", True))
+        if track_impressions and recs:
+            store.record_events(
+                [
+                    {
+                        "event_type": "impression",
+                        "run_id": run_id,
+                        "article_id": rec.get("article_id"),
+                        "scenario_id": scenario_id,
+                        "user_id": effective_user_id,
+                        "external_user_id": external_user_id,
+                        "rank_position": idx,
+                        "metadata": {"score": rec.get("score"), "source": rec.get("source")},
+                    }
+                    for idx, rec in enumerate(recs, start=1)
+                ]
+            )
 
         return jsonify(
             {
                 "run_id": run_id,
                 "user_id": user_id,
+                "effective_user_id": effective_user_id,
+                "external_user_id": external_user_id,
                 "top_n": top_n,
                 "sources": selected_sources,
                 "config_id": effective_config_id,
                 "config_version": config_version,
                 "source_defaults_applied": source_defaults,
                 "effective_ranking_config": effective_ranking_config,
+                "scenario_id": scenario_id,
+                "scenario_trace": scenario_trace,
                 "recommendations": recs,
             }
         )
@@ -890,9 +1669,21 @@ def list_recommendation_runs():
         return jsonify({"error": "Store unavailable"}), 500
 
     try:
-        limit = int(request.args.get("limit", 20))
-        runs = store.list_runs(limit=limit)
-        return jsonify({"runs": runs, "count": len(runs)})
+        limit = max(1, min(200, int(request.args.get("limit", 20))))
+        offset = max(0, int(request.args.get("offset", 0)))
+        rows = store.list_runs(limit=limit + 1, offset=offset)
+        has_more = len(rows) > limit
+        runs = rows[:limit]
+        return jsonify(
+            {
+                "runs": runs,
+                "count": len(runs),
+                "limit": limit,
+                "offset": offset,
+                "has_more": has_more,
+                "next_offset": (offset + limit) if has_more else None,
+            }
+        )
     except Exception as e:
         logger.error(f"Error listing runs: {str(e)}")
         logger.error(traceback.format_exc())
@@ -908,6 +1699,176 @@ def get_recommendation_run(run_id):
     if not run:
         return jsonify({"error": "Run not found"}), 404
     return jsonify(run)
+
+
+@app.route("/api/recommendations/cms", methods=["POST"])
+@app.route("/api/v1/recommendations/cms", methods=["POST"])
+def recommendations_cms():
+    """CMS-oriented recommendation endpoint with external ID + compact response payload."""
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+
+    try:
+        started_at = datetime.now()
+        payload = request.get_json() or {}
+        idempotency_key = _read_idempotency_key(payload)
+        if idempotency_key:
+            cached = store.get_idempotency_record("recommendations_cms", idempotency_key)
+            if cached:
+                response = jsonify(cached["response"])
+                response.headers["X-Idempotent-Replay"] = "true"
+                return response, int(cached["status_code"])
+        data = payload.get("request") if isinstance(payload.get("request"), dict) else payload
+        user_id = str(data.get("user_id", "anonymous")).strip() or "anonymous"
+        external_user_id = str(data.get("external_user_id", "")).strip() or None
+        effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
+        top_n = max(1, min(20, int(data.get("limit", data.get("top_n", 5)))))
+        user_reads = data.get("user_reads") or recommender.user_profiles.get(effective_user_id, [])
+        if not user_reads:
+            user_reads = recommender.user_profiles.get(user_id, [])
+        requested_sources = data.get("sources") or []
+        config_id = str(data.get("config_id", "balanced")).strip() or "balanced"
+        scenario_id = str(data.get("scenario_id", "")).strip() or None
+        scenario = store.get_scenario(scenario_id) if scenario_id else None
+        if scenario and scenario.get("rule_set", {}).get("include_sources") and not requested_sources:
+            requested_sources = scenario["rule_set"]["include_sources"]
+        if scenario and scenario.get("rule_set", {}).get("ranking_config_id"):
+            config_id = scenario["rule_set"]["ranking_config_id"]
+
+        decision_context = _build_decision_context(requested_sources, config_id, None)
+        selected_sources = decision_context["selected_sources"]
+        effective_ranking_config = decision_context["effective_ranking_config"]
+        recs = recommender.recommend_for_user(
+            effective_user_id,
+            recommender.article_vectors,
+            user_reads,
+            top_n=top_n,
+            sources=selected_sources,
+            config_id=decision_context["effective_config_id"],
+            ranking_config=effective_ranking_config,
+        ) if selected_sources else []
+        recs, scenario_trace = _apply_scenario_rules(recs, scenario)
+        recs = recs[:top_n]
+
+        run_id = store.persist_recommendation_run(
+            user_id=effective_user_id,
+            config_id=decision_context["effective_config_id"],
+            config_version=decision_context["config_version"],
+            request_payload={
+                "user_id": user_id,
+                "external_user_id": external_user_id,
+                "effective_user_id": effective_user_id,
+                "scenario_id": scenario_id,
+                "sources": selected_sources,
+                "top_n": top_n,
+                "api_surface": "cms",
+            },
+            recommendations=recs,
+            request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
+        )
+
+        store.record_events(
+            [
+                {
+                    "event_type": "impression",
+                    "run_id": run_id,
+                    "article_id": rec.get("article_id"),
+                    "scenario_id": scenario_id,
+                    "user_id": effective_user_id,
+                    "external_user_id": external_user_id,
+                    "rank_position": idx,
+                    "metadata": {"surface": "cms", "placement": data.get("placement")},
+                }
+                for idx, rec in enumerate(recs, start=1)
+            ]
+        )
+
+        response_payload = {
+            "api_version": "v1",
+            "request_id": run_id,
+            "user": {
+                "user_id": user_id,
+                "external_user_id": external_user_id,
+                "effective_user_id": effective_user_id,
+            },
+            "placement": data.get("placement"),
+            "scenario_id": scenario_id,
+            "config_id": decision_context["effective_config_id"],
+            "config_version": decision_context["config_version"],
+            "items": [
+                {
+                    "rank": idx,
+                    "article_id": rec.get("article_id"),
+                    "title": rec.get("title"),
+                    "url": rec.get("url"),
+                    "source": rec.get("source"),
+                    "score": rec.get("score"),
+                    "explanation": rec.get("explanation"),
+                    "feature_contributions": rec.get("feature_contributions"),
+                }
+                for idx, rec in enumerate(recs, start=1)
+            ],
+            "trace": {
+                "selected_sources": selected_sources,
+                "source_defaults_applied": decision_context["source_defaults_applied"],
+                "scenario_trace": scenario_trace,
+            },
+        }
+        if idempotency_key:
+            store.save_idempotency_record(
+                endpoint="recommendations_cms",
+                key=idempotency_key,
+                status_code=200,
+                response_payload=response_payload,
+            )
+        return jsonify(response_payload)
+    except Exception as e:
+        logger.error(f"Error in CMS recommendations endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/scenarios/<scenario_id>/simulate", methods=["POST"])
+def simulate_scenario(scenario_id):
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    scenario = store.get_scenario(scenario_id)
+    if not scenario:
+        return jsonify({"error": "Scenario not found"}), 404
+    try:
+        payload = request.get_json() or {}
+        user_id = str(payload.get("user_id", "demo_user"))
+        top_n = max(1, min(50, int(payload.get("top_n", 10))))
+        requested_sources = payload.get("sources") or scenario.get("rule_set", {}).get("include_sources") or []
+        config_id = scenario.get("rule_set", {}).get("ranking_config_id") or payload.get("config_id", "balanced")
+        user_reads = payload.get("user_reads") or recommender.user_profiles.get(user_id, [])
+
+        context = _build_decision_context(requested_sources, config_id, None)
+        base = recommender.recommend_for_user(
+            user_id,
+            recommender.article_vectors,
+            user_reads,
+            top_n=top_n,
+            sources=context["selected_sources"],
+            config_id=context["effective_config_id"],
+            ranking_config=context["effective_ranking_config"],
+        ) if context["selected_sources"] else []
+        reranked, scenario_trace = _apply_scenario_rules(base, scenario, include_decisions=True)
+        return jsonify(
+            {
+                "scenario_id": scenario_id,
+                "base_count": len(base),
+                "scenario_count": len(reranked),
+                "context": context,
+                "scenario_trace": scenario_trace,
+                "base_top": base[: min(5, len(base))],
+                "scenario_top": reranked[: min(5, len(reranked))],
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error simulating scenario: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/metrics/offline")
@@ -974,12 +1935,431 @@ def recommendation_context():
         requested_sources = payload.get("sources") or []
         config_id = payload.get("config_id", "balanced")
         ranking_config = payload.get("ranking_config")
+        scenario_id = (payload.get("scenario_id") or "").strip() or None
+        scenario = store.get_scenario(scenario_id) if scenario_id else None
+        if scenario and scenario.get("rule_set", {}).get("include_sources") and not requested_sources:
+            requested_sources = scenario["rule_set"]["include_sources"]
+        if scenario and scenario.get("rule_set", {}).get("ranking_config_id") and not ranking_config:
+            config_id = scenario["rule_set"]["ranking_config_id"]
         context = _build_decision_context(requested_sources, config_id, ranking_config)
+        context["scenario_id"] = scenario_id
+        context["scenario"] = scenario
+        if scenario:
+            context["scenario_rule_set"] = scenario.get("rule_set", {})
         return jsonify(context)
     except Exception as e:
         logger.error(f"Error building recommendation context: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/events", methods=["GET", "POST"])
+@app.route("/api/v1/events", methods=["GET", "POST"])
+def recommendation_events():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+
+    if request.method == "GET":
+        try:
+            limit = max(1, min(1000, int(request.args.get("limit", 100))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            scenario_id = request.args.get("scenario_id")
+            event_type = request.args.get("event_type")
+            days = int(request.args.get("days")) if request.args.get("days") else None
+            rows = store.list_events(
+                limit=limit + 1,
+                offset=offset,
+                scenario_id=scenario_id,
+                event_type=event_type,
+                days=days,
+            )
+            has_more = len(rows) > limit
+            events = rows[:limit]
+            return jsonify(
+                {
+                    "api_version": "v1",
+                    "events": events,
+                    "count": len(events),
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": has_more,
+                    "next_offset": (offset + limit) if has_more else None,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error listing events: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({"error": str(e)}), 500
+
+    try:
+        payload = request.get_json() or {}
+        idempotency_key = _read_idempotency_key(payload)
+        if idempotency_key:
+            cached = store.get_idempotency_record("events_ingest", idempotency_key)
+            if cached:
+                response = jsonify(cached["response"])
+                response.headers["X-Idempotent-Replay"] = "true"
+                return response, int(cached["status_code"])
+        raw_events = payload.get("events")
+        if raw_events is None:
+            raw_events = [payload]
+
+        validated = []
+        for event in raw_events:
+            event_type = str(event.get("event_type", "")).strip()
+            if event_type not in {"impression", "click", "conversion"}:
+                raise ValueError("event_type must be one of: impression, click, conversion")
+            user_id = str(event.get("user_id", "anonymous")).strip() or "anonymous"
+            external_user_id = str(event.get("external_user_id", "")).strip() or None
+            effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
+            validated.append(
+                {
+                    "event_type": event_type,
+                    "run_id": event.get("run_id"),
+                    "article_id": event.get("article_id"),
+                    "scenario_id": event.get("scenario_id"),
+                    "user_id": effective_user_id,
+                    "external_user_id": external_user_id,
+                    "rank_position": event.get("rank_position"),
+                    "event_value": float(event.get("event_value", 1.0)),
+                    "metadata": event.get("metadata") or {},
+                }
+            )
+
+        inserted = store.record_events(validated)
+        response_payload = {"api_version": "v1", "inserted": inserted}
+        if idempotency_key:
+            store.save_idempotency_record(
+                endpoint="events_ingest",
+                key=idempotency_key,
+                status_code=201,
+                response_payload=response_payload,
+            )
+        return jsonify(response_payload), 201
+    except Exception as e:
+        logger.error(f"Error recording events: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/metrics/scenarios", methods=["GET"])
+def scenario_metrics():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = int(request.args.get("days", 30))
+        top_articles = int(request.args.get("top_articles", 5))
+        metrics = store.compute_scenario_metrics(days=days, top_articles=top_articles)
+        return jsonify(metrics)
+    except Exception as e:
+        logger.error(f"Error computing scenario metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/scenarios/<scenario_id>/sources", methods=["GET"])
+def scenario_source_metrics(scenario_id):
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        days = int(request.args.get("days", 30))
+        limit = int(request.args.get("limit", 2000))
+        events = store.list_events(limit=limit, scenario_id=scenario_id, days=days)
+        by_source: Dict[str, Dict] = {}
+        for event in events:
+            article_id = event.get("article_id")
+            source = "unknown"
+            if article_id in recommender.article_vectors:
+                url = recommender.article_vectors[article_id].get("metadata", {}).get("url", "")
+                source = recommender.extract_source(url)
+            bucket = by_source.setdefault(source, {"source": source, "impressions": 0, "clicks": 0, "conversions": 0})
+            if event["event_type"] == "impression":
+                bucket["impressions"] += 1
+            elif event["event_type"] == "click":
+                bucket["clicks"] += 1
+            elif event["event_type"] == "conversion":
+                bucket["conversions"] += 1
+        items = []
+        for row in by_source.values():
+            impressions = row["impressions"]
+            clicks = row["clicks"]
+            row["ctr"] = round((clicks / impressions), 4) if impressions else 0.0
+            row["conversion_rate"] = round((row["conversions"] / clicks), 4) if clicks else 0.0
+            items.append(row)
+        items.sort(key=lambda x: (x["impressions"], x["clicks"]), reverse=True)
+        return jsonify({"scenario_id": scenario_id, "window_days": days, "sources": items})
+    except Exception as e:
+        logger.error(f"Error computing scenario source metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/observability/overview", methods=["GET"])
+@app.route("/api/v1/observability/overview", methods=["GET"])
+def observability_overview():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = int(request.args.get("days", 7))
+        return jsonify(_compute_observability_snapshot(days))
+    except Exception as e:
+        logger.error(f"Error building observability overview: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/observability/sli", methods=["GET"])
+@app.route("/api/v1/observability/sli", methods=["GET"])
+def observability_sli():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = int(request.args.get("days", 7))
+        snapshot = _compute_observability_snapshot(days)
+        thresholds = snapshot.get("slo_targets", {})
+        checks = _build_sli_checks(snapshot)
+        persist = request.args.get("persist_incidents", "false").lower() == "true"
+        incident_sync = None
+        if persist:
+            incident_sync = _sync_alert_incidents_from_checks(checks, actor_id=_request_actor_id())
+        overall_status = "pass" if all(check["status"] == "pass" for check in checks) else "warn"
+        return jsonify(
+            {
+                "api_version": "v1",
+                "generated_at": snapshot.get("generated_at"),
+                "window_days": snapshot.get("window_days"),
+                "overall_status": overall_status,
+                "checks": checks,
+                "thresholds": thresholds,
+                "incident_sync": incident_sync,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error building observability SLI: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/alerts/incidents", methods=["GET"])
+@app.route("/api/v1/alerts/incidents", methods=["GET"])
+def alert_incidents():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        limit = max(1, min(500, int(request.args.get("limit", 100))))
+        offset = max(0, int(request.args.get("offset", 0)))
+        status = request.args.get("status")
+        metric = request.args.get("metric")
+        rows = store.list_alert_incidents(limit=limit + 1, offset=offset, status=status, metric=metric)
+        has_more = len(rows) > limit
+        incidents = rows[:limit]
+        return jsonify(
+            {
+                "api_version": "v1",
+                "incidents": incidents,
+                "count": len(incidents),
+                "limit": limit,
+                "offset": offset,
+                "has_more": has_more,
+                "next_offset": (offset + limit) if has_more else None,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error listing alert incidents: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/alerts/incidents/evaluate", methods=["POST"])
+@app.route("/api/v1/alerts/incidents/evaluate", methods=["POST"])
+def evaluate_alert_incidents():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json() or {}
+        days = int(payload.get("days", 7))
+        snapshot = _compute_observability_snapshot(days)
+        checks = _build_sli_checks(snapshot)
+        result = _sync_alert_incidents_from_checks(checks, actor_id=_request_actor_id(payload))
+        _record_audit(
+            action="evaluate",
+            resource_type="alert_incidents",
+            resource_id="global",
+            payload=payload,
+            extra=result,
+        )
+        return jsonify({"api_version": "v1", "window_days": days, "checks": checks, "incident_sync": result})
+    except Exception as e:
+        logger.error(f"Error evaluating alert incidents: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/alerts/incidents/<incident_id>/resolve", methods=["PUT"])
+@app.route("/api/v1/alerts/incidents/<incident_id>/resolve", methods=["PUT"])
+def resolve_alert_incident(incident_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json() or {}
+        actor_id = _request_actor_id(payload)
+        note = str(payload.get("note", "")).strip()
+        resolved = store.resolve_alert_incident(incident_id=incident_id, resolved_by=actor_id, note=note)
+        if not resolved:
+            return jsonify({"error": "Incident not found or already resolved"}), 404
+        _record_audit(
+            action="resolve",
+            resource_type="alert_incident",
+            resource_id=incident_id,
+            payload=payload,
+            extra={"resolved_by": actor_id},
+        )
+        return jsonify({"api_version": "v1", "resolved": True, "incident_id": incident_id})
+    except Exception as e:
+        logger.error(f"Error resolving alert incident: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/alerts/thresholds", methods=["GET", "PUT"])
+@app.route("/api/v1/alerts/thresholds", methods=["GET", "PUT"])
+def alerts_thresholds():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    if request.method == "GET":
+        try:
+            thresholds = store.get_alert_thresholds()
+            return jsonify({"api_version": "v1", "thresholds": thresholds})
+        except Exception as e:
+            logger.error(f"Error reading alert thresholds: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({"error": str(e)}), 500
+
+    try:
+        payload = request.get_json() or {}
+        threshold_values = payload.get("thresholds", payload)
+        validated = {
+            "recommendation_p95_ms": float(threshold_values.get("recommendation_p95_ms")),
+            "connector_failure_rate": float(threshold_values.get("connector_failure_rate")),
+            "min_ctr": float(threshold_values.get("min_ctr")),
+        }
+        if validated["recommendation_p95_ms"] <= 0:
+            return jsonify({"error": "recommendation_p95_ms must be > 0"}), 400
+        if not (0 <= validated["connector_failure_rate"] <= 1):
+            return jsonify({"error": "connector_failure_rate must be in [0, 1]"}), 400
+        if not (0 <= validated["min_ctr"] <= 1):
+            return jsonify({"error": "min_ctr must be in [0, 1]"}), 400
+
+        stored = store.upsert_alert_thresholds(validated)
+        _record_audit(
+            action="update",
+            resource_type="alert_thresholds",
+            resource_id="global",
+            payload=payload,
+            extra={"thresholds": stored},
+        )
+        return jsonify({"api_version": "v1", "thresholds": stored})
+    except Exception as e:
+        logger.error(f"Error updating alert thresholds: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/audit-logs", methods=["GET"])
+@app.route("/api/v1/audit-logs", methods=["GET"])
+def audit_logs():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        limit = max(1, min(500, int(request.args.get("limit", 100))))
+        offset = max(0, int(request.args.get("offset", 0)))
+        actor_id = request.args.get("actor_id")
+        resource_type = request.args.get("resource_type")
+        rows = store.list_audit_events(
+            limit=limit + 1,
+            offset=offset,
+            actor_id=actor_id,
+            resource_type=resource_type,
+        )
+        has_more = len(rows) > limit
+        events = rows[:limit]
+        return jsonify(
+            {
+                "api_version": "v1",
+                "events": events,
+                "count": len(events),
+                "limit": limit,
+                "offset": offset,
+                "has_more": has_more,
+                "next_offset": (offset + limit) if has_more else None,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error listing audit logs: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/maintenance/cleanup/status", methods=["GET"])
+@app.route("/api/v1/maintenance/cleanup/status", methods=["GET"])
+def cleanup_status():
+    with _cleanup_state_lock:
+        snapshot = dict(_cleanup_state)
+    snapshot["api_version"] = "v1"
+    return jsonify(snapshot)
+
+
+@app.route("/api/maintenance/cleanup/run-now", methods=["POST"])
+@app.route("/api/v1/maintenance/cleanup/run-now", methods=["POST"])
+def cleanup_run_now():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        result = _run_cleanup_cycle()
+        with _cleanup_state_lock:
+            _cleanup_state["runs_total"] += 1
+            _cleanup_state["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _cleanup_state["last_result"] = result
+            _cleanup_state["last_error"] = None
+        _record_audit(
+            action="run",
+            resource_type="maintenance_cleanup",
+            resource_id="manual",
+            extra=result,
+        )
+        return jsonify({"api_version": "v1", "cleanup": result})
+    except Exception as e:
+        with _cleanup_state_lock:
+            _cleanup_state["errors_total"] += 1
+            _cleanup_state["last_error"] = str(e)
+        logger.error(f"Error running cleanup: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/engine/config", methods=["GET"])
+@app.route("/api/v1/engine/config", methods=["GET"])
+def engine_config():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        sources, settings = _load_sources_with_settings()
+        scenarios = store.list_scenarios(include_disabled=True)
+        configs = store.list_latest_configs()
+        return jsonify(
+            {
+                "api_version": "v1",
+                "ranking_configs": configs,
+                "sources": _merge_source_settings(sources, settings),
+                "scenarios": scenarios,
+                "scheduler": dict(_scheduler_state),
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error reading engine config: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/stats")

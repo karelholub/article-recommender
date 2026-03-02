@@ -247,3 +247,48 @@ Backwards-compatible route with added filtering/configuration.
   - `docker-compose.prod.yml` with separate `migrate` service
   - Gunicorn app process (`app:app`) with container healthcheck
   - API health endpoints: `/healthz`, `/readyz`
+
+## 9. Implemented Extension (Scenario Engine + Analytics)
+
+- Scenario/rule configuration API:
+  - `GET/POST /api/scenarios`
+  - `GET/PUT/DELETE /api/scenarios/<scenario_id>`
+- Rule-set capabilities (runtime configurable):
+  - source include/exclude
+  - section/rubric include/exclude
+  - keyword include/exclude
+  - max content age
+  - excluded article IDs
+  - minimum score threshold
+  - source-specific score boosts
+  - optional scenario-level `ranking_config_id` override
+- Recommendation query additions:
+  - `external_user_id` for cross-device identity continuity
+  - `scenario_id` / `scenario_ids` routing into scenario rule engine
+  - automatic impression tracking (configurable by request flag)
+  - response includes `scenario_trace` and effective identity/config context
+- Event + reporting APIs:
+  - `POST /api/events` for impression/click/conversion ingestion
+  - `GET /api/events` for inspection/filtering
+  - `GET /api/metrics/scenarios` for scenario-level KPI reporting
+    - impressions, clicks, conversions
+    - CTR and conversion rate
+    - top recommended/clicked articles per scenario
+- Integration-oriented APIs:
+  - `POST /api/recommendations/cms` for compact CMS-friendly response payloads
+  - `POST /api/scenarios/<scenario_id>/simulate` for explainable rule simulation
+  - `GET /api/metrics/scenarios/<scenario_id>/sources` for source-level KPI drill-down
+  - `GET /api/engine/config` for transparent full runtime config snapshot
+- Contract hardening:
+  - idempotency support for write APIs (`Idempotency-Key` on CMS recommendations + events ingest)
+  - versioned API aliases (`/api/v1/...`) for integration stability
+  - paginated event/run listing (`limit`, `offset`, `has_more`, `next_offset`)
+  - `GET /api/observability/overview` for SLA/operations reporting (p95 latency, event throughput, connector failure rate)
+  - auth-ready API key middleware (`X-API-Key`, env-configured key set)
+  - optional endpoint-level rate limiting (actor + endpoint per minute)
+  - persistent audit trail (`audit_events`) + `GET /api/audit-logs`
+  - optional HMAC request signing for write APIs (`X-Timestamp` + `X-Signature`)
+  - configurable per-endpoint quota rules (`API_RATE_LIMIT_RULES`)
+  - retention cleanup scheduler for idempotency + audit data with manual run/status APIs
+  - configurable alert threshold store + SLI endpoint (`/api/alerts/thresholds`, `/api/observability/sli`)
+  - incident lifecycle for alerting (`/api/alerts/incidents`, evaluate + manual resolve)
