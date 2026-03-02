@@ -134,6 +134,11 @@ Update default source behavior:
 - `PUT /api/connectors/<connector_id>`
 - `DELETE /api/connectors/<connector_id>`
 - `POST /api/connectors/<connector_id>/sync`
+- `POST /api/connectors/<connector_id>/sync-async`
+- `POST /api/connectors/sync-due`
+- `GET /api/connectors/scheduler/status`
+- `POST /api/connectors/scheduler/run-now`
+- `GET /api/connectors/metrics`
 - `GET /api/connectors/<connector_id>/runs`
 - `GET /api/connector-runs/<run_id>`
 
@@ -143,11 +148,21 @@ Connector types:
 
 Sync behavior:
 - Executes source ingestion for the connector type.
+- Supports synchronous and asynchronous execution modes.
 - Deduplicates by URL against stored article vectors.
 - Generates deterministic embeddings for newly ingested articles.
 - Persists article vectors and refreshes in-process recommender state.
 - Persists connector run records with status and counters.
 - Returns ingestion diagnostics (`attempted`, `ingested`, `skipped_existing`, `errors`) and run metadata.
+- Scheduler hook:
+  - `sync-due` evaluates connector config flags `auto_sync_enabled` + `sync_interval_minutes`
+  - enqueues due connectors as `scheduled` runs
+  - optional in-process scheduler loop executes due scans on a fixed interval
+
+Connector config validation:
+- `feed_url` / `base_url` must be valid `http(s)` URLs
+- `max_articles` normalized to `1..50`
+- `sync_interval_minutes` normalized to `1..1440`
 
 ### 5.2 `GET /api/ranking-configs`
 

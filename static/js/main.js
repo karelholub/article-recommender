@@ -4,6 +4,7 @@ let articles = [];
 let sourceOptions = [];
 let rankingConfigs = {};
 let connectors = [];
+const connectorRunsCache = {};
 
 // Initialize the application
 document.addEventListener('DOMContentLoaded', () => {
@@ -13,7 +14,11 @@ document.addEventListener('DOMContentLoaded', () => {
     loadRankingConfigs();
     loadOfflineMetrics();
     loadConnectors();
+    loadConnectorMetrics();
+    loadSchedulerStatus();
+    loadDecisionContext();
     setupEventListeners();
+    setInterval(loadSchedulerStatus, 15000);
 });
 
 async function loadArticles() {
@@ -63,6 +68,7 @@ async function loadSources() {
         const data = await response.json();
         sourceOptions = data.sources || [];
         renderSourceFilters();
+        loadDecisionContext();
     } catch (error) {
         console.error('Error loading sources:', error);
         document.getElementById('source-filters').innerHTML = `<span>Failed to load sources</span>`;
@@ -79,9 +85,31 @@ async function loadConnectors() {
         const data = await response.json();
         connectors = data.connectors || [];
         renderConnectors();
+        loadConnectorMetrics();
     } catch (error) {
         console.error('Error loading connectors:', error);
         document.getElementById('connector-list').innerHTML = '<span>Connectors unavailable</span>';
+    }
+}
+
+async function loadConnectorMetrics() {
+    const container = document.getElementById('connector-metrics');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/connectors/metrics');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load connector metrics');
+        }
+        const payload = await response.json();
+        container.innerHTML = `
+            <div><strong>Connectors:</strong> ${payload.total_connectors}</div>
+            <div><strong>Runs:</strong> ${payload.total_runs}</div>
+            <div><strong>Success rate:</strong> ${(Number(payload.overall_success_rate || 0) * 100).toFixed(1)}%</div>
+            <div><strong>Avg ingested/run:</strong> ${Number(payload.avg_ingested_per_run || 0).toFixed(2)}</div>
+        `;
+    } catch (error) {
+        container.textContent = `Metrics unavailable: ${error.message}`;
     }
 }
 
@@ -93,18 +121,40 @@ function renderConnectors() {
     }
 
     container.innerHTML = connectors.map(connector => `
-        <div class="border rounded p-2 mb-2">
+        <div class="border rounded p-2 mb-2 connector-card" data-id="${connector.connector_id}">
             <div class="fw-semibold">${connector.name}</div>
             <div class="text-muted">${connector.connector_type}</div>
             <div class="text-muted small">${connector.config?.base_url || connector.config?.feed_url || 'n/a'}</div>
+            <div class="text-muted small">
+                Auto-sync: ${connector.config?.auto_sync_enabled ? 'on' : 'off'}
+                (${Number(connector.config?.sync_interval_minutes || 60)} min)
+            </div>
+            <div class="row g-2 mt-1">
+                <div class="col-4">
+                    <input class="form-control form-control-sm connector-max-articles" type="number" min="1" max="50" value="${Number(connector.config?.max_articles || 10)}" title="max_articles">
+                </div>
+                <div class="col-4">
+                    <input class="form-control form-control-sm connector-sync-interval" type="number" min="1" value="${Number(connector.config?.sync_interval_minutes || 60)}" title="sync_interval_minutes">
+                </div>
+                <div class="col-4 d-flex align-items-center">
+                    <div class="form-check mb-0">
+                        <input class="form-check-input connector-auto-sync" type="checkbox" ${connector.config?.auto_sync_enabled ? 'checked' : ''}>
+                        <label class="form-check-label small">Auto</label>
+                    </div>
+                </div>
+            </div>
             <div class="d-flex gap-2 mt-2">
                 <button class="btn btn-sm btn-outline-secondary connector-sync" data-id="${connector.connector_id}">Sync</button>
+                <button class="btn btn-sm btn-outline-primary connector-sync-async" data-id="${connector.connector_id}">Sync Async</button>
+                <button class="btn btn-sm btn-outline-info connector-runs" data-id="${connector.connector_id}">Runs</button>
+                <button class="btn btn-sm btn-outline-success connector-save-config" data-id="${connector.connector_id}">Save Config</button>
                 <button class="btn btn-sm btn-outline-warning connector-toggle" data-id="${connector.connector_id}" data-enabled="${connector.enabled}">
                     ${connector.enabled ? 'Disable' : 'Enable'}
                 </button>
                 <button class="btn btn-sm btn-outline-danger connector-delete" data-id="${connector.connector_id}">Delete</button>
             </div>
             ${connector.last_run_at ? `<div class="small text-muted mt-1">Last sync: ${connector.last_run_at}</div>` : ''}
+            <div id="connector-runs-${connector.connector_id}" class="small mt-2"></div>
         </div>
     `).join('');
 }
@@ -113,6 +163,9 @@ async function createConnector() {
     const name = document.getElementById('connector-name').value.trim();
     const connectorType = document.getElementById('connector-type').value;
     const url = document.getElementById('connector-url').value.trim();
+    const maxArticles = Number(document.getElementById('connector-max-articles').value);
+    const autoSyncEnabled = document.getElementById('connector-auto-sync').checked;
+    const syncIntervalMinutes = Number(document.getElementById('connector-sync-interval').value);
 
     if (!name || !url) {
         showError('Connector name and URL are required');
@@ -120,6 +173,11 @@ async function createConnector() {
     }
 
     const config = connectorType === 'rss' ? { feed_url: url } : { base_url: url };
+    config.max_articles = Number.isFinite(maxArticles) && maxArticles > 0 ? maxArticles : 10;
+    config.auto_sync_enabled = Boolean(autoSyncEnabled);
+    config.sync_interval_minutes = Number.isFinite(syncIntervalMinutes) && syncIntervalMinutes > 0
+        ? syncIntervalMinutes
+        : 60;
     const response = await fetch('/api/connectors', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -136,15 +194,22 @@ async function createConnector() {
     }
     document.getElementById('connector-name').value = '';
     document.getElementById('connector-url').value = '';
+    document.getElementById('connector-max-articles').value = '10';
+    document.getElementById('connector-sync-interval').value = '60';
+    document.getElementById('connector-auto-sync').checked = false;
     await loadConnectors();
 }
 
 async function handleConnectorAction(event) {
     const syncBtn = event.target.closest('.connector-sync');
+    const syncAsyncBtn = event.target.closest('.connector-sync-async');
+    const runsBtn = event.target.closest('.connector-runs');
+    const saveConfigBtn = event.target.closest('.connector-save-config');
     const toggleBtn = event.target.closest('.connector-toggle');
     const deleteBtn = event.target.closest('.connector-delete');
+    const card = event.target.closest('.connector-card');
 
-    if (!syncBtn && !toggleBtn && !deleteBtn) return;
+    if (!syncBtn && !syncAsyncBtn && !runsBtn && !saveConfigBtn && !toggleBtn && !deleteBtn) return;
 
     try {
         if (syncBtn) {
@@ -153,6 +218,54 @@ async function handleConnectorAction(event) {
             if (!response.ok) {
                 const error = await response.json();
                 throw new Error(error.error || 'Failed to sync connector');
+            }
+            await loadConnectorRuns(id);
+        }
+
+        if (syncAsyncBtn) {
+            const id = syncAsyncBtn.dataset.id;
+            const response = await fetch(`/api/connectors/${encodeURIComponent(id)}/sync-async`, { method: 'POST' });
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.error || 'Failed to enqueue connector sync');
+            }
+            const payload = await response.json();
+            document.getElementById('connector-sync-summary').textContent = `Queued run ${payload.run_id} for ${id}`;
+            await pollConnectorRun(payload.run_id, id);
+        }
+
+        if (runsBtn) {
+            const id = runsBtn.dataset.id;
+            await loadConnectorRuns(id);
+            return;
+        }
+
+        if (saveConfigBtn) {
+            const id = saveConfigBtn.dataset.id;
+            const target = connectors.find(connector => connector.connector_id === id);
+            const nextMaxArticles = Number(card?.querySelector('.connector-max-articles')?.value);
+            const nextSyncInterval = Number(card?.querySelector('.connector-sync-interval')?.value);
+            const nextAutoSync = Boolean(card?.querySelector('.connector-auto-sync')?.checked);
+            const config = { ...(target?.config || {}) };
+            config.max_articles = Number.isFinite(nextMaxArticles) && nextMaxArticles > 0 ? nextMaxArticles : 10;
+            config.sync_interval_minutes = Number.isFinite(nextSyncInterval) && nextSyncInterval > 0
+                ? nextSyncInterval
+                : 60;
+            config.auto_sync_enabled = nextAutoSync;
+
+            const response = await fetch(`/api/connectors/${encodeURIComponent(id)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    enabled: target?.enabled,
+                    name: target?.name,
+                    connector_type: target?.connector_type,
+                    config
+                })
+            });
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.error || 'Failed to save connector config');
             }
         }
 
@@ -190,6 +303,123 @@ async function handleConnectorAction(event) {
         console.error('Connector action failed:', error);
         showError(error.message || 'Connector operation failed');
     }
+}
+
+async function syncDueConnectors() {
+    try {
+        const response = await fetch('/api/connectors/sync-due', { method: 'POST' });
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to trigger due connector sync');
+        }
+        const payload = await response.json();
+        document.getElementById('connector-sync-summary').textContent =
+            `Triggered ${payload.triggered_count}, skipped ${payload.skipped_count}`;
+
+        const pollTasks = (payload.triggered || []).map(item => pollConnectorRun(item.run_id, item.connector_id));
+        await Promise.all(pollTasks);
+        await loadConnectors();
+        await loadConnectorMetrics();
+    } catch (error) {
+        console.error('Error syncing due connectors:', error);
+        showError(error.message || 'Failed to run due connector sync');
+    }
+}
+
+async function loadSchedulerStatus() {
+    const statusEl = document.getElementById('scheduler-status');
+    if (!statusEl) return;
+    try {
+        const response = await fetch('/api/connectors/scheduler/status');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load scheduler status');
+        }
+        const payload = await response.json();
+        const lastRun = payload.last_run_at || 'never';
+        const state = payload.running ? 'running' : (payload.enabled ? 'enabled' : 'disabled');
+        statusEl.textContent = `${state}; runs ${payload.runs_total}; last ${lastRun}`;
+    } catch (error) {
+        statusEl.textContent = `Scheduler status error: ${error.message}`;
+    }
+}
+
+async function runSchedulerNow() {
+    try {
+        const response = await fetch('/api/connectors/scheduler/run-now', { method: 'POST' });
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to run scheduler now');
+        }
+        const payload = await response.json();
+        const summary = payload.scheduler_run || {};
+        document.getElementById('connector-sync-summary').textContent =
+            `Scheduler run: triggered ${summary.triggered_count || 0}, skipped ${summary.skipped_count || 0}`;
+        await loadSchedulerStatus();
+        await loadConnectors();
+        await loadConnectorMetrics();
+    } catch (error) {
+        showError(error.message || 'Scheduler run failed');
+    }
+}
+
+async function pollConnectorRun(runId, connectorId) {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+        const response = await fetch(`/api/connector-runs/${encodeURIComponent(runId)}`);
+        if (!response.ok) {
+            break;
+        }
+        const run = await response.json();
+        if (['completed', 'completed_with_errors', 'failed'].includes(run.status)) {
+            await loadConnectorRuns(connectorId);
+            return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 800));
+    }
+}
+
+function statusBadgeClass(status) {
+    if (status === 'completed') return 'bg-success';
+    if (status === 'completed_with_errors') return 'bg-warning text-dark';
+    if (status === 'failed') return 'bg-danger';
+    return 'bg-secondary';
+}
+
+async function loadConnectorRuns(connectorId) {
+    try {
+        const response = await fetch(`/api/connectors/${encodeURIComponent(connectorId)}/runs?limit=5`);
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load connector runs');
+        }
+        const payload = await response.json();
+        connectorRunsCache[connectorId] = payload.runs || [];
+        renderConnectorRuns(connectorId);
+    } catch (error) {
+        console.error('Error loading connector runs:', error);
+        showError(error.message || 'Failed to load connector runs');
+    }
+}
+
+function renderConnectorRuns(connectorId) {
+    const target = document.getElementById(`connector-runs-${connectorId}`);
+    if (!target) return;
+
+    const runs = connectorRunsCache[connectorId] || [];
+    if (!runs.length) {
+        target.innerHTML = '<span class="text-muted">No run history.</span>';
+        return;
+    }
+
+    target.innerHTML = runs.map(run => `
+        <div class="border-top pt-1 mt-1">
+            <span class="badge ${statusBadgeClass(run.status)}">${run.status}</span>
+            <span class="ms-1">attempted ${run.attempted}, ingested ${run.ingested}</span>
+            ${run.error_count ? `<div class="text-danger">errors: ${run.error_count}</div>` : ''}
+            ${run.errors && run.errors.length ? `<div class="text-danger small">${run.errors[0]}</div>` : ''}
+            <div class="text-muted">${run.created_at}</div>
+        </div>
+    `).join('');
 }
 
 function renderSourceFilters() {
@@ -281,9 +511,35 @@ async function loadRankingConfigs() {
         if (data.default_config_id && rankingConfigs[data.default_config_id]) {
             select.value = data.default_config_id;
         }
+        loadDecisionContext();
     } catch (error) {
         console.error('Error loading ranking configs:', error);
         document.getElementById('ranking-config').innerHTML = '<option value="balanced">balanced</option>';
+    }
+}
+
+async function loadDecisionContext() {
+    const container = document.getElementById('decision-context');
+    if (!container) return;
+    try {
+        const configId = document.getElementById('ranking-config')?.value || 'balanced';
+        const selectedSources = getSelectedSources();
+        const response = await fetch('/api/recommendation-context', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                config_id: configId,
+                sources: selectedSources
+            })
+        });
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load decision context');
+        }
+        const context = await response.json();
+        container.textContent = JSON.stringify(context, null, 2);
+    } catch (error) {
+        container.textContent = `Failed to load decision context: ${error.message}`;
     }
 }
 
@@ -561,6 +817,13 @@ function setupEventListeners() {
     });
 
     document.getElementById('show-similar').addEventListener('click', showSimilarArticles);
+    document.getElementById('refresh-decision-context').addEventListener('click', loadDecisionContext);
+    document.getElementById('ranking-config').addEventListener('change', loadDecisionContext);
+    document.getElementById('source-filters').addEventListener('change', (event) => {
+        if (event.target.classList.contains('source-filter')) {
+            loadDecisionContext();
+        }
+    });
     document.getElementById('save-source-settings').addEventListener('click', saveSourceSettings);
     document.getElementById('create-connector').addEventListener('click', async () => {
         try {
@@ -569,6 +832,8 @@ function setupEventListeners() {
             showError(error.message || 'Failed to create connector');
         }
     });
+    document.getElementById('sync-due-connectors').addEventListener('click', syncDueConnectors);
+    document.getElementById('run-scheduler-now').addEventListener('click', runSchedulerNow);
     document.getElementById('connector-list').addEventListener('click', handleConnectorAction);
 }
 

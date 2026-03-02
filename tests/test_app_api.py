@@ -1,6 +1,8 @@
 import uuid
+import time
 
 from app import app, recommender
+from connector_pipeline import IngestResult
 
 
 def test_health_endpoints():
@@ -349,3 +351,150 @@ def test_connector_validation():
         json={'connector_type': 'unsupported'},
     )
     assert invalid_type_update.status_code == 400
+
+    invalid_url = client.post(
+        '/api/connectors',
+        json={
+            'name': 'bad-url',
+            'connector_type': 'rss',
+            'config': {'feed_url': 'notaurl'},
+        },
+    )
+    assert invalid_url.status_code == 400
+
+    created = client.post(
+        '/api/connectors',
+        json={
+            'name': f'normalize-{uuid.uuid4().hex[:8]}',
+            'connector_type': 'rss',
+            'config': {
+                'feed_url': 'https://example.com/feed.xml',
+                'max_articles': 999,
+                'sync_interval_minutes': 0,
+                'auto_sync_enabled': 'yes',
+            },
+        },
+    )
+    assert created.status_code == 201
+    payload = created.get_json()
+    assert payload['config']['max_articles'] == 50
+    assert payload['config']['sync_interval_minutes'] == 1
+    assert payload['config']['auto_sync_enabled'] is True
+
+
+def test_connector_sync_async_endpoint(monkeypatch):
+    client = app.test_client()
+    created = client.post(
+        '/api/connectors',
+        json={
+            'name': f'async-{uuid.uuid4().hex[:8]}',
+            'connector_type': 'rss',
+            'config': {'feed_url': 'https://example.com/feed.xml'},
+            'enabled': True,
+        },
+    ).get_json()
+    connector_id = created['connector_id']
+
+    monkeypatch.setattr(
+        'app.ConnectorIngestionService.sync_connector',
+        lambda self, connector: IngestResult(
+            connector_id=connector['connector_id'],
+            attempted=2,
+            ingested=1,
+            skipped_existing=1,
+            errors=[],
+        ),
+    )
+
+    response = client.post(f'/api/connectors/{connector_id}/sync-async')
+    assert response.status_code == 202
+    payload = response.get_json()
+    assert payload['status'] == 'running'
+    run_id = payload['run_id']
+
+    run_payload = None
+    for _ in range(30):
+        run_resp = client.get(f'/api/connector-runs/{run_id}')
+        assert run_resp.status_code == 200
+        run_payload = run_resp.get_json()
+        if run_payload['status'] in ('completed', 'completed_with_errors', 'failed'):
+            break
+        time.sleep(0.02)
+
+    assert run_payload is not None
+    assert run_payload['status'] in ('completed', 'completed_with_errors')
+    assert run_payload['attempted'] == 2
+
+
+def test_connector_sync_due_triggers_configured_connectors(monkeypatch):
+    client = app.test_client()
+    created = client.post(
+        '/api/connectors',
+        json={
+            'name': f'scheduled-{uuid.uuid4().hex[:8]}',
+            'connector_type': 'rss',
+            'config': {
+                'feed_url': 'https://example.com/feed.xml',
+                'auto_sync_enabled': True,
+                'sync_interval_minutes': 1,
+            },
+            'enabled': True,
+        },
+    ).get_json()
+    connector_id = created['connector_id']
+
+    monkeypatch.setattr(
+        'app.ConnectorIngestionService.sync_connector',
+        lambda self, connector: IngestResult(
+            connector_id=connector['connector_id'],
+            attempted=1,
+            ingested=0,
+            skipped_existing=1,
+            errors=[],
+        ),
+    )
+
+    trigger = client.post('/api/connectors/sync-due')
+    assert trigger.status_code == 200
+    trigger_payload = trigger.get_json()
+    assert trigger_payload['triggered_count'] >= 1
+    assert any(item['connector_id'] == connector_id for item in trigger_payload['triggered'])
+
+
+def test_connector_scheduler_status_endpoint():
+    client = app.test_client()
+    response = client.get('/api/connectors/scheduler/status')
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert 'enabled' in payload
+    assert 'interval_seconds' in payload
+    assert 'runs_total' in payload
+
+
+def test_connector_scheduler_run_now_endpoint(monkeypatch):
+    client = app.test_client()
+    monkeypatch.setattr(
+        'app._enqueue_due_connector_syncs',
+        lambda trigger_label='scheduled': {  # noqa: ARG005
+            'triggered': [{'connector_id': 'c1', 'run_id': 'r1'}],
+            'skipped': [],
+            'triggered_count': 1,
+            'skipped_count': 0,
+        },
+    )
+    response = client.post('/api/connectors/scheduler/run-now')
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert 'scheduler_run' in payload
+    assert payload['scheduler_run']['triggered_count'] == 1
+
+
+def test_connector_metrics_endpoint():
+    client = app.test_client()
+    response = client.get('/api/connectors/metrics')
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert 'total_connectors' in payload
+    assert 'total_runs' in payload
+    assert 'overall_success_rate' in payload
+    assert 'connectors' in payload

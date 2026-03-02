@@ -145,8 +145,13 @@ python embed.py
 - `PUT /api/connectors/<connector_id>`: Update connector
 - `DELETE /api/connectors/<connector_id>`: Delete connector
 - `POST /api/connectors/<connector_id>/sync`: Execute connector ingestion, update embeddings, and record sync timestamp
+- `POST /api/connectors/<connector_id>/sync-async`: Enqueue connector sync run and return immediately
+- `POST /api/connectors/sync-due`: Trigger async sync for connectors configured as auto-sync and currently due
+- `GET /api/connectors/scheduler/status`: In-process scheduler state
+- `POST /api/connectors/scheduler/run-now`: Force one scheduler due-scan cycle
 - `GET /api/connectors/<connector_id>/runs?limit=20`: Connector sync run history
 - `GET /api/connector-runs/<run_id>`: Connector sync run detail
+- `GET /api/connectors/metrics`: Aggregated connector reliability and ingestion metrics
 - `GET /api/ranking-configs`: Latest ranking configs + versions
 - `POST /api/ranking-configs`: Create custom ranking config (new version starts at 1)
 - `PUT /api/ranking-configs/<config_id>`: Create a new version for an existing custom config
@@ -180,6 +185,19 @@ These show exactly which source weights and ranking config were used during scor
 Connector config fields:
 - `rss`: `config.feed_url` (optional `max_articles`, default 10, max 50)
 - `section_scraper`: `config.base_url` (optional `max_articles`, default 10, max 50)
+- Optional scheduling flags in `config`:
+  - `auto_sync_enabled` (`true|false`)
+  - `sync_interval_minutes` (default `60`)
+
+Server-side normalization:
+- `max_articles` is clamped to `[1, 50]`
+- `sync_interval_minutes` is clamped to `[1, 1440]`
+- URL fields must be valid `http(s)` URLs
+
+Optional autonomous scheduler (in-process):
+- `CONNECTOR_SCHEDULER_ENABLED=true`
+- `CONNECTOR_SCHEDULER_INTERVAL_SECONDS=60`
+- Process lock file (default): `/tmp/article_recommender_scheduler.lock`
 
 `POST /api/connectors/<id>/sync` returns ingestion diagnostics:
 - `attempted`
