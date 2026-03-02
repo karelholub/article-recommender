@@ -763,6 +763,8 @@ class PostgresRecommenderStore(BaseRecommenderStore):
     def _init_db(self) -> None:
         with self._managed_connection() as conn:
             with conn.cursor() as cur:
+                # Prevent concurrent schema bootstrap across multiple gunicorn workers.
+                cur.execute("SELECT pg_advisory_lock(%s)", (987654321,))
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS ranking_configs (
@@ -846,6 +848,7 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                     );
                     """
                 )
+                cur.execute("SELECT pg_advisory_unlock(%s)", (987654321,))
 
     def _latest_version(self, config_id: str) -> int:
         with self._managed_connection() as conn:
