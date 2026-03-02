@@ -26,7 +26,11 @@ let reportingLastQualityCompare = null;
 let reportingLastConfigCompare = null;
 let cdpIntegration = null;
 let recommendationRuns = [];
+let rankingLabContexts = [];
+let rankingLabLastComparison = null;
+let rankingLabEvaluationsById = {};
 const GUARD_PRESET_STORAGE_KEY = 'reporting_guard_preset_v1';
+const RANKING_LAB_BOOKMARKS_STORAGE_KEY = 'ranking_lab_context_sets_v1';
 const GUARD_PRESETS = {
     conservative: {
         min_ndcg_lift: 0.01,
@@ -60,7 +64,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('article-list')) loadArticles();
     if (hasElement('article-stats')) loadStats();
     if (hasElement('source-filters') || hasElement('reporting-source-filter')) loadSources();
-    if (hasElement('ranking-config') || hasElement('config-compare-baseline')) loadRankingConfigs();
+    if (hasElement('ranking-config') || hasElement('config-compare-baseline') || hasElement('lab-baseline-config')) loadRankingConfigs();
     if (hasElement('scenario-select') || hasElement('reporting-scenario-filter') || hasElement('scenario-id')) loadScenarios();
     if (hasElement('offline-metrics')) loadOfflineMetrics();
     if (hasElement('scenario-metrics')) loadScenarioMetrics();
@@ -88,6 +92,11 @@ document.addEventListener('DOMContentLoaded', () => {
         loadCdpSchedulerStatus();
         loadCdpDiagnostics();
     }
+    if (hasElement('embedding-model-name')) {
+        loadEmbeddingConfig();
+        loadEmbeddingStatus();
+        setInterval(loadEmbeddingStatus, 5000);
+    }
     if (hasElement('decision-context')) loadDecisionContext();
     if (hasElement('reporting-summary')) {
         loadReportingWorkspace();
@@ -95,6 +104,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (hasElement('guard-preset')) {
         loadGuardPresetFromStorage();
+    }
+    if (hasElement('lab-contexts')) {
+        renderRankingLabBookmarks();
+        loadRankingLabContexts();
+        loadRankingLabHistory();
     }
     setupEventListeners();
 });
@@ -713,6 +727,7 @@ async function loadRankingConfigs() {
             populateRankingConfigEditor(select.value);
         }
         renderConfigCompareSelectors();
+        renderRankingLabConfigSelectors();
         renderRuleBuilderConfigOptions();
         loadDecisionContext();
     } catch (error) {
@@ -722,6 +737,7 @@ async function loadRankingConfigs() {
         rankingConfigs = {};
         renderRuleBuilderConfigOptions();
         renderConfigCompareSelectors();
+        renderRankingLabConfigSelectors();
         if (select) populateRankingConfigEditor('balanced');
     }
 }
@@ -734,6 +750,20 @@ function renderRuleBuilderConfigOptions() {
         options.push(`<option value="${id}">${id}</option>`);
     });
     select.innerHTML = options.join('');
+}
+
+function renderRankingLabConfigSelectors() {
+    const baseline = document.getElementById('lab-baseline-config');
+    const candidate = document.getElementById('lab-candidate-config');
+    if (!baseline || !candidate) return;
+    const configIds = Object.keys(rankingConfigs);
+    const options = configIds.map(id => `<option value="${id}">${id}</option>`).join('');
+    baseline.innerHTML = options || '<option value="balanced">balanced</option>';
+    candidate.innerHTML = options || '<option value="balanced">balanced</option>';
+    if (baseline.value && candidate.value === baseline.value && configIds.length > 1) {
+        const alt = configIds.find(id => id !== baseline.value);
+        if (alt) candidate.value = alt;
+    }
 }
 
 function populateRankingConfigEditor(configId) {
@@ -1839,6 +1869,107 @@ async function runBatchRecommendations() {
     output.textContent = JSON.stringify(payload, null, 2);
 }
 
+function renderEmbeddingJobStatus(payload) {
+    const status = document.getElementById('embedding-job-status');
+    const result = document.getElementById('embedding-job-result');
+    if (!status || !result) return;
+    const state = payload.state || {};
+    const statusLabel = state.running ? 'running' : (state.last_status || 'idle');
+    status.innerHTML = `
+        <strong>Status:</strong> ${statusLabel}
+        | <strong>Current job:</strong> ${state.current_job_id || 'n/a'}
+        | <strong>Last completed:</strong> ${state.last_completed_at || 'n/a'}
+        | <strong>Duration:</strong> ${state.last_duration_ms ?? 'n/a'} ms
+    `;
+    const output = {
+        state,
+        config: payload.config || {}
+    };
+    result.textContent = JSON.stringify(output, null, 2);
+}
+
+async function loadEmbeddingConfig() {
+    const status = document.getElementById('embedding-config-status');
+    const modelSelect = document.getElementById('embedding-model-name');
+    if (!status || !modelSelect) return;
+    try {
+        const response = await fetch('/api/embeddings/config');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load embedding config');
+        }
+        const payload = await response.json();
+        const allowed = payload.allowed_models || [];
+        modelSelect.innerHTML = allowed.map(name => `<option value="${name}">${name}</option>`).join('');
+        const cfg = payload.config || {};
+        modelSelect.value = cfg.model_name || allowed[0] || '';
+        document.getElementById('embedding-batch-size').value = Number(cfg.batch_size ?? 16);
+        document.getElementById('embedding-max-length').value = Number(cfg.max_length ?? 512);
+        document.getElementById('embedding-normalize').checked = Boolean(cfg.normalize_embeddings);
+        document.getElementById('embedding-show-progress').checked = Boolean(cfg.show_progress_bar);
+        status.textContent = `Loaded from ${payload.config_path || 'config file'}.`;
+    } catch (error) {
+        status.textContent = `Embedding config unavailable: ${error.message}`;
+    }
+}
+
+async function saveEmbeddingConfig() {
+    const status = document.getElementById('embedding-config-status');
+    if (!status) return;
+    status.textContent = 'Saving...';
+    const response = await fetch('/api/embeddings/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            config: {
+                model_name: (document.getElementById('embedding-model-name')?.value || '').trim(),
+                batch_size: Number(document.getElementById('embedding-batch-size')?.value || 16),
+                max_length: Number(document.getElementById('embedding-max-length')?.value || 512),
+                normalize_embeddings: Boolean(document.getElementById('embedding-normalize')?.checked),
+                show_progress_bar: Boolean(document.getElementById('embedding-show-progress')?.checked)
+            },
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to save embedding config');
+    }
+    await loadEmbeddingConfig();
+    status.textContent = 'Embedding config saved.';
+}
+
+async function loadEmbeddingStatus() {
+    const status = document.getElementById('embedding-job-status');
+    if (!status) return;
+    try {
+        const response = await fetch('/api/embeddings/status');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load embedding status');
+        }
+        const payload = await response.json();
+        renderEmbeddingJobStatus(payload);
+    } catch (error) {
+        status.textContent = `Embedding status unavailable: ${error.message}`;
+    }
+}
+
+async function runEmbeddingJob(forceUpdate = false) {
+    const status = document.getElementById('embedding-job-status');
+    if (status) status.textContent = forceUpdate ? 'Starting full re-embed...' : 'Starting incremental re-embed...';
+    const response = await fetch('/api/embeddings/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ force_update: forceUpdate, actor_id: getOperatorId() || undefined })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to start embedding run');
+    }
+    await loadEmbeddingStatus();
+}
+
 async function loadEngineConfigSnapshot() {
     const container = document.getElementById('engine-config-snapshot');
     if (!container) return;
@@ -2553,6 +2684,407 @@ async function autoTuneRankingConfig(apply = false) {
     }
 }
 
+function selectedRankingLabContextIds() {
+    const select = document.getElementById('lab-contexts');
+    if (!select) return [];
+    return Array.from(select.selectedOptions || []).map(option => option.value).filter(Boolean);
+}
+
+function renderRankingLabContexts() {
+    const select = document.getElementById('lab-contexts');
+    const countEl = document.getElementById('lab-context-count');
+    if (!select) return;
+    select.innerHTML = rankingLabContexts.map(ctx => {
+        const sourceCount = (ctx.sources || []).length;
+        const scenario = ctx.scenario_id ? ` | ${ctx.scenario_id}` : '';
+        const createdAt = ctx.created_at || '';
+        const label = `${ctx.label || ctx.effective_user_id || ctx.context_id} | sources:${sourceCount}${scenario} | ${createdAt}`;
+        return `<option value="${ctx.context_id}">${label}</option>`;
+    }).join('');
+    if (countEl) countEl.textContent = `${rankingLabContexts.length} loaded`;
+    if (rankingLabContexts.length) {
+        const maxContexts = Math.max(1, Math.min(20, Number(document.getElementById('lab-context-limit')?.value || 10)));
+        Array.from(select.options).forEach((option, idx) => {
+            option.selected = idx < maxContexts;
+        });
+    }
+}
+
+async function loadRankingLabContexts() {
+    const days = Math.max(1, Math.min(365, Number(document.getElementById('lab-window-days')?.value || 30)));
+    const limit = Math.max(1, Math.min(50, Number(document.getElementById('lab-context-limit')?.value || 10)));
+    const status = document.getElementById('lab-status');
+    if (status) status.textContent = 'Loading sample contexts...';
+    const response = await fetch(`/api/ranking-lab/contexts?days=${days}&limit=${limit}`);
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to load ranking lab contexts');
+    }
+    rankingLabContexts = payload.contexts || [];
+    renderRankingLabContexts();
+    if (status) status.textContent = `Loaded ${rankingLabContexts.length} contexts.`;
+}
+
+function formatLabItemDetails(item) {
+    const contrib = item.feature_contributions || {};
+    return `
+        <div><strong>${item.title || item.article_id || 'n/a'}</strong></div>
+        <div class="text-muted">Score ${Number(item.score || 0).toFixed(4)} | Source ${item.source || 'n/a'}</div>
+        <div class="text-muted">Contrib: semantic ${formatContribution(contrib.semantic)}, freshness ${formatContribution(contrib.freshness)}, topic ${formatContribution(contrib.topic)}, source ${formatContribution(contrib.source)}</div>
+        <div class="text-muted">${item.explanation || ''}</div>
+    `;
+}
+
+function renderRankingLabComparison(payload) {
+    rankingLabLastComparison = payload;
+    const summary = document.getElementById('lab-summary');
+    const deltas = document.getElementById('lab-deltas-table');
+    const coverage = document.getElementById('lab-coverage-summary');
+    const sideBySide = document.getElementById('lab-side-by-side');
+    if (!payload || !deltas || !sideBySide) return;
+
+    const overall = payload.overall || {};
+    const deltaRows = (overall.deltas || []).map(row => `
+        <tr>
+            <td>${row.metric}</td>
+            <td>${Number(row.baseline || 0).toFixed(6)}</td>
+            <td>${Number(row.candidate || 0).toFixed(6)}</td>
+            <td>${Number(row.delta || 0).toFixed(6)}</td>
+            <td>${row.delta_pct == null ? 'n/a' : `${(Number(row.delta_pct) * 100).toFixed(2)}%`}</td>
+        </tr>
+    `).join('');
+    deltas.innerHTML = deltaRows || '<tr><td colspan="5" class="text-muted">No metrics returned.</td></tr>';
+
+    const contexts = payload.contexts || [];
+    const coverageSummary = payload.coverage_summary || {};
+    if (summary) {
+        summary.innerHTML = `
+            <strong>Baseline:</strong> ${payload.baseline_config_id}
+            | <strong>Candidate:</strong> ${payload.candidate_config_id}
+            | <strong>Runs evaluated:</strong> ${overall.runs_evaluated || 0}/${overall.runs_considered || 0}
+            | <strong>Contexts shown:</strong> ${contexts.length}
+        `;
+    }
+    if (coverage) {
+        coverage.innerHTML = `
+            <strong>Avg overlap@k:</strong> ${(Number(coverageSummary.avg_overlap_at_k || 0) * 100).toFixed(2)}%
+            | <strong>Unique top articles:</strong> ${coverageSummary.unique_top_articles || 0}
+        `;
+    }
+
+    sideBySide.innerHTML = contexts.map(ctx => {
+        const baselineRows = (ctx.baseline?.recommendations || []).slice(0, 3).map(item => `<div class="mb-2">${formatLabItemDetails(item)}</div>`).join('');
+        const candidateRows = (ctx.candidate?.recommendations || []).slice(0, 3).map(item => `<div class="mb-2">${formatLabItemDetails(item)}</div>`).join('');
+        const baselineTrace = ctx.baseline?.scenario_trace || {};
+        const candidateTrace = ctx.candidate?.scenario_trace || {};
+        return `
+            <div class="border rounded p-2 mb-2">
+                <div class="small mb-2">
+                    <strong>${ctx.label || ctx.context_id}</strong>
+                    | overlap@k ${(Number(ctx.overlap_at_k || 0) * 100).toFixed(2)}%
+                    ${ctx.seed_article_title ? `| seed ${ctx.seed_article_title}` : ''}
+                </div>
+                <div class="row g-2">
+                    <div class="col-md-6">
+                        <div class="small fw-semibold mb-1">Baseline (${ctx.baseline?.config_id || payload.baseline_config_id})</div>
+                        <div class="small text-muted mb-1">Scenario filtered ${baselineTrace.filtered_out || 0} | remaining ${baselineTrace.remaining || 0}</div>
+                        ${baselineRows || '<div class="text-muted small">No recommendations.</div>'}
+                    </div>
+                    <div class="col-md-6">
+                        <div class="small fw-semibold mb-1">Candidate (${ctx.candidate?.config_id || payload.candidate_config_id})</div>
+                        <div class="small text-muted mb-1">Scenario filtered ${candidateTrace.filtered_out || 0} | remaining ${candidateTrace.remaining || 0}</div>
+                        ${candidateRows || '<div class="text-muted small">No recommendations.</div>'}
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('') || '<div class="text-muted">No context rows.</div>';
+}
+
+async function runRankingLabCompare() {
+    const status = document.getElementById('lab-status');
+    if (status) status.textContent = 'Running comparison...';
+    const payload = {
+        baseline_config_id: document.getElementById('lab-baseline-config')?.value || 'balanced',
+        candidate_config_id: document.getElementById('lab-candidate-config')?.value || '',
+        days: Math.max(1, Math.min(365, Number(document.getElementById('lab-window-days')?.value || 30))),
+        top_n: Math.max(1, Math.min(20, Number(document.getElementById('lab-top-n')?.value || 5))),
+        limit_runs: Math.max(10, Math.min(5000, Number(document.getElementById('lab-limit-runs')?.value || 300))),
+        max_contexts: Math.max(1, Math.min(20, Number(document.getElementById('lab-context-limit')?.value || 10))),
+        require_relevant: Boolean(document.getElementById('lab-require-relevant')?.checked),
+        context_ids: selectedRankingLabContextIds()
+    };
+    const response = await fetch('/api/ranking-lab/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (!response.ok) {
+        throw new Error(result.error || 'Failed to run ranking lab compare');
+    }
+    renderRankingLabComparison(result);
+    if (status) status.textContent = 'Comparison finished.';
+}
+
+async function loadRankingLabHistory() {
+    const table = document.getElementById('lab-history-table');
+    if (!table) return;
+    const response = await fetch('/api/ranking-lab/evaluations?limit=30');
+    const payload = await response.json();
+    if (!response.ok) {
+        table.innerHTML = `<tr><td colspan="8" class="text-danger">${payload.error || 'Failed to load history'}</td></tr>`;
+        return;
+    }
+    rankingLabEvaluationsById = {};
+    table.innerHTML = (payload.evaluations || []).map(item => {
+        const meta = item.metadata || {};
+        const metrics = item.metrics || {};
+        rankingLabEvaluationsById[item.snapshot_id] = item;
+        return `
+            <tr>
+                <td>${item.created_at || ''}</td>
+                <td>${meta.label || '-'}</td>
+                <td>${meta.baseline_config_id || '-'}</td>
+                <td>${meta.candidate_config_id || '-'}</td>
+                <td>${metrics.contexts_selected ?? '-'}</td>
+                <td>${Number(metrics.delta_ndcg_at_k || 0).toFixed(6)}</td>
+                <td>${Number(metrics.delta_historical_ctr || 0).toFixed(6)}</td>
+                <td><button class="btn btn-sm btn-outline-secondary lab-load-evaluation" data-id="${item.snapshot_id}">Load</button></td>
+            </tr>
+        `;
+    }).join('') || '<tr><td colspan="8" class="text-muted">No evaluations yet.</td></tr>';
+}
+
+async function saveRankingLabEvaluation() {
+    const status = document.getElementById('lab-status');
+    if (status) status.textContent = 'Saving evaluation...';
+    const payload = {
+        baseline_config_id: document.getElementById('lab-baseline-config')?.value || 'balanced',
+        candidate_config_id: document.getElementById('lab-candidate-config')?.value || '',
+        days: Math.max(1, Math.min(365, Number(document.getElementById('lab-window-days')?.value || 30))),
+        top_n: Math.max(1, Math.min(20, Number(document.getElementById('lab-top-n')?.value || 5))),
+        limit_runs: Math.max(10, Math.min(5000, Number(document.getElementById('lab-limit-runs')?.value || 300))),
+        max_contexts: Math.max(1, Math.min(20, Number(document.getElementById('lab-context-limit')?.value || 10))),
+        require_relevant: Boolean(document.getElementById('lab-require-relevant')?.checked),
+        context_ids: selectedRankingLabContextIds(),
+        label: (document.getElementById('lab-evaluation-label')?.value || '').trim(),
+        actor_id: getOperatorId() || undefined
+    };
+    const response = await fetch('/api/ranking-lab/evaluations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (!response.ok) {
+        throw new Error(result.error || 'Failed to save ranking lab evaluation');
+    }
+    if (result.comparison) renderRankingLabComparison(result.comparison);
+    await loadRankingLabHistory();
+    if (status) status.textContent = `Evaluation saved (${result.evaluation?.snapshot_id?.slice(0, 8) || 'ok'}).`;
+}
+
+function getRankingLabBookmarks() {
+    try {
+        const raw = localStorage.getItem(RANKING_LAB_BOOKMARKS_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (_error) {
+        return [];
+    }
+}
+
+function setRankingLabBookmarks(bookmarks) {
+    localStorage.setItem(RANKING_LAB_BOOKMARKS_STORAGE_KEY, JSON.stringify(bookmarks || []));
+}
+
+function renderRankingLabBookmarks() {
+    const select = document.getElementById('lab-bookmark-select');
+    if (!select) return;
+    const bookmarks = getRankingLabBookmarks();
+    select.innerHTML = '<option value="">Saved sets</option>' + bookmarks.map((item) => (
+        `<option value="${item.id}">${item.name} (${(item.context_ids || []).length})</option>`
+    )).join('');
+}
+
+function saveRankingLabBookmark() {
+    const nameInput = document.getElementById('lab-bookmark-name');
+    const name = (nameInput?.value || '').trim();
+    const contextIds = selectedRankingLabContextIds();
+    if (!name) throw new Error('Bookmark name is required');
+    if (!contextIds.length) throw new Error('Select at least one context');
+    const bookmarks = getRankingLabBookmarks();
+    const existingIdx = bookmarks.findIndex(item => item.name === name);
+    const payload = {
+        id: existingIdx >= 0 ? bookmarks[existingIdx].id : `set_${Date.now()}`,
+        name,
+        context_ids: contextIds,
+        updated_at: new Date().toISOString()
+    };
+    if (existingIdx >= 0) {
+        bookmarks[existingIdx] = payload;
+    } else {
+        bookmarks.unshift(payload);
+    }
+    setRankingLabBookmarks(bookmarks.slice(0, 20));
+    renderRankingLabBookmarks();
+}
+
+function loadRankingLabBookmark() {
+    const select = document.getElementById('lab-bookmark-select');
+    const contextsEl = document.getElementById('lab-contexts');
+    if (!select || !contextsEl) return;
+    const bookmarkId = select.value;
+    if (!bookmarkId) throw new Error('Choose a saved set');
+    const bookmark = getRankingLabBookmarks().find(item => item.id === bookmarkId);
+    if (!bookmark) throw new Error('Saved set not found');
+    const ids = new Set(bookmark.context_ids || []);
+    Array.from(contextsEl.options).forEach(option => {
+        option.selected = ids.has(option.value);
+    });
+}
+
+function deleteRankingLabBookmark() {
+    const select = document.getElementById('lab-bookmark-select');
+    if (!select) return;
+    const bookmarkId = select.value;
+    if (!bookmarkId) throw new Error('Choose a saved set');
+    const bookmarks = getRankingLabBookmarks().filter(item => item.id !== bookmarkId);
+    setRankingLabBookmarks(bookmarks);
+    renderRankingLabBookmarks();
+}
+
+function collectRankingLabGuard() {
+    return {
+        min_ndcg_lift: Number(document.getElementById('lab-guard-min-ndcg')?.value || 0),
+        min_ctr_lift: Number(document.getElementById('lab-guard-min-ctr')?.value || 0),
+        max_precision_drop: Number(document.getElementById('lab-guard-max-precision-drop')?.value || 0),
+        max_recall_drop: Number(document.getElementById('lab-guard-max-recall-drop')?.value || 0),
+        max_mrr_drop: Number(document.getElementById('lab-guard-max-mrr-drop')?.value || 0)
+    };
+}
+
+async function promoteRankingLabCandidate(guarded = false) {
+    const status = document.getElementById('lab-status');
+    const baselineId = document.getElementById('lab-baseline-config')?.value || '';
+    const candidateId = document.getElementById('lab-candidate-config')?.value || '';
+    if (!baselineId || !candidateId) throw new Error('Select baseline and candidate configs');
+    if (status) status.textContent = guarded ? 'Running guarded promotion...' : 'Promoting candidate...';
+
+    const body = {
+        source_config_id: candidateId,
+        target_config_id: 'balanced',
+        actor_id: getOperatorId() || undefined
+    };
+    let endpoint = '/api/ranking-configs/promote';
+    if (guarded) {
+        endpoint = '/api/ranking-configs/promote-with-guard';
+        body.baseline_config_id = baselineId;
+        body.candidate_config_id = candidateId;
+        body.days = Math.max(1, Math.min(365, Number(document.getElementById('lab-window-days')?.value || 30)));
+        body.top_n = Math.max(1, Math.min(20, Number(document.getElementById('lab-top-n')?.value || 5)));
+        body.limit_runs = Math.max(10, Math.min(5000, Number(document.getElementById('lab-limit-runs')?.value || 300)));
+        body.require_relevant = Boolean(document.getElementById('lab-require-relevant')?.checked);
+        body.guard = collectRankingLabGuard();
+    }
+
+    const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify(body)
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        if (response.status === 409 && guarded) {
+            const failedChecks = (payload.guard_evaluation?.checks || []).filter(item => !item.pass);
+            const failed = failedChecks.map(item => `${item.metric}: ${item.value} ${item.operator} ${item.target}`).join(' | ');
+            throw new Error(`Guard blocked promotion. ${failed || 'thresholds not met'}`);
+        }
+        throw new Error(payload.error || 'Failed to promote candidate');
+    }
+    await loadRankingConfigs();
+    if (status) status.textContent = `Promoted ${candidateId} to balanced v${payload.target_version || payload.version || 'n/a'}.`;
+}
+
+function exportRankingLabJson() {
+    if (!rankingLabLastComparison) {
+        throw new Error('Run comparison before export');
+    }
+    const blob = new Blob([JSON.stringify(rankingLabLastComparison, null, 2)], { type: 'application/json;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ranking_lab_compare_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+}
+
+function exportRankingLabCsv() {
+    if (!rankingLabLastComparison) {
+        throw new Error('Run comparison before export');
+    }
+    const rows = [['metric', 'baseline', 'candidate', 'delta', 'delta_pct']];
+    ((rankingLabLastComparison.overall || {}).deltas || []).forEach(item => {
+        rows.push([item.metric, item.baseline, item.candidate, item.delta, item.delta_pct]);
+    });
+    rows.push([]);
+    rows.push(['context_id', 'label', 'overlap_at_k', 'baseline_top_article', 'candidate_top_article']);
+    (rankingLabLastComparison.contexts || []).forEach(ctx => {
+        const baselineTop = (ctx.baseline?.recommendations || [])[0]?.article_id || '';
+        const candidateTop = (ctx.candidate?.recommendations || [])[0]?.article_id || '';
+        rows.push([ctx.context_id, ctx.label, ctx.overlap_at_k, baselineTop, candidateTop]);
+    });
+    const csv = rows.map(row => row.map(toCsvCell).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ranking_lab_compare_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+}
+
+async function loadRankingLabEvaluation(snapshotId) {
+    const status = document.getElementById('lab-status');
+    if (status) status.textContent = 'Loading evaluation...';
+    const response = await fetch(`/api/ranking-lab/evaluations/${encodeURIComponent(snapshotId)}`);
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to load evaluation');
+    }
+    const rehydrate = payload.rehydrate || {};
+    const baseline = document.getElementById('lab-baseline-config');
+    const candidate = document.getElementById('lab-candidate-config');
+    if (baseline) baseline.value = rehydrate.baseline_config_id || baseline.value;
+    if (candidate) candidate.value = rehydrate.candidate_config_id || candidate.value;
+    const daysInput = document.getElementById('lab-window-days');
+    const topNInput = document.getElementById('lab-top-n');
+    const limitRunsInput = document.getElementById('lab-limit-runs');
+    const requireInput = document.getElementById('lab-require-relevant');
+    const labelInput = document.getElementById('lab-evaluation-label');
+    if (daysInput) daysInput.value = Number(rehydrate.days || daysInput.value || 30);
+    if (topNInput) topNInput.value = Number(rehydrate.top_n || topNInput.value || 5);
+    if (limitRunsInput) limitRunsInput.value = Number(rehydrate.limit_runs || limitRunsInput.value || 300);
+    if (requireInput) requireInput.checked = Boolean(rehydrate.require_relevant);
+    if (labelInput) labelInput.value = rehydrate.label || '';
+
+    await loadRankingLabContexts();
+    const contextIds = new Set(rehydrate.context_ids || []);
+    const contextsEl = document.getElementById('lab-contexts');
+    if (contextsEl && contextIds.size) {
+        Array.from(contextsEl.options).forEach(option => {
+            option.selected = contextIds.has(option.value);
+        });
+    }
+    await runRankingLabCompare();
+    if (status) status.textContent = `Evaluation ${snapshotId.slice(0, 8)} loaded.`;
+}
+
 async function loadReportingWorkspace() {
     try {
         const days = Number(document.getElementById('reporting-days')?.value || 30);
@@ -3026,6 +3558,7 @@ async function showSimilarArticles() {
 
         similarList.innerHTML = similarArticles.map(article => {
             const contrib = article.feature_contributions || {};
+            const components = article.similarity_components || {};
             return `
                 <div class="similar-article fade-in">
                     <h5>${article.title || 'No Title'}</h5>
@@ -3055,6 +3588,15 @@ async function showSimilarArticles() {
                         </small>
                         <small class="text-muted d-block mt-1">${article.explanation || ''}</small>
                         <small class="text-muted d-block mt-1">Overall Score: ${(article.score * 100).toFixed(1)}%</small>
+                        <details class="mt-2">
+                            <summary class="small">Explainability details</summary>
+                            <div class="small text-muted mt-1">
+                                <div>Similarity components:</div>
+                                <code>semantic=${formatContribution(components.semantic)} freshness=${formatContribution(components.freshness)} topic=${formatContribution(components.topic)} source=${formatContribution(components.source)}</code>
+                                ${article.score_before_scenario != null ? `<div class="mt-1">Scenario score: ${formatContribution(article.score_before_scenario)} -> ${formatContribution(article.score)} (boost ${formatContribution(article.scenario_boost)})</div>` : ''}
+                                <div class="mt-1">Config: <code>${article.config_id || 'n/a'}</code> | Scenario: <code>${article.scenario_id || 'none'}</code></div>
+                            </div>
+                        </details>
                     </div>
 
                     ${article.url ? `
@@ -3192,6 +3734,92 @@ function setupEventListeners() {
     on('reporting-scenario-filter', 'change', loadReportingWorkspace);
     on('reporting-source-filter', 'change', loadReportingWorkspace);
     on('reporting-top-runs', 'change', loadReportingWorkspace);
+    on('load-lab-contexts', 'click', async () => {
+        try {
+            await loadRankingLabContexts();
+        } catch (error) {
+            showError(error.message || 'Failed to load ranking lab contexts');
+        }
+    });
+    on('run-lab-compare', 'click', async () => {
+        try {
+            await runRankingLabCompare();
+        } catch (error) {
+            showError(error.message || 'Failed to run ranking lab comparison');
+        }
+    });
+    on('save-lab-evaluation', 'click', async () => {
+        try {
+            await saveRankingLabEvaluation();
+        } catch (error) {
+            showError(error.message || 'Failed to save ranking lab evaluation');
+        }
+    });
+    on('refresh-lab-history', 'click', async () => {
+        try {
+            await loadRankingLabHistory();
+        } catch (error) {
+            showError(error.message || 'Failed to load ranking lab history');
+        }
+    });
+    on('lab-history-table', 'click', async (event) => {
+        const button = event.target.closest('.lab-load-evaluation');
+        if (!button) return;
+        try {
+            await loadRankingLabEvaluation(button.dataset.id);
+        } catch (error) {
+            showError(error.message || 'Failed to load evaluation');
+        }
+    });
+    on('save-lab-bookmark', 'click', () => {
+        try {
+            saveRankingLabBookmark();
+        } catch (error) {
+            showError(error.message || 'Failed to save context set');
+        }
+    });
+    on('load-lab-bookmark', 'click', () => {
+        try {
+            loadRankingLabBookmark();
+        } catch (error) {
+            showError(error.message || 'Failed to load context set');
+        }
+    });
+    on('delete-lab-bookmark', 'click', () => {
+        try {
+            deleteRankingLabBookmark();
+        } catch (error) {
+            showError(error.message || 'Failed to delete context set');
+        }
+    });
+    on('lab-promote-candidate', 'click', async () => {
+        try {
+            await promoteRankingLabCandidate(false);
+        } catch (error) {
+            showError(error.message || 'Failed to promote candidate');
+        }
+    });
+    on('lab-promote-guarded', 'click', async () => {
+        try {
+            await promoteRankingLabCandidate(true);
+        } catch (error) {
+            showError(error.message || 'Failed guarded promotion');
+        }
+    });
+    on('export-lab-json', 'click', () => {
+        try {
+            exportRankingLabJson();
+        } catch (error) {
+            showError(error.message || 'Failed to export ranking lab JSON');
+        }
+    });
+    on('export-lab-csv', 'click', () => {
+        try {
+            exportRankingLabCsv();
+        } catch (error) {
+            showError(error.message || 'Failed to export ranking lab CSV');
+        }
+    });
     on('capture-quality-snapshot', 'click', async () => {
         try {
             await captureQualitySnapshot();
@@ -3476,6 +4104,29 @@ function setupEventListeners() {
             await runBatchRecommendations();
         } catch (error) {
             showError(error.message || 'Failed to run batch recommendations');
+        }
+    });
+    on('refresh-embedding-config', 'click', loadEmbeddingConfig);
+    on('save-embedding-config', 'click', async () => {
+        try {
+            await saveEmbeddingConfig();
+        } catch (error) {
+            showError(error.message || 'Failed to save embedding config');
+        }
+    });
+    on('refresh-embedding-status', 'click', loadEmbeddingStatus);
+    on('run-embedding-incremental', 'click', async () => {
+        try {
+            await runEmbeddingJob(false);
+        } catch (error) {
+            showError(error.message || 'Failed to run incremental embedding');
+        }
+    });
+    on('run-embedding-full', 'click', async () => {
+        try {
+            await runEmbeddingJob(true);
+        } catch (error) {
+            showError(error.message || 'Failed to run full embedding');
         }
     });
     on('refresh-audit-logs', 'click', loadAuditLogs);

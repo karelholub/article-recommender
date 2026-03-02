@@ -1,23 +1,45 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="row g-3">
+    <div class="col-12">
+        <div class="page-intro">
+            <h3 class="mb-1">CDP Integration (Meiro)</h3>
+            <p>Configure the connector, map payload fields to engine traits, validate with preview, then run sync for selected external user IDs.</p>
+        </div>
+    </div>
+
     <div class="col-lg-6">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
-                <strong>Meiro Integration</strong>
+                <strong><span class="step-chip">1</span>Meiro Integration</strong>
                 <button id="refresh-cdp-config" class="btn btn-sm btn-outline-secondary">Refresh</button>
             </div>
             <div class="card-body">
+                <div class="section-hint">Set the request endpoint and transport settings used for profile fetches.</div>
                 <div class="form-check mb-2">
                     <input id="cdp-enabled" class="form-check-input" type="checkbox">
                     <label class="form-check-label">Enabled</label>
                 </div>
+                <label class="form-label small mb-1" for="cdp-base-url">Base URL</label>
                 <input id="cdp-base-url" class="form-control form-control-sm mb-2" placeholder="Base URL (https://...)">
+                <small class="field-hint">Example: `https://cdp.store.demo.meiro.io`</small>
+                <label class="form-label small mb-1 mt-2" for="cdp-request-url-template">Request URL Template</label>
                 <input id="cdp-request-url-template" class="form-control form-control-sm mb-2" placeholder="Full request URL template (...value={external_user_id})">
+                <small class="field-hint">Include `{external_user_id}` placeholder.</small>
+                <label class="form-label small mb-1 mt-2" for="cdp-profile-endpoint-template">Profile Endpoint Template</label>
                 <input id="cdp-profile-endpoint-template" class="form-control form-control-sm mb-2" placeholder="/profiles/{external_user_id}">
+                <label class="form-label small mb-1" for="cdp-api-key">API Key</label>
                 <input id="cdp-api-key" class="form-control form-control-sm mb-2" placeholder="API Key (kept if left ***)">
-                <input id="cdp-timeout-seconds" class="form-control form-control-sm mb-2" type="number" min="1" max="30" step="1" placeholder="Timeout seconds">
-                <input id="cdp-request-retries" class="form-control form-control-sm mb-2" type="number" min="0" max="5" step="1" placeholder="Request retries">
+                <div class="row g-2">
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="cdp-timeout-seconds">Timeout (seconds)</label>
+                        <input id="cdp-timeout-seconds" class="form-control form-control-sm mb-2" type="number" min="1" max="30" step="1" placeholder="5">
+                    </div>
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="cdp-request-retries">Request Retries</label>
+                        <input id="cdp-request-retries" class="form-control form-control-sm mb-2" type="number" min="0" max="5" step="1" placeholder="2">
+                    </div>
+                </div>
                 <button id="save-cdp-config" class="btn btn-sm btn-outline-primary">Save Integration</button>
                 <div id="cdp-config-status" class="small text-muted mt-2">Idle.</div>
             </div>
@@ -25,10 +47,12 @@
     </div>
     <div class="col-12">
         <div class="card">
-            <div class="card-header"><strong>Trait Derivation</strong></div>
+            <div class="card-header"><strong><span class="step-chip">2</span>Trait Derivation</strong></div>
             <div class="card-body">
+                <div class="section-hint">Preview trait derivation for one external user ID before persisting it.</div>
                 <div class="row g-2 mb-2">
                     <div class="col-md-8">
+                        <label class="form-label small mb-1" for="cdp-derive-external-id">External User ID</label>
                         <input id="cdp-derive-external-id" class="form-control form-control-sm" placeholder="External user ID">
                     </div>
                     <div class="col-md-2 d-grid">
@@ -48,28 +72,54 @@
     </div>
     <div class="col-lg-6">
         <div class="card">
-            <div class="card-header"><strong>Engine Mapping</strong></div>
+            <div class="card-header"><strong><span class="step-chip">3</span>Engine Mapping</strong></div>
             <div class="card-body">
+                <div class="section-hint">Map CDP payload fields and traits to recommendation engine inputs.</div>
+                <label class="form-label small mb-1" for="cdp-external-id-path">External ID Path</label>
                 <input id="cdp-external-id-path" class="form-control form-control-sm mb-2" placeholder="external_id path (e.g. customer_entity_id)">
+                <label class="form-label small mb-1" for="cdp-traits-path">Traits Path</label>
                 <input id="cdp-traits-path" class="form-control form-control-sm mb-2" placeholder="traits path (e.g. returned_attributes)">
+                <label class="form-label small mb-1" for="cdp-segments-path">Segments Path (optional)</label>
                 <input id="cdp-segments-path" class="form-control form-control-sm mb-2" placeholder="segments path (optional)">
+                <label class="form-label small mb-1" for="cdp-fixed-segments">Fixed Segments</label>
                 <input id="cdp-fixed-segments" class="form-control form-control-sm mb-2" placeholder="fixed segments (comma separated)">
+                <label class="form-label small mb-1" for="cdp-preferred-sources-trait">Preferred Sources Trait Key</label>
                 <input id="cdp-preferred-sources-trait" class="form-control form-control-sm mb-2" placeholder="preferred_sources trait key">
+                <label class="form-label small mb-1" for="cdp-excluded-sources-trait">Excluded Sources Trait Key</label>
                 <input id="cdp-excluded-sources-trait" class="form-control form-control-sm mb-2" placeholder="excluded_sources trait key">
+                <label class="form-label small mb-1" for="cdp-source-weights-trait">Source Weights Trait Key</label>
                 <input id="cdp-source-weights-trait" class="form-control form-control-sm mb-2" placeholder="source_weights trait key">
+                <label class="form-label small mb-1" for="cdp-source-weight-prefix">Source Weight Trait Prefix</label>
                 <input id="cdp-source-weight-prefix" class="form-control form-control-sm mb-2" placeholder="source_weight_ prefix">
                 <div class="row g-2 mb-2">
-                    <div class="col-sm-6"><input id="cdp-derivation-min-source-events" class="form-control form-control-sm" type="number" min="0" step="1" placeholder="min source events"></div>
-                    <div class="col-sm-6"><input id="cdp-derivation-min-category-events" class="form-control form-control-sm" type="number" min="0" step="1" placeholder="min category events"></div>
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="cdp-derivation-min-source-events">Min Source Events</label>
+                        <input id="cdp-derivation-min-source-events" class="form-control form-control-sm" type="number" min="0" step="1" placeholder="3">
+                    </div>
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="cdp-derivation-min-category-events">Min Category Events</label>
+                        <input id="cdp-derivation-min-category-events" class="form-control form-control-sm" type="number" min="0" step="1" placeholder="1">
+                    </div>
                 </div>
                 <div class="row g-2 mb-2">
-                    <div class="col-sm-6"><input id="cdp-derivation-max-sources" class="form-control form-control-sm" type="number" min="1" step="1" placeholder="max preferred sources"></div>
-                    <div class="col-sm-6"><input id="cdp-derivation-weight-range" class="form-control form-control-sm" placeholder="min:max source weight"></div>
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="cdp-derivation-max-sources">Max Preferred Sources</label>
+                        <input id="cdp-derivation-max-sources" class="form-control form-control-sm" type="number" min="1" step="1" placeholder="5">
+                    </div>
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="cdp-derivation-weight-range">Derived Source Weight Range</label>
+                        <input id="cdp-derivation-weight-range" class="form-control form-control-sm" placeholder="1.05:2.0">
+                    </div>
                 </div>
+                <label class="form-label small mb-1" for="cdp-derivation-allowlist">Derived Source Allowlist</label>
                 <input id="cdp-derivation-allowlist" class="form-control form-control-sm mb-2" placeholder="allowlist sources (comma separated)">
+                <label class="form-label small mb-1" for="cdp-derivation-blocklist">Derived Source Blocklist</label>
                 <input id="cdp-derivation-blocklist" class="form-control form-control-sm mb-2" placeholder="blocklist sources (comma separated)">
+                <label class="form-label small mb-1" for="cdp-scenario-segment-map">Scenario Segment Map (JSON)</label>
                 <textarea id="cdp-scenario-segment-map" class="form-control form-control-sm mb-2" rows="3" placeholder='{"segment":"scenario_id"}'></textarea>
+                <label class="form-label small mb-1" for="cdp-config-segment-map">Config Segment Map (JSON)</label>
                 <textarea id="cdp-config-segment-map" class="form-control form-control-sm mb-2" rows="3" placeholder='{"segment":"config_id"}'></textarea>
+                <label class="form-label small mb-1" for="cdp-segment-priority">Segment Priority (comma separated)</label>
                 <input id="cdp-segment-priority" class="form-control form-control-sm mb-2" placeholder="comma,separated,priority">
                 <button id="save-cdp-mapping" class="btn btn-sm btn-outline-primary">Save Mapping</button>
             </div>
@@ -78,11 +128,14 @@
     <div class="col-lg-6">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
-                <strong>Mapping Preview</strong>
+                <strong><span class="step-chip">4</span>Mapping Preview</strong>
                 <button id="preview-cdp-mapping" class="btn btn-sm btn-outline-secondary">Preview Mapping</button>
             </div>
             <div class="card-body">
+                <div class="section-hint">Paste a sample payload from Meiro and verify extracted traits/config before sync.</div>
+                <label class="form-label small mb-1" for="cdp-preview-payload">Sample Payload JSON</label>
                 <textarea id="cdp-preview-payload" class="form-control form-control-sm mb-2" rows="8" placeholder='{"customer_entity_id":"...","returned_attributes":{}}'></textarea>
+                <label class="form-label small mb-1" for="cdp-preview-fallback-external-id">Fallback External ID (optional)</label>
                 <input id="cdp-preview-fallback-external-id" class="form-control form-control-sm mb-2" placeholder="fallback external ID (optional)">
                 <pre id="cdp-mapping-preview-output" class="small mb-0">Paste a sample Meiro payload and run preview.</pre>
             </div>
@@ -91,12 +144,14 @@
     <div class="col-12">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
-                <strong>Profile Sync</strong>
+                <strong><span class="step-chip">5</span>Profile Sync</strong>
                 <button id="refresh-cdp-profiles" class="btn btn-sm btn-outline-secondary">Refresh</button>
             </div>
             <div class="card-body">
+                <div class="section-hint">Sync one or more external user IDs to populate internal personalization profiles.</div>
                 <div class="row g-2 mb-2">
                     <div class="col-md-9">
+                        <label class="form-label small mb-1" for="cdp-sync-external-ids">External User IDs</label>
                         <input id="cdp-sync-external-ids" class="form-control form-control-sm" placeholder="external IDs, comma separated">
                     </div>
                     <div class="col-md-3 d-grid">
@@ -122,6 +177,7 @@
                 <button id="refresh-cdp-scheduler" class="btn btn-sm btn-outline-secondary">Refresh</button>
             </div>
             <div class="card-body">
+                <div class="section-hint">Scheduler executes periodic sync in the background.</div>
                 <div id="cdp-scheduler-status" class="small text-muted mb-2">Loading...</div>
                 <button id="run-cdp-scheduler-now" class="btn btn-sm btn-outline-dark">Run Now</button>
             </div>
@@ -134,6 +190,7 @@
                 <button id="refresh-cdp-diagnostics" class="btn btn-sm btn-outline-secondary">Refresh</button>
             </div>
             <div class="card-body">
+                <div class="section-hint">Recent sync outcomes and error counts for troubleshooting.</div>
                 <div id="cdp-diagnostics-summary" class="small text-muted mb-2">Loading...</div>
                 <div class="table-responsive">
                     <table class="table table-sm mb-0">

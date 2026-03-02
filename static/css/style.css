@@ -17,6 +17,54 @@ body {
     transform: translateY(-2px);
 }
 
+.card .card-header strong {
+    letter-spacing: 0.01em;
+}
+
+.page-intro {
+    border: 1px solid #dbeafe;
+    background: #eff6ff;
+    border-radius: 0.5rem;
+    padding: 0.9rem 1rem;
+}
+
+.page-intro h2,
+.page-intro h3 {
+    margin-bottom: 0.25rem;
+}
+
+.page-intro p {
+    margin: 0;
+    color: #334155;
+}
+
+.step-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.4rem;
+    height: 1.4rem;
+    border-radius: 999px;
+    background: #0f172a;
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: 700;
+    margin-right: 0.45rem;
+}
+
+.section-hint {
+    font-size: 0.85rem;
+    color: #64748b;
+    margin-bottom: 0.65rem;
+}
+
+.field-hint {
+    display: block;
+    font-size: 0.78rem;
+    color: #64748b;
+    margin-top: 0.2rem;
+}
+
 /* Article Display */
 #article-title {
     color: #2c3e50;

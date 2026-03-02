@@ -42,6 +42,9 @@
         <div class="row">
             <aside class="col-lg-2 p-3 app-sidebar">
                 <h5 class="mb-3"><i class="fas fa-brain me-2"></i>Recommender</h5>
+                <div class="small mb-3 text-light-emphasis">
+                    Configure data sources, tune ranking logic, and validate outcomes.
+                </div>
                 <nav class="nav flex-column">
                     <a class="nav-link {% if active_page == 'recommendations' %}active{% endif %}" href="{{ url_for('recommendations_page') }}">
                         <i class="fas fa-newspaper me-2"></i>Recommendations
@@ -49,16 +52,31 @@
                     <a class="nav-link {% if active_page == 'reporting' %}active{% endif %}" href="{{ url_for('reporting_page') }}">
                         <i class="fas fa-chart-line me-2"></i>Reporting
                     </a>
+                    <a class="nav-link {% if active_page == 'ranking_lab' %}active{% endif %}" href="{{ url_for('ranking_lab_page') }}">
+                        <i class="fas fa-flask me-2"></i>Ranking Lab
+                    </a>
                     <a class="nav-link {% if active_page == 'operations' %}active{% endif %}" href="{{ url_for('operations_page') }}">
                         <i class="fas fa-sliders-h me-2"></i>Operations
                     </a>
                     <a class="nav-link {% if active_page == 'cdp' %}active{% endif %}" href="{{ url_for('cdp_page') }}">
                         <i class="fas fa-id-card me-2"></i>CDP
                     </a>
+                    <a class="nav-link {% if active_page == 'embeddings' %}active{% endif %}" href="{{ url_for('embeddings_page') }}">
+                        <i class="fas fa-microchip me-2"></i>Embeddings
+                    </a>
                     <a class="nav-link {% if active_page == 'runs' %}active{% endif %}" href="{{ url_for('runs_page') }}">
                         <i class="fas fa-history me-2"></i>Run Explorer
                     </a>
                 </nav>
+                <hr class="border-secondary my-3">
+                <div class="small">
+                    <div class="mb-1 fw-semibold">Suggested flow</div>
+                    <div class="text-light-emphasis">1. Operations</div>
+                    <div class="text-light-emphasis">2. CDP</div>
+                    <div class="text-light-emphasis">3. Embeddings</div>
+                    <div class="text-light-emphasis">4. Recommendations</div>
+                    <div class="text-light-emphasis">5. Reporting</div>
+                </div>
             </aside>
             <main class="col-lg-10 p-4 app-main">
                 {% block content %}{% endblock %}

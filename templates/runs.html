@@ -1,11 +1,17 @@
 {% extends "base.html" %}
 {% block content %}
+<div class="page-intro mb-4">
+    <h3 class="mb-1">Recommendation Run Explorer</h3>
+    <p>Select a recent run to inspect request context, ranked items, and full decision-flow reasoning.</p>
+</div>
+
 <div class="card">
     <div class="card-header d-flex justify-content-between align-items-center">
         <h3 class="mb-0">Recommendation Run Explorer</h3>
         <button id="refresh-run-explorer" class="btn btn-sm btn-outline-secondary">Refresh</button>
     </div>
     <div class="card-body">
+        <div class="section-hint">Increase the run limit when doing deeper audits or incident reconstruction.</div>
         <div class="row g-2 mb-2">
             <div class="col-md-3">
                 <label class="form-label small mb-1" for="run-limit">Recent runs</label>

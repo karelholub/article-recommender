@@ -2,16 +2,15 @@
 {% block content %}
 <div class="row">
     <div class="col-xl-8">
-        <div class="card mb-4">
-            <div class="card-body">
-                <h3 class="card-title">Recommendation Workspace</h3>
-                <p class="text-muted mb-0">Explore article similarity, source filters, ranking config, and scenario logic.</p>
-            </div>
+        <div class="page-intro mb-4">
+            <h3 class="mb-1">Recommendation Workspace</h3>
+            <p>Run recommendations in this order: choose controls on the right, pick an article, then inspect similar results and decision details.</p>
         </div>
 
         <div class="card mb-4">
-            <div class="card-header"><strong>Current Article</strong></div>
+            <div class="card-header"><strong><span class="step-chip">1</span>Choose Current Article</strong></div>
             <div class="card-body">
+                <div class="section-hint">Start from a representative article. Similarity and ranking previews are computed from this context.</div>
                 <h5 id="article-title"></h5>
                 <p id="article-content" class="mb-3"></p>
                 <div class="d-flex gap-2">
@@ -22,16 +21,19 @@
         </div>
 
         <div id="similar-articles" class="card mb-4" style="display:none;">
-            <div class="card-header"><strong>Similar Articles</strong></div>
+            <div class="card-header"><strong><span class="step-chip">2</span>Inspect Similar Articles</strong></div>
             <div class="card-body"><div id="similar-list"></div></div>
         </div>
 
         <div class="card mb-4">
             <div class="card-header d-flex justify-content-between">
-                <strong>Decision Context</strong>
+                <strong><span class="step-chip">3</span>Decision Context</strong>
                 <button id="refresh-decision-context" class="btn btn-sm btn-outline-secondary">Refresh</button>
             </div>
-            <div class="card-body"><pre id="decision-context" class="small mb-0">Loading...</pre></div>
+            <div class="card-body">
+                <div class="section-hint">Shows the effective configuration after applying defaults, scenario overrides, and runtime selections.</div>
+                <pre id="decision-context" class="small mb-0">Loading...</pre>
+            </div>
         </div>
 
         <div class="card mb-4">
@@ -42,32 +44,54 @@
 
     <div class="col-xl-4">
         <div class="card mb-4">
-            <div class="card-header"><strong>Recommendation Controls</strong></div>
+            <div class="card-header"><strong><span class="step-chip">A</span>Recommendation Controls</strong></div>
             <div class="card-body">
-                <label class="form-label">Ranking Configuration</label>
+                <div class="section-hint">These controls affect every recommendation request in this workspace.</div>
+                <label class="form-label mb-1">Ranking Configuration</label>
                 <select id="ranking-config" class="form-select mb-2"></select>
-                <label class="form-label">Scenario</label>
+                <small class="field-hint">Pick a baseline strategy version for scoring and weights.</small>
+                <label class="form-label mt-2 mb-1">Scenario</label>
                 <select id="scenario-select" class="form-select mb-2"><option value="">No scenario</option></select>
-                <label class="form-label">External User ID</label>
+                <small class="field-hint">Optional runtime rule set for topical or business constraints.</small>
+                <label class="form-label mt-2 mb-1">External User ID</label>
                 <input id="external-user-id" class="form-control mb-2" placeholder="customer-123">
-                <label class="form-label">Sources</label>
+                <small class="field-hint">Use a stable external ID for cross-device personalization.</small>
+                <label class="form-label mt-2 mb-1">Allowed Sources</label>
                 <div id="source-filters" class="small text-muted mb-2">Loading sources...</div>
                 <button id="save-source-settings" class="btn btn-sm btn-outline-secondary">Save Source Defaults</button>
+                <small class="field-hint">Persist source enablement and default per-source weights.</small>
             </div>
         </div>
 
         <div class="card mb-4">
-            <div class="card-header"><strong>Ranking Config Editor</strong></div>
+            <div class="card-header"><strong><span class="step-chip">B</span>Ranking Config Editor</strong></div>
             <div class="card-body">
-                <input id="ranking-config-id" class="form-control form-control-sm mb-2" placeholder="config_id">
+                <div class="section-hint">Create or tune a named configuration version, then select it above to test.</div>
+                <label class="form-label small mb-1" for="ranking-config-id">Config ID</label>
+                <input id="ranking-config-id" class="form-control form-control-sm mb-2" placeholder="balanced_news_v2">
                 <div class="row g-2 mb-2">
-                    <div class="col-6"><input id="weight-semantic" class="form-control form-control-sm" type="number" step="0.01" placeholder="semantic"></div>
-                    <div class="col-6"><input id="weight-freshness" class="form-control form-control-sm" type="number" step="0.01" placeholder="freshness"></div>
-                    <div class="col-6"><input id="weight-topic" class="form-control form-control-sm" type="number" step="0.01" placeholder="topic"></div>
-                    <div class="col-6"><input id="weight-source" class="form-control form-control-sm" type="number" step="0.01" placeholder="source"></div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="weight-semantic">Semantic Weight</label>
+                        <input id="weight-semantic" class="form-control form-control-sm" type="number" step="0.01" placeholder="1.00">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="weight-freshness">Freshness Weight</label>
+                        <input id="weight-freshness" class="form-control form-control-sm" type="number" step="0.01" placeholder="0.25">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="weight-topic">Topic Weight</label>
+                        <input id="weight-topic" class="form-control form-control-sm" type="number" step="0.01" placeholder="0.15">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="weight-source">Source Weight</label>
+                        <input id="weight-source" class="form-control form-control-sm" type="number" step="0.01" placeholder="0.10">
+                    </div>
                 </div>
-                <input id="ranking-time-decay-days" class="form-control form-control-sm mb-2" type="number" min="1" placeholder="time_decay_days">
+                <label class="form-label small mb-1" for="ranking-time-decay-days">Time Decay (days)</label>
+                <input id="ranking-time-decay-days" class="form-control form-control-sm mb-2" type="number" min="1" placeholder="7">
+                <label class="form-label small mb-1" for="ranking-source-weights-json">Source Weights JSON (optional)</label>
                 <textarea id="ranking-source-weights-json" class="form-control form-control-sm mb-2" rows="3" placeholder='{"www.e15.cz":1.1}'></textarea>
+                <small class="field-hint">Use source domain keys with multiplier values.</small>
                 <div class="d-flex gap-2">
                     <button id="save-ranking-config" class="btn btn-sm btn-outline-primary">Save</button>
                     <button id="delete-ranking-config" class="btn btn-sm btn-outline-danger">Delete</button>
@@ -76,16 +100,34 @@
             </div>
         </div>
         <div class="card mb-4">
-            <div class="card-header"><strong>Feedback Auto-Tune</strong></div>
+            <div class="card-header"><strong><span class="step-chip">C</span>Feedback Auto-Tune</strong></div>
             <div class="card-body">
-                <div class="small text-muted mb-2">Adjust source weights from historical CTR signal with guardrails.</div>
+                <div class="section-hint">Estimate source-weight adjustments from historical CTR while enforcing min/max guardrails.</div>
                 <div class="row g-2 mb-2">
-                    <div class="col-6"><input id="autotune-days" class="form-control form-control-sm" type="number" min="1" max="365" value="30" placeholder="days"></div>
-                    <div class="col-6"><input id="autotune-min-impressions" class="form-control form-control-sm" type="number" min="1" value="50" placeholder="min impressions"></div>
-                    <div class="col-6"><input id="autotune-learning-rate" class="form-control form-control-sm" type="number" min="0.01" max="2" step="0.01" value="0.5" placeholder="learning rate"></div>
-                    <div class="col-6"><input id="autotune-max-delta" class="form-control form-control-sm" type="number" min="0.01" max="1" step="0.01" value="0.25" placeholder="max delta"></div>
-                    <div class="col-6"><input id="autotune-min-weight" class="form-control form-control-sm" type="number" min="0.1" max="5" step="0.1" value="0.5" placeholder="min weight"></div>
-                    <div class="col-6"><input id="autotune-max-weight" class="form-control form-control-sm" type="number" min="0.1" max="10" step="0.1" value="3.0" placeholder="max weight"></div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="autotune-days">Lookback Days</label>
+                        <input id="autotune-days" class="form-control form-control-sm" type="number" min="1" max="365" value="30" placeholder="30">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="autotune-min-impressions">Min Impressions</label>
+                        <input id="autotune-min-impressions" class="form-control form-control-sm" type="number" min="1" value="50" placeholder="50">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="autotune-learning-rate">Learning Rate</label>
+                        <input id="autotune-learning-rate" class="form-control form-control-sm" type="number" min="0.01" max="2" step="0.01" value="0.5" placeholder="0.50">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="autotune-max-delta">Max Delta</label>
+                        <input id="autotune-max-delta" class="form-control form-control-sm" type="number" min="0.01" max="1" step="0.01" value="0.25" placeholder="0.25">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="autotune-min-weight">Min Weight</label>
+                        <input id="autotune-min-weight" class="form-control form-control-sm" type="number" min="0.1" max="5" step="0.1" value="0.5" placeholder="0.5">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="autotune-max-weight">Max Weight</label>
+                        <input id="autotune-max-weight" class="form-control form-control-sm" type="number" min="0.1" max="10" step="0.1" value="3.0" placeholder="3.0">
+                    </div>
                 </div>
                 <div class="d-flex gap-2 mb-2">
                     <button id="preview-autotune" class="btn btn-sm btn-outline-secondary">Preview</button>
@@ -96,32 +138,52 @@
         </div>
 
         <div class="card mb-4">
-            <div class="card-header"><strong>Scenario Config</strong></div>
+            <div class="card-header"><strong><span class="step-chip">D</span>Scenario Config</strong></div>
             <div class="card-body">
-                <input id="scenario-id" class="form-control form-control-sm mb-2" placeholder="scenario_id">
-                <input id="scenario-name" class="form-control form-control-sm mb-2" placeholder="name">
-                <input id="scenario-description" class="form-control form-control-sm mb-2" placeholder="description">
+                <div class="section-hint">Define runtime rule packs (allow/deny source, section, keyword, age) and simulate before saving.</div>
+                <label class="form-label small mb-1" for="scenario-id">Scenario ID</label>
+                <input id="scenario-id" class="form-control form-control-sm mb-2" placeholder="home_registered_users">
+                <label class="form-label small mb-1" for="scenario-name">Scenario Name</label>
+                <input id="scenario-name" class="form-control form-control-sm mb-2" placeholder="Homepage - Registered Users">
+                <label class="form-label small mb-1" for="scenario-description">Description</label>
+                <input id="scenario-description" class="form-control form-control-sm mb-2" placeholder="Prioritize business and technology content for known users">
                 <div class="form-check mb-2">
                     <input id="scenario-enabled" class="form-check-input" type="checkbox" checked>
                     <label class="form-check-label small" for="scenario-enabled">Enabled</label>
                 </div>
-                <input id="rule-include-sources" class="form-control form-control-sm mb-2" placeholder="include_sources">
-                <input id="rule-exclude-sources" class="form-control form-control-sm mb-2" placeholder="exclude_sources">
-                <input id="rule-include-sections" class="form-control form-control-sm mb-2" placeholder="include_sections">
-                <input id="rule-exclude-sections" class="form-control form-control-sm mb-2" placeholder="exclude_sections">
-                <input id="rule-include-keywords" class="form-control form-control-sm mb-2" placeholder="include_keywords">
-                <input id="rule-exclude-keywords" class="form-control form-control-sm mb-2" placeholder="exclude_keywords">
-                <input id="rule-exclude-article-ids" class="form-control form-control-sm mb-2" placeholder="exclude_article_ids">
+                <label class="form-label small mb-1" for="rule-include-sources">Include Sources (comma-separated)</label>
+                <input id="rule-include-sources" class="form-control form-control-sm mb-2" placeholder="www.e15.cz, www.idnes.cz">
+                <label class="form-label small mb-1" for="rule-exclude-sources">Exclude Sources (comma-separated)</label>
+                <input id="rule-exclude-sources" class="form-control form-control-sm mb-2" placeholder="example.com">
+                <label class="form-label small mb-1" for="rule-include-sections">Include Sections (comma-separated)</label>
+                <input id="rule-include-sections" class="form-control form-control-sm mb-2" placeholder="technology, economy">
+                <label class="form-label small mb-1" for="rule-exclude-sections">Exclude Sections (comma-separated)</label>
+                <input id="rule-exclude-sections" class="form-control form-control-sm mb-2" placeholder="sports">
+                <label class="form-label small mb-1" for="rule-include-keywords">Include Keywords (comma-separated)</label>
+                <input id="rule-include-keywords" class="form-control form-control-sm mb-2" placeholder="inflation, ai, energy">
+                <label class="form-label small mb-1" for="rule-exclude-keywords">Exclude Keywords (comma-separated)</label>
+                <input id="rule-exclude-keywords" class="form-control form-control-sm mb-2" placeholder="casino, gossip">
+                <label class="form-label small mb-1" for="rule-exclude-article-ids">Exclude Article IDs (comma-separated)</label>
+                <input id="rule-exclude-article-ids" class="form-control form-control-sm mb-2" placeholder="article_1, article_2">
                 <div class="row g-2 mb-2">
-                    <div class="col-6"><input id="rule-max-age-days" class="form-control form-control-sm" type="number" min="0" placeholder="max_age_days"></div>
-                    <div class="col-6"><input id="rule-min-score" class="form-control form-control-sm" type="number" min="0" step="0.0001" placeholder="min_score"></div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="rule-max-age-days">Max Age (days)</label>
+                        <input id="rule-max-age-days" class="form-control form-control-sm" type="number" min="0" placeholder="7">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="rule-min-score">Minimum Score</label>
+                        <input id="rule-min-score" class="form-control form-control-sm" type="number" min="0" step="0.0001" placeholder="0.1000">
+                    </div>
                 </div>
+                <label class="form-label small mb-1" for="rule-ranking-config-id">Override Ranking Config (optional)</label>
                 <select id="rule-ranking-config-id" class="form-select form-select-sm mb-2"><option value="">None</option></select>
+                <label class="form-label small mb-1" for="rule-source-boosts-json">Source Boosts JSON</label>
                 <textarea id="rule-source-boosts-json" class="form-control form-control-sm mb-2" rows="2" placeholder='{"www.e15.cz":1.2}'></textarea>
                 <div class="d-flex gap-2 mb-2">
                     <button id="apply-rule-builder" class="btn btn-sm btn-outline-secondary">Apply to JSON</button>
                     <button id="load-rule-builder" class="btn btn-sm btn-outline-secondary">Load from JSON</button>
                 </div>
+                <label class="form-label small mb-1" for="scenario-rule-set">Rule JSON</label>
                 <textarea id="scenario-rule-set" class="form-control form-control-sm mb-2" rows="5"></textarea>
                 <div class="d-flex gap-2 mb-2">
                     <button id="save-scenario" class="btn btn-sm btn-outline-primary">Save</button>
@@ -143,6 +205,7 @@
         <div class="card mt-4">
             <div class="card-header"><strong>Batch Recommendation API Playground</strong></div>
             <div class="card-body">
+                <div class="section-hint">Test multiple recommendation requests in one call. Useful for Postman parity checks and load sampling.</div>
                 <textarea id="batch-recommendation-requests" class="form-control form-control-sm mb-2" rows="7" placeholder='[{"request_id":"u1-home","user_id":"demo_user","top_n":3},{"request_id":"u2-home","user_id":"demo_user","top_n":3}]'></textarea>
                 <div class="d-flex gap-2 mb-2">
                     <button id="run-batch-recommendations" class="btn btn-sm btn-outline-primary">Run Batch</button>

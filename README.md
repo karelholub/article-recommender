@@ -153,8 +153,10 @@ python embed.py
 - `GET /`: Main page
 - `GET /recommendations`: Recommendation workspace UI
 - `GET /reporting`: Reporting workspace UI
+- `GET /ranking-lab`: Ranking Lab UI (side-by-side config evaluation + explainability)
 - `GET /operations`: Operations/observability UI
 - `GET /runs`: Recommendation run explorer UI
+- `GET /embeddings`: Embedding pipeline UI (model settings + re-embed controls)
 - `GET /api/articles`: All available articles
 - `GET /api/sources`: Available source domains and article counts
 - `GET /api/source-settings`: Source defaults (`enabled`, `default_weight`)
@@ -243,6 +245,16 @@ Meiro mapping also supports derivation guardrails:
 - `GET /api/engine/config`: Full runtime engine configuration snapshot (sources/configs/scenarios/scheduler)
   - alias: `/api/v1/engine/config`
 - `GET /api/observability/overview?days=7`: SLA-oriented operational snapshot (recommendation latency stats, events throughput, connector failure rate)
+- `GET /api/embeddings/config`: Current embedding model/runtime settings + allowlist
+- `PUT /api/embeddings/config`: Update embedding settings (`model_name`, `batch_size`, `max_length`, normalization/progress flags)
+- `GET /api/embeddings/status`: Embedding job runtime status
+- `POST /api/embeddings/run`: Trigger embedding regeneration (`force_update=false|true`)
+
+- `GET /api/ranking-lab/contexts`: Sample real recommendation contexts for lab runs
+- `POST /api/ranking-lab/compare`: Side-by-side baseline vs candidate compare over sampled contexts
+- `GET /api/ranking-lab/evaluations`: Saved ranking lab evaluation history
+- `POST /api/ranking-lab/evaluations`: Run + persist ranking lab evaluation snapshot
+- `GET /api/ranking-lab/evaluations/{snapshot_id}`: Retrieve one evaluation + rehydrate payload for lab controls
 - `GET /api/observability/sli?days=7`: SLI check status (`pass|warn`) against configured thresholds
 - `GET /api/alerts/thresholds`: current alert/SLO threshold config
 - `PUT /api/alerts/thresholds`: update alert/SLO thresholds

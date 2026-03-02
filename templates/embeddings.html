@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+    <div class="col-12">
+        <div class="page-intro">
+            <h3 class="mb-1">Embeddings Workspace</h3>
+            <p>Choose a sentence-transformer model and runtime parameters, save them, then run incremental or full embedding jobs.</p>
+        </div>
+    </div>
+
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong><span class="step-chip">1</span>Embedding Model Settings</strong>
+                <button id="refresh-embedding-config" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="section-hint">Model settings are applied when new embeddings are generated.</div>
+                <label class="form-label small mb-1" for="embedding-model-name">Model</label>
+                <select id="embedding-model-name" class="form-select form-select-sm mb-2"></select>
+                <small class="field-hint">Use smaller models for faster updates and larger ones for richer semantics.</small>
+                <div class="row g-2 mb-2">
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="embedding-batch-size">Batch size</label>
+                        <input id="embedding-batch-size" class="form-control form-control-sm" type="number" min="1" max="128" step="1">
+                        <small class="field-hint">Larger batch improves throughput but increases memory usage.</small>
+                    </div>
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="embedding-max-length">Max length</label>
+                        <input id="embedding-max-length" class="form-control form-control-sm" type="number" min="64" max="4096" step="1">
+                        <small class="field-hint">Texts longer than this value are truncated during encoding.</small>
+                    </div>
+                </div>
+                <div class="form-check mb-2">
+                    <input id="embedding-normalize" class="form-check-input" type="checkbox">
+                    <label class="form-check-label small" for="embedding-normalize">Normalize embeddings</label>
+                </div>
+                <div class="form-check mb-2">
+                    <input id="embedding-show-progress" class="form-check-input" type="checkbox">
+                    <label class="form-check-label small" for="embedding-show-progress">Show model progress bar (server logs)</label>
+                </div>
+                <button id="save-embedding-config" class="btn btn-sm btn-outline-primary">Save Settings</button>
+                <div id="embedding-config-status" class="small text-muted mt-2">Idle.</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong><span class="step-chip">2</span>Embedding Job</strong>
+                <button id="refresh-embedding-status" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="section-hint">Use incremental mode for daily operation. Use full re-embed after model or truncation changes.</div>
+                <div class="d-flex gap-2 mb-2">
+                    <button id="run-embedding-incremental" class="btn btn-sm btn-outline-success">Re-embed Changed Only</button>
+                    <button id="run-embedding-full" class="btn btn-sm btn-outline-danger">Full Re-embed</button>
+                </div>
+                <div id="embedding-job-status" class="small text-muted mb-2">No run yet.</div>
+                <pre id="embedding-job-result" class="small mb-0">No job result yet.</pre>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

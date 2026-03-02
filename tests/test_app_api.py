@@ -19,6 +19,70 @@ def test_health_endpoints():
     assert ready.status_code in (200, 503)
 
 
+def test_workspace_pages_available():
+    client = app.test_client()
+    for path in ['/recommendations', '/reporting', '/operations', '/cdp', '/embeddings', '/runs', '/ranking-lab']:
+        resp = client.get(path)
+        assert resp.status_code == 200
+
+
+def test_embeddings_config_and_run_endpoints(monkeypatch, tmp_path):
+    client = app.test_client()
+    cfg_path = tmp_path / "embedding_settings.json"
+    monkeypatch.setattr('app._embedding_config_path', lambda: str(cfg_path))
+
+    get_resp = client.get('/api/embeddings/config')
+    assert get_resp.status_code == 200
+    payload = get_resp.get_json()
+    assert 'config' in payload
+    assert 'allowed_models' in payload
+    model_name = payload['config']['model_name']
+
+    put_resp = client.put(
+        '/api/embeddings/config',
+        json={
+            'config': {
+                'model_name': model_name,
+                'batch_size': 8,
+                'max_length': 512,
+                'normalize_embeddings': True,
+                'show_progress_bar': False,
+            },
+        },
+    )
+    assert put_resp.status_code == 200
+    saved = put_resp.get_json()
+    assert saved['config']['batch_size'] == 8
+
+    # Backward compatibility: accept flat payload shape used by UI.
+    put_flat_resp = client.put(
+        '/api/embeddings/config',
+        json={
+            'model_name': model_name,
+            'batch_size': 12,
+            'max_length': 384,
+            'normalize_embeddings': True,
+            'show_progress_bar': False,
+        },
+    )
+    assert put_flat_resp.status_code == 200
+    saved_flat = put_flat_resp.get_json()
+    assert saved_flat['config']['batch_size'] == 12
+    assert saved_flat['config']['max_length'] == 384
+
+    monkeypatch.setattr('app._start_embedding_job', lambda force_update, triggered_by='manual': 'job-test-1')
+    run_resp = client.post('/api/embeddings/run', json={'force_update': False})
+    assert run_resp.status_code == 202
+    run_payload = run_resp.get_json()
+    assert run_payload['job_id'] == 'job-test-1'
+
+    status_resp = client.get('/api/embeddings/status')
+    assert status_resp.status_code == 200
+    status_payload = status_resp.get_json()
+    assert 'state' in status_payload
+    assert 'config' in status_payload
+
+
 def test_sources_endpoint():
     client = app.test_client()
     response = client.get('/api/sources')
@@ -32,6 +96,66 @@ def test_sources_endpoint():
         first = payload['sources'][0]
         assert 'enabled' in first
         assert 'default_weight' in first
+
+
+def test_ranking_lab_endpoints():
+    client = app.test_client()
+
+    contexts_resp = client.get('/api/ranking-lab/contexts?days=365&limit=5')
+    assert contexts_resp.status_code == 200
+    contexts_payload = contexts_resp.get_json()
+    assert 'contexts' in contexts_payload
+    assert isinstance(contexts_payload['contexts'], list)
+
+    compare_resp = client.post(
+        '/api/ranking-lab/compare',
+        json={
+            'baseline_config_id': 'balanced',
+            'candidate_config_id': 'balanced',
+            'days': 365,
+            'top_n': 3,
+            'limit_runs': 50,
+            'max_contexts': 2,
+            'require_relevant': False,
+        },
+    )
+    assert compare_resp.status_code == 200
+    compare_payload = compare_resp.get_json()
+    assert 'overall' in compare_payload
+    assert 'contexts' in compare_payload
+    assert 'coverage_summary' in compare_payload
+
+    eval_resp = client.post(
+        '/api/ranking-lab/evaluations',
+        json={
+            'baseline_config_id': 'balanced',
+            'candidate_config_id': 'balanced',
+            'days': 365,
+            'top_n': 3,
+            'limit_runs': 50,
+            'max_contexts': 2,
+            'require_relevant': False,
+            'context_ids': [ctx['context_id'] for ctx in contexts_payload['contexts'][:1]],
+            'label': 'test-eval',
+        },
+    )
+    assert eval_resp.status_code == 201
+    eval_payload = eval_resp.get_json()
+    assert 'evaluation' in eval_payload
+    assert 'comparison' in eval_payload
+    eval_id = eval_payload['evaluation']['snapshot_id']
+
+    history_resp = client.get('/api/ranking-lab/evaluations?limit=10')
+    assert history_resp.status_code == 200
+    history_payload = history_resp.get_json()
+    assert 'evaluations' in history_payload
+    assert isinstance(history_payload['evaluations'], list)
+
+    detail_resp = client.get(f'/api/ranking-lab/evaluations/{eval_id}')
+    assert detail_resp.status_code == 200
+    detail_payload = detail_resp.get_json()
+    assert 'rehydrate' in detail_payload
+    assert detail_payload['rehydrate']['candidate_config_id'] == 'balanced'
 
 
 def test_source_settings_update():

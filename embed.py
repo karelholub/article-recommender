@@ -20,7 +20,9 @@ class ArticleEmbedder:
         model_name: str = "paraphrase-multilingual-mpnet-base-v2",  # More powerful multilingual model
         cache_dir: str = "embeddings",
         max_length: int = 512,  # BERT's max sequence length
-        batch_size: int = 16    # Smaller batch size for larger model
+        batch_size: int = 16,   # Smaller batch size for larger model
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = True,
     ):
         self.model = SentenceTransformer(model_name)
         self.cache_dir = Path(cache_dir)
@@ -28,6 +30,8 @@ class ArticleEmbedder:
         self.embedding_cache = {}
         self.max_length = max_length
         self.batch_size = batch_size
+        self.normalize_embeddings = normalize_embeddings
+        self.show_progress_bar = show_progress_bar
         
     def _preprocess_text(self, text: str) -> str:
         """Clean and normalize text for better embedding quality"""
@@ -76,8 +80,8 @@ class ArticleEmbedder:
             batch = processed_texts[i:i + self.batch_size]
             batch_embeddings = self.model.encode(
                 batch,
-                normalize_embeddings=True,
-                show_progress_bar=True
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=self.show_progress_bar
             )
             embeddings.extend(batch_embeddings.tolist())
         

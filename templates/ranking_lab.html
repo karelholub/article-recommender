@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+    <div class="col-12">
+        <div class="page-intro">
+            <h3 class="mb-1">Ranking Lab</h3>
+            <p>Select baseline and candidate configs, evaluate them on sampled real contexts, inspect explainability side-by-side, then store evaluations.</p>
+        </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header"><strong><span class="step-chip">1</span>Lab Controls</strong></div>
+            <div class="card-body">
+                <div class="row g-2">
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="lab-window-days">Window (days)</label>
+                        <input id="lab-window-days" class="form-control form-control-sm" type="number" min="1" max="365" value="30">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="lab-context-limit">Context Limit</label>
+                        <input id="lab-context-limit" class="form-control form-control-sm" type="number" min="1" max="50" value="10">
+                    </div>
+                </div>
+                <label class="form-label small mt-2 mb-1" for="lab-baseline-config">Baseline Config</label>
+                <select id="lab-baseline-config" class="form-select form-select-sm mb-2"></select>
+                <label class="form-label small mb-1" for="lab-candidate-config">Candidate Config</label>
+                <select id="lab-candidate-config" class="form-select form-select-sm mb-2"></select>
+                <div class="row g-2 mb-2">
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="lab-top-n">Top N</label>
+                        <input id="lab-top-n" class="form-control form-control-sm" type="number" min="1" max="20" value="5">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="lab-limit-runs">Run Limit</label>
+                        <input id="lab-limit-runs" class="form-control form-control-sm" type="number" min="10" max="5000" value="300">
+                    </div>
+                </div>
+                <div class="form-check mb-2">
+                    <input id="lab-require-relevant" class="form-check-input" type="checkbox" checked>
+                    <label class="form-check-label small" for="lab-require-relevant">Require click/conversion relevance for quality metrics</label>
+                </div>
+                <div class="d-flex gap-2">
+                    <button id="load-lab-contexts" class="btn btn-sm btn-outline-secondary">Load Contexts</button>
+                    <button id="run-lab-compare" class="btn btn-sm btn-outline-primary">Run Compare</button>
+                </div>
+                <div class="d-flex gap-2 mt-2">
+                    <input id="lab-evaluation-label" class="form-control form-control-sm" placeholder="Evaluation label (optional)">
+                    <button id="save-lab-evaluation" class="btn btn-sm btn-outline-success">Save Evaluation</button>
+                </div>
+                <div class="d-flex gap-2 mt-2">
+                    <button id="lab-promote-candidate" class="btn btn-sm btn-outline-warning">Promote Candidate</button>
+                    <button id="lab-promote-guarded" class="btn btn-sm btn-outline-danger">Promote With Guard</button>
+                </div>
+                <div class="row g-2 mt-1">
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="lab-guard-min-ndcg">Min NDCG Lift</label>
+                        <input id="lab-guard-min-ndcg" class="form-control form-control-sm" type="number" step="0.001" value="0.000">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="lab-guard-min-ctr">Min CTR Lift</label>
+                        <input id="lab-guard-min-ctr" class="form-control form-control-sm" type="number" step="0.001" value="0.000">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="lab-guard-max-precision-drop">Max Precision Drop</label>
+                        <input id="lab-guard-max-precision-drop" class="form-control form-control-sm" type="number" min="0" step="0.001" value="0.020">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="lab-guard-max-recall-drop">Max Recall Drop</label>
+                        <input id="lab-guard-max-recall-drop" class="form-control form-control-sm" type="number" min="0" step="0.001" value="0.020">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="lab-guard-max-mrr-drop">Max MRR Drop</label>
+                        <input id="lab-guard-max-mrr-drop" class="form-control form-control-sm" type="number" min="0" step="0.001" value="0.020">
+                    </div>
+                </div>
+                <div id="lab-status" class="small text-muted mt-2">Idle.</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-8">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong><span class="step-chip">2</span>Sample Contexts</strong>
+                <span id="lab-context-count" class="small text-muted">0 loaded</span>
+            </div>
+            <div class="card-body">
+                <div class="section-hint">Select contexts to compare. Each context represents a real request profile (user reads + sources + scenario).</div>
+                <div class="d-flex gap-2 mb-2">
+                    <input id="lab-bookmark-name" class="form-control form-control-sm" placeholder="Context set name">
+                    <button id="save-lab-bookmark" class="btn btn-sm btn-outline-secondary">Save Set</button>
+                </div>
+                <div class="d-flex gap-2 mb-2">
+                    <select id="lab-bookmark-select" class="form-select form-select-sm">
+                        <option value="">Saved sets</option>
+                    </select>
+                    <button id="load-lab-bookmark" class="btn btn-sm btn-outline-secondary">Load Set</button>
+                    <button id="delete-lab-bookmark" class="btn btn-sm btn-outline-danger">Delete Set</button>
+                </div>
+                <select id="lab-contexts" class="form-select form-select-sm" multiple size="8"></select>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header"><strong><span class="step-chip">3</span>Comparison Summary</strong></div>
+            <div class="card-body">
+                <div class="d-flex gap-2 mb-2">
+                    <button id="export-lab-json" class="btn btn-sm btn-outline-secondary">Export JSON</button>
+                    <button id="export-lab-csv" class="btn btn-sm btn-outline-secondary">Export CSV</button>
+                </div>
+                <div id="lab-summary" class="small text-muted mb-2">Run a comparison to see metrics.</div>
+                <div class="table-responsive mb-2">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Delta %</th></tr></thead>
+                        <tbody id="lab-deltas-table"><tr><td colspan="5" class="text-muted">No comparison yet.</td></tr></tbody>
+                    </table>
+                </div>
+                <div id="lab-coverage-summary" class="small text-muted">Coverage summary unavailable.</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header"><strong><span class="step-chip">4</span>Side-by-Side Explainability</strong></div>
+            <div class="card-body">
+                <div class="section-hint">Shows top-ranked outputs for each sampled context with feature contributions and final explanation text.</div>
+                <div id="lab-side-by-side" class="small text-muted">No side-by-side results yet.</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong><span class="step-chip">5</span>Evaluation History</strong>
+                <button id="refresh-lab-history" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>Created</th><th>Label</th><th>Baseline</th><th>Candidate</th><th>Contexts</th><th>NDCG Delta</th><th>CTR Delta</th><th>Action</th></tr></thead>
+                        <tbody id="lab-history-table"><tr><td colspan="8" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

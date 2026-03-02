@@ -44,6 +44,8 @@ _cleanup_stop_event = threading.Event()
 _cdp_state_lock = threading.Lock()
 _cdp_thread: Optional[threading.Thread] = None
 _cdp_stop_event = threading.Event()
+_embedding_state_lock = threading.Lock()
+_embedding_thread: Optional[threading.Thread] = None
 _scheduler_state = {
     "enabled": False,
     "running": False,
@@ -100,6 +102,25 @@ _DEFAULT_MEIRO_MAPPING = {
     "derivation_max_preferred_sources": 5,
     "derivation_min_source_weight": 1.05,
     "derivation_max_source_weight": 2.0,
+}
+_DEFAULT_EMBEDDING_CONFIG = {
+    "model_name": os.getenv("EMBEDDING_MODEL_NAME", "paraphrase-multilingual-mpnet-base-v2"),
+    "batch_size": int(os.getenv("EMBEDDING_BATCH_SIZE", "16")),
+    "max_length": int(os.getenv("EMBEDDING_MAX_LENGTH", "512")),
+    "normalize_embeddings": os.getenv("EMBEDDING_NORMALIZE", "true").strip().lower() != "false",
+    "show_progress_bar": os.getenv("EMBEDDING_SHOW_PROGRESS", "false").strip().lower() == "true",
+}
+_embedding_state = {
+    "running": False,
+    "current_job_id": None,
+    "last_job_id": None,
+    "last_trigger": None,
+    "last_run_at": None,
+    "last_completed_at": None,
+    "last_status": None,
+    "last_error": None,
+    "last_duration_ms": None,
+    "last_result": None,
 }
 
 
@@ -657,6 +678,136 @@ def _validate_scenario_rule_set(rule_set: Dict) -> Dict:
             raise ValueError(f"source_boosts[{source}] must be greater than 0")
 
     return normalized
+
+
+def _embedding_config_path() -> str:
+    return os.getenv("EMBEDDING_CONFIG_PATH", "config/embedding_settings.json")
+
+
+def _embedding_allowed_models() -> List[str]:
+    raw = os.getenv(
+        "EMBEDDING_MODEL_ALLOWLIST",
+        "paraphrase-multilingual-mpnet-base-v2,all-MiniLM-L6-v2",
+    )
+    models = [item.strip() for item in raw.split(",") if item.strip()]
+    if _DEFAULT_EMBEDDING_CONFIG["model_name"] not in models:
+        models.append(_DEFAULT_EMBEDDING_CONFIG["model_name"])
+    return sorted(set(models))
+
+
+def _load_embedding_config() -> Dict[str, Any]:
+    cfg = dict(_DEFAULT_EMBEDDING_CONFIG)
+    path = _embedding_config_path()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                cfg.update(payload)
+    except Exception:
+        logger.exception("Failed to load embedding config; using defaults")
+    return _normalize_embedding_config(cfg)
+
+
+def _save_embedding_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_embedding_config(config)
+    path = _embedding_config_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(normalized, f, indent=2, ensure_ascii=False)
+    return normalized
+
+
+def _normalize_embedding_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    candidate = dict(_DEFAULT_EMBEDDING_CONFIG)
+    if isinstance(config, dict):
+        candidate.update(config)
+    model_name = str(candidate.get("model_name") or "").strip()
+    if not model_name:
+        raise ValueError("model_name is required")
+    allowed = _embedding_allowed_models()
+    if model_name not in allowed:
+        raise ValueError(f"model_name must be one of: {', '.join(allowed)}")
+    batch_size = int(candidate.get("batch_size", 16))
+    max_length = int(candidate.get("max_length", 512))
+    normalized = {
+        "model_name": model_name,
+        "batch_size": max(1, min(128, batch_size)),
+        "max_length": max(64, min(4096, max_length)),
+        "normalize_embeddings": bool(candidate.get("normalize_embeddings", True)),
+        "show_progress_bar": bool(candidate.get("show_progress_bar", False)),
+    }
+    return normalized
+
+
+def _run_embedding_job(job_id: str, config: Dict[str, Any], force_update: bool, triggered_by: str = "manual") -> None:
+    global _embedding_thread, _last_embed_mtime
+    started_at = datetime.now()
+    with _embedding_state_lock:
+        _embedding_state["running"] = True
+        _embedding_state["current_job_id"] = job_id
+        _embedding_state["last_job_id"] = job_id
+        _embedding_state["last_trigger"] = triggered_by
+        _embedding_state["last_run_at"] = started_at.strftime("%Y-%m-%d %H:%M:%S")
+        _embedding_state["last_status"] = "running"
+        _embedding_state["last_error"] = None
+    try:
+        from embed import ArticleEmbedder  # Lazy import; heavy dependency.
+
+        embedder = ArticleEmbedder(
+            model_name=config["model_name"],
+            max_length=config["max_length"],
+            batch_size=config["batch_size"],
+            normalize_embeddings=config["normalize_embeddings"],
+            show_progress_bar=config["show_progress_bar"],
+        )
+        vectors = embedder.embed_articles("articles", force_update=force_update)
+        if recommender:
+            recommender._load_data()
+            _last_embed_mtime = recommender.embed_file.stat().st_mtime if recommender.embed_file.exists() else _last_embed_mtime
+        finished = datetime.now()
+        with _embedding_state_lock:
+            _embedding_state["running"] = False
+            _embedding_state["current_job_id"] = None
+            _embedding_state["last_completed_at"] = finished.strftime("%Y-%m-%d %H:%M:%S")
+            _embedding_state["last_status"] = "completed"
+            _embedding_state["last_duration_ms"] = int((finished - started_at).total_seconds() * 1000)
+            _embedding_state["last_result"] = {
+                "force_update": bool(force_update),
+                "vector_count": len(vectors or {}),
+                "model_name": config["model_name"],
+            }
+    except Exception as exc:
+        finished = datetime.now()
+        with _embedding_state_lock:
+            _embedding_state["running"] = False
+            _embedding_state["current_job_id"] = None
+            _embedding_state["last_completed_at"] = finished.strftime("%Y-%m-%d %H:%M:%S")
+            _embedding_state["last_status"] = "failed"
+            _embedding_state["last_duration_ms"] = int((finished - started_at).total_seconds() * 1000)
+            _embedding_state["last_error"] = str(exc)
+            _embedding_state["last_result"] = None
+        logger.error(f"Embedding job failed: {str(exc)}")
+        logger.error(traceback.format_exc())
+
+
+def _start_embedding_job(force_update: bool, triggered_by: str = "manual") -> str:
+    global _embedding_thread
+    with _embedding_state_lock:
+        if _embedding_state["running"]:
+            raise ValueError("An embedding job is already running")
+    config = _load_embedding_config()
+    token = f"{datetime.now().timestamp()}:{config['model_name']}:{force_update}"
+    job_id = hashlib.sha1(token.encode("utf-8")).hexdigest()[:16]
+    thread = threading.Thread(
+        target=_run_embedding_job,
+        args=(job_id, config, bool(force_update), triggered_by),
+        name=f"embedding-job-{job_id}",
+        daemon=True,
+    )
+    _embedding_thread = thread
+    thread.start()
+    return job_id
 
 
 def _resolve_effective_user_id(user_id: str, external_user_id: Optional[str]) -> str:
@@ -1695,6 +1846,11 @@ def reporting_page():
     return render_template("reporting.html", active_page="reporting", title="Reporting")
 
 
+@app.route("/ranking-lab")
+def ranking_lab_page():
+    return render_template("ranking_lab.html", active_page="ranking_lab", title="Ranking Lab")
+
+
 @app.route("/operations")
 def operations_page():
     return render_template("operations.html", active_page="operations", title="Operations")
@@ -1708,6 +1864,11 @@ def runs_page():
 @app.route("/cdp")
 def cdp_page():
     return render_template("cdp.html", active_page="cdp", title="CDP Integration")
+
+
+@app.route("/embeddings")
+def embeddings_page():
+    return render_template("embeddings.html", active_page="embeddings", title="Embeddings")
 
 
 @app.route("/healthz")
@@ -1805,6 +1966,85 @@ def update_source_setting(source):
         return jsonify({"source": source, "enabled": enabled, "default_weight": default_weight})
     except Exception as e:
         logger.error(f"Error updating source setting: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/embeddings/config", methods=["GET", "PUT"])
+def embeddings_config():
+    if request.method == "GET":
+        try:
+            config = _load_embedding_config()
+            return jsonify(
+                {
+                    "config": config,
+                    "allowed_models": _embedding_allowed_models(),
+                    "config_path": _embedding_config_path(),
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error loading embedding config: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({"error": str(e)}), 500
+    try:
+        payload = request.get_json() or {}
+        current = _load_embedding_config()
+        next_config = dict(current)
+        config_payload = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+        if isinstance(config_payload, dict):
+            next_config.update(config_payload or {})
+        saved = _save_embedding_config(next_config)
+        _record_audit(
+            action="update",
+            resource_type="embedding_config",
+            resource_id="default",
+            payload=payload,
+            extra={"model_name": saved.get("model_name")},
+        )
+        return jsonify(
+            {
+                "config": saved,
+                "allowed_models": _embedding_allowed_models(),
+                "config_path": _embedding_config_path(),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error saving embedding config: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/embeddings/status", methods=["GET"])
+def embeddings_status():
+    with _embedding_state_lock:
+        state = dict(_embedding_state)
+    return jsonify(
+        {
+            "state": state,
+            "config": _load_embedding_config(),
+            "allowed_models": _embedding_allowed_models(),
+        }
+    )
+
+
+@app.route("/api/embeddings/run", methods=["POST"])
+def embeddings_run():
+    try:
+        payload = request.get_json(silent=True) or {}
+        force_update = bool(payload.get("force_update", False))
+        job_id = _start_embedding_job(force_update=force_update, triggered_by="manual")
+        _record_audit(
+            action="run",
+            resource_type="embedding_job",
+            resource_id=job_id,
+            payload=payload,
+            extra={"force_update": force_update},
+        )
+        return jsonify({"job_id": job_id, "running": True, "force_update": force_update}), 202
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    except Exception as e:
+        logger.error(f"Error starting embedding run: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
 
@@ -3826,6 +4066,333 @@ def _evaluate_promotion_guard(compare_payload: Dict[str, Any], guard: Dict[str, 
             "max_mrr_drop": max_mrr_drop,
         },
     }
+
+
+def _build_ranking_lab_contexts(days: int, limit: int) -> List[Dict[str, Any]]:
+    runs = store.list_runs_with_request(limit=max(limit * 4, 20), offset=0, days=days)
+    seen = set()
+    contexts: List[Dict[str, Any]] = []
+    for row in runs:
+        req = row.get("request") or {}
+        user_reads = req.get("user_reads") or []
+        if not isinstance(user_reads, list):
+            user_reads = []
+        selected_sources = req.get("sources") or []
+        if not isinstance(selected_sources, list):
+            selected_sources = []
+        scenario_id = str(req.get("scenario_id") or "").strip() or None
+        effective_user_id = str(req.get("effective_user_id") or row.get("user_id") or "").strip()
+        external_user_id = str(req.get("external_user_id") or "").strip() or None
+        seed_article_id = str(user_reads[0]).strip() if user_reads else None
+        key = (
+            effective_user_id,
+            external_user_id or "",
+            scenario_id or "",
+            tuple(sorted(str(source).strip() for source in selected_sources if str(source).strip())),
+            seed_article_id or "",
+        )
+        if not effective_user_id or key in seen:
+            continue
+        seen.add(key)
+        seed_title = None
+        if seed_article_id:
+            seed_title = (recommender.article_vectors.get(seed_article_id, {}).get("metadata", {}) or {}).get("title")
+        contexts.append(
+            {
+                "context_id": str(row.get("run_id") or ""),
+                "run_id": str(row.get("run_id") or ""),
+                "created_at": row.get("created_at"),
+                "user_id": str(row.get("user_id") or ""),
+                "effective_user_id": effective_user_id,
+                "external_user_id": external_user_id,
+                "scenario_id": scenario_id,
+                "sources": selected_sources,
+                "user_reads": user_reads,
+                "seed_article_id": seed_article_id,
+                "seed_article_title": seed_title,
+                "label": f"{effective_user_id} | {seed_title or seed_article_id or 'no-seed'}",
+            }
+        )
+        if len(contexts) >= limit:
+            break
+    return contexts
+
+
+def _recommend_for_lab_context(context: Dict[str, Any], config_id: str, top_n: int) -> Dict[str, Any]:
+    user_id = str(context.get("effective_user_id") or context.get("user_id") or "").strip()
+    user_reads = context.get("user_reads") or recommender.user_profiles.get(user_id, [])
+    selected_sources = context.get("sources") or []
+    scenario_id = str(context.get("scenario_id") or "").strip() or None
+    context_details = _build_decision_context(selected_sources, config_id, None)
+    selected_sources = context_details.get("selected_sources") or []
+    if not user_id or not selected_sources:
+        return {
+            "recommendations": [],
+            "scenario_trace": {"applied": False, "scenario_id": scenario_id, "filtered_out": 0, "remaining": 0, "reasons": {}},
+            "selected_sources": selected_sources,
+            "effective_config_id": context_details.get("effective_config_id"),
+        }
+    recs = recommender.recommend_for_user(
+        user_id,
+        recommender.article_vectors,
+        user_reads,
+        top_n=top_n,
+        sources=selected_sources,
+        config_id=context_details["effective_config_id"],
+        ranking_config=context_details["effective_ranking_config"],
+    )
+    scenario_trace = {"applied": False, "scenario_id": scenario_id, "filtered_out": 0, "remaining": len(recs), "reasons": {}}
+    if scenario_id:
+        scenario = store.get_scenario(scenario_id)
+        if scenario and scenario.get("enabled", True):
+            recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
+    recs = recs[: max(1, top_n)]
+    return {
+        "recommendations": recs,
+        "scenario_trace": scenario_trace,
+        "selected_sources": selected_sources,
+        "effective_config_id": context_details.get("effective_config_id"),
+    }
+
+
+def _compute_ranking_lab_compare_payload(
+    baseline_config_id: str,
+    candidate_config_id: str,
+    days: int,
+    limit_runs: int,
+    limit_events: int,
+    top_n: int,
+    require_relevant: bool,
+    max_contexts: int,
+    context_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    overall = _compute_offline_config_compare_result(
+        baseline_config_id=baseline_config_id,
+        candidate_config_id=candidate_config_id,
+        days=days,
+        limit_runs=limit_runs,
+        limit_events=limit_events,
+        top_n=top_n,
+        require_relevant=require_relevant,
+    )
+    context_pool = _build_ranking_lab_contexts(days=days, limit=max(max_contexts * 2, 20))
+    requested_context_ids = set(str(item).strip() for item in (context_ids or []) if str(item).strip())
+    if requested_context_ids:
+        selected_contexts = [ctx for ctx in context_pool if ctx.get("context_id") in requested_context_ids]
+    else:
+        selected_contexts = context_pool[:max_contexts]
+    selected_contexts = selected_contexts[:max_contexts]
+
+    detailed_rows = []
+    top_article_ids = set()
+    overlap_total = 0.0
+    for context in selected_contexts:
+        baseline_pack = _recommend_for_lab_context(context, baseline_config_id, top_n)
+        candidate_pack = _recommend_for_lab_context(context, candidate_config_id, top_n)
+        baseline_recs = baseline_pack.get("recommendations") or []
+        candidate_recs = candidate_pack.get("recommendations") or []
+        baseline_ids = [item.get("article_id") for item in baseline_recs if item.get("article_id")]
+        candidate_ids = [item.get("article_id") for item in candidate_recs if item.get("article_id")]
+        if baseline_ids or candidate_ids:
+            overlap = len(set(baseline_ids) & set(candidate_ids)) / max(1, top_n)
+        else:
+            overlap = 0.0
+        overlap_total += overlap
+        top_article_ids.update(baseline_ids[:1])
+        top_article_ids.update(candidate_ids[:1])
+        detailed_rows.append(
+            {
+                "context_id": context.get("context_id"),
+                "run_id": context.get("run_id"),
+                "label": context.get("label"),
+                "seed_article_id": context.get("seed_article_id"),
+                "seed_article_title": context.get("seed_article_title"),
+                "effective_user_id": context.get("effective_user_id"),
+                "external_user_id": context.get("external_user_id"),
+                "scenario_id": context.get("scenario_id"),
+                "sources": context.get("sources") or [],
+                "overlap_at_k": round(overlap, 4),
+                "baseline": {
+                    "config_id": baseline_pack.get("effective_config_id") or baseline_config_id,
+                    "selected_sources": baseline_pack.get("selected_sources") or [],
+                    "scenario_trace": baseline_pack.get("scenario_trace") or {},
+                    "recommendations": baseline_recs,
+                },
+                "candidate": {
+                    "config_id": candidate_pack.get("effective_config_id") or candidate_config_id,
+                    "selected_sources": candidate_pack.get("selected_sources") or [],
+                    "scenario_trace": candidate_pack.get("scenario_trace") or {},
+                    "recommendations": candidate_recs,
+                },
+            }
+        )
+
+    coverage_summary = {
+        "contexts_selected": len(detailed_rows),
+        "avg_overlap_at_k": round((overlap_total / len(detailed_rows)), 6) if detailed_rows else 0.0,
+        "unique_top_articles": len(top_article_ids),
+    }
+
+    return {
+        "api_version": "v1",
+        "baseline_config_id": baseline_config_id,
+        "candidate_config_id": candidate_config_id,
+        "window_days": days,
+        "top_n": top_n,
+        "limit_runs": limit_runs,
+        "require_relevant": require_relevant,
+        "overall": overall,
+        "coverage_summary": coverage_summary,
+        "contexts": detailed_rows,
+    }
+
+
+@app.route("/api/ranking-lab/contexts", methods=["GET"])
+def ranking_lab_contexts():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        limit = max(1, min(50, int(request.args.get("limit", 10))))
+        contexts = _build_ranking_lab_contexts(days=days, limit=limit)
+        return jsonify({"api_version": "v1", "days": days, "count": len(contexts), "contexts": contexts})
+    except Exception as e:
+        logger.error(f"Error loading ranking lab contexts: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ranking-lab/compare", methods=["POST"])
+def ranking_lab_compare():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json(silent=True) or {}
+        days = max(1, min(365, int(payload.get("days", 30))))
+        limit_runs = max(10, min(5000, int(payload.get("limit_runs", 300))))
+        limit_events = max(1000, min(200000, int(payload.get("limit_events", 100000))))
+        top_n = max(1, min(20, int(payload.get("top_n", 5))))
+        max_contexts = max(1, min(20, int(payload.get("max_contexts", 10))))
+        baseline_config_id = str(payload.get("baseline_config_id", "balanced")).strip() or "balanced"
+        candidate_config_id = str(payload.get("candidate_config_id", "")).strip()
+        if not candidate_config_id:
+            return jsonify({"error": "candidate_config_id is required"}), 400
+        require_relevant = bool(payload.get("require_relevant", True))
+        context_ids = payload.get("context_ids") or []
+        compare_payload = _compute_ranking_lab_compare_payload(
+            baseline_config_id=baseline_config_id,
+            candidate_config_id=candidate_config_id,
+            days=days,
+            limit_runs=limit_runs,
+            limit_events=limit_events,
+            top_n=top_n,
+            require_relevant=require_relevant,
+            max_contexts=max_contexts,
+            context_ids=context_ids,
+        )
+        return jsonify(compare_payload)
+    except Exception as e:
+        logger.error(f"Error running ranking lab compare: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ranking-lab/evaluations", methods=["GET", "POST"])
+def ranking_lab_evaluations():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        if request.method == "GET":
+            limit = max(1, min(100, int(request.args.get("limit", 20))))
+            rows = store.list_quality_snapshots(snapshot_type="ranking_lab_evaluation", limit=limit, offset=0)
+            return jsonify({"api_version": "v1", "count": len(rows), "evaluations": rows})
+
+        if not recommender:
+            return jsonify({"error": "Recommender not initialized"}), 500
+        payload = request.get_json(silent=True) or {}
+        if not str(payload.get("candidate_config_id", "")).strip():
+            return jsonify({"error": "candidate_config_id is required"}), 400
+        compare_payload = _compute_ranking_lab_compare_payload(
+            baseline_config_id=str(payload.get("baseline_config_id", "balanced")).strip() or "balanced",
+            candidate_config_id=str(payload.get("candidate_config_id", "")).strip(),
+            days=max(1, min(365, int(payload.get("days", 30)))),
+            limit_runs=max(10, min(5000, int(payload.get("limit_runs", 300)))),
+            limit_events=max(1000, min(200000, int(payload.get("limit_events", 100000)))),
+            top_n=max(1, min(20, int(payload.get("top_n", 5)))),
+            require_relevant=bool(payload.get("require_relevant", True)),
+            max_contexts=max(1, min(20, int(payload.get("max_contexts", 10)))),
+            context_ids=payload.get("context_ids") or [],
+        )
+        overall = compare_payload.get("overall") or {}
+        baseline_metrics = overall.get("baseline_metrics") or {}
+        candidate_metrics = overall.get("candidate_metrics") or {}
+        snapshot_metrics = {
+            "baseline_ndcg_at_k": float(baseline_metrics.get("ndcg_at_k", 0.0)),
+            "candidate_ndcg_at_k": float(candidate_metrics.get("ndcg_at_k", 0.0)),
+            "delta_ndcg_at_k": float(candidate_metrics.get("ndcg_at_k", 0.0)) - float(baseline_metrics.get("ndcg_at_k", 0.0)),
+            "baseline_historical_ctr": float(baseline_metrics.get("historical_ctr", 0.0)),
+            "candidate_historical_ctr": float(candidate_metrics.get("historical_ctr", 0.0)),
+            "delta_historical_ctr": float(candidate_metrics.get("historical_ctr", 0.0)) - float(baseline_metrics.get("historical_ctr", 0.0)),
+            "contexts_selected": int((compare_payload.get("coverage_summary") or {}).get("contexts_selected", 0)),
+            "avg_overlap_at_k": float((compare_payload.get("coverage_summary") or {}).get("avg_overlap_at_k", 0.0)),
+        }
+        metadata = {
+            "label": str(payload.get("label", "")).strip(),
+            "created_by": _request_actor_id(payload),
+            "baseline_config_id": compare_payload.get("baseline_config_id"),
+            "candidate_config_id": compare_payload.get("candidate_config_id"),
+            "top_n": compare_payload.get("top_n"),
+            "window_days": compare_payload.get("window_days"),
+            "limit_runs": max(10, min(5000, int(payload.get("limit_runs", 300)))),
+            "require_relevant": compare_payload.get("require_relevant"),
+            "context_ids": [str(item).strip() for item in (payload.get("context_ids") or []) if str(item).strip()],
+            "runs_evaluated": int((overall.get("runs_evaluated") or 0)),
+            "coverage_summary": compare_payload.get("coverage_summary") or {},
+        }
+        snapshot = store.create_quality_snapshot(
+            snapshot_type="ranking_lab_evaluation",
+            window_days=int(compare_payload.get("window_days") or 30),
+            metrics=snapshot_metrics,
+            metadata=metadata,
+        )
+        _record_audit(
+            action="create",
+            resource_type="ranking_lab_evaluation",
+            resource_id=snapshot.get("snapshot_id"),
+            payload=payload,
+            extra={"baseline_config_id": compare_payload.get("baseline_config_id"), "candidate_config_id": compare_payload.get("candidate_config_id")},
+        )
+        return jsonify({"api_version": "v1", "evaluation": snapshot, "comparison": compare_payload}), 201
+    except Exception as e:
+        logger.error(f"Error handling ranking lab evaluations: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ranking-lab/evaluations/<snapshot_id>", methods=["GET"])
+def ranking_lab_evaluation_detail(snapshot_id: str):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        row = store.get_quality_snapshot(snapshot_id)
+        if not row or str(row.get("snapshot_type")) != "ranking_lab_evaluation":
+            return jsonify({"error": "Evaluation not found"}), 404
+        meta = row.get("metadata") or {}
+        rehydrate = {
+            "baseline_config_id": str(meta.get("baseline_config_id") or "balanced").strip() or "balanced",
+            "candidate_config_id": str(meta.get("candidate_config_id") or "").strip(),
+            "days": max(1, min(365, int(meta.get("window_days") or row.get("window_days") or 30))),
+            "top_n": max(1, min(20, int(meta.get("top_n") or 5))),
+            "limit_runs": max(10, min(5000, int(meta.get("limit_runs") or 300))),
+            "require_relevant": bool(meta.get("require_relevant", True)),
+            "context_ids": [str(item).strip() for item in (meta.get("context_ids") or []) if str(item).strip()],
+            "label": str(meta.get("label") or "").strip(),
+        }
+        return jsonify({"api_version": "v1", "evaluation": row, "rehydrate": rehydrate})
+    except Exception as e:
+        logger.error(f"Error loading ranking lab evaluation detail: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/metrics/offline/config-compare", methods=["GET"])
