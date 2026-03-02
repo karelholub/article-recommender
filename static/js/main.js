@@ -18,6 +18,8 @@ let reportingLastPayload = null;
 let reportingLastAttribution = null;
 let reportingLastIdentity = null;
 let reportingLastScenarioTraces = null;
+let reportingLastIdentityDiagnostics = null;
+let reportingLastExperiments = null;
 let recommendationRuns = [];
 
 function hasElement(id) {
@@ -1664,6 +1666,57 @@ function renderIdentityMetrics(payload) {
     }
 }
 
+function renderIdentityDiagnostics(payload) {
+    reportingLastIdentityDiagnostics = payload;
+    const summary = payload.summary || {};
+    const summaryEl = document.getElementById('reporting-identity-diagnostics-summary');
+    if (summaryEl) {
+        summaryEl.innerHTML = `
+            <strong>Identity diagnostics:</strong>
+            orphan external events ${summary.orphan_external_events ?? 0},
+            unknown-run external events ${summary.unknown_run_external_events ?? 0},
+            mismatch events ${summary.run_external_mismatch_events ?? 0}
+        `;
+    }
+    const table = document.getElementById('reporting-identity-diagnostics-table');
+    if (table) {
+        const rows = (payload.mismatch_samples || []).map(item => `
+            <tr>
+                <td><code>${item.run_id}</code></td>
+                <td><code>${item.event_external_user_id}</code></td>
+                <td><code>${item.run_external_user_id}</code></td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="3" class="text-muted">No mismatch samples in selected window.</td></tr>';
+    }
+}
+
+function renderExperimentMetrics(payload) {
+    reportingLastExperiments = payload;
+    const summaryEl = document.getElementById('reporting-experiment-summary');
+    if (summaryEl) {
+        summaryEl.innerHTML = `
+            <strong>Experiments:</strong>
+            ${payload.experiment_id || 'multiple/none'} | assignments ${payload.runs_with_assignment ?? 0}
+        `;
+    }
+    const table = document.getElementById('reporting-experiment-table');
+    if (table) {
+        const rows = (payload.variants || []).map(item => `
+            <tr>
+                <td>${item.variant_id}</td>
+                <td>${item.runs || 0}</td>
+                <td>${item.impressions || 0}</td>
+                <td>${item.clicks || 0}</td>
+                <td>${item.conversions || 0}</td>
+                <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+                <td>${(Number(item.conversion_rate || 0) * 100).toFixed(2)}%</td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="7" class="text-muted">No experiment assignments in selected window.</td></tr>';
+    }
+}
+
 function renderScenarioTraceMetrics(payload) {
     reportingLastScenarioTraces = payload;
     const table = document.getElementById('reporting-scenario-trace-table');
@@ -1697,10 +1750,12 @@ async function loadReportingWorkspace() {
         const attributionParams = new URLSearchParams(params);
         attributionParams.set('top_runs', String(topRuns));
 
-        const [trendsResponse, attributionResponse, identityResponse, traceResponse] = await Promise.all([
+        const [trendsResponse, attributionResponse, identityResponse, identityDiagnosticsResponse, experimentsResponse, traceResponse] = await Promise.all([
             fetch(`/api/metrics/trends?${params.toString()}`),
             fetch(`/api/metrics/attribution?${attributionParams.toString()}`),
             fetch(`/api/metrics/identity?days=${params.get('days')}&limit_events=50000&limit_runs=1000&top_external=25`),
+            fetch(`/api/metrics/identity/diagnostics?days=${params.get('days')}&limit_events=50000&limit_runs=5000`),
+            fetch(`/api/metrics/experiments?days=${params.get('days')}&limit_runs=5000&limit_events=100000`),
             fetch(`/api/metrics/scenario-traces?days=${params.get('days')}&limit_runs=1000${scenarioIds.length ? `&scenario_ids=${encodeURIComponent(scenarioIds.join(','))}` : ''}`)
         ]);
         if (!trendsResponse.ok) {
@@ -1715,6 +1770,14 @@ async function loadReportingWorkspace() {
             const error = await identityResponse.json();
             throw new Error(error.error || 'Failed to load identity analytics');
         }
+        if (!identityDiagnosticsResponse.ok) {
+            const error = await identityDiagnosticsResponse.json();
+            throw new Error(error.error || 'Failed to load identity diagnostics');
+        }
+        if (!experimentsResponse.ok) {
+            const error = await experimentsResponse.json();
+            throw new Error(error.error || 'Failed to load experiment analytics');
+        }
         if (!traceResponse.ok) {
             const error = await traceResponse.json();
             throw new Error(error.error || 'Failed to load scenario trace analytics');
@@ -1722,10 +1785,14 @@ async function loadReportingWorkspace() {
         const trendsPayload = await trendsResponse.json();
         const attributionPayload = await attributionResponse.json();
         const identityPayload = await identityResponse.json();
+        const identityDiagnosticsPayload = await identityDiagnosticsResponse.json();
+        const experimentsPayload = await experimentsResponse.json();
         const tracePayload = await traceResponse.json();
         renderReportingWorkspace(trendsPayload);
         renderReportingAttribution(attributionPayload);
         renderIdentityMetrics(identityPayload);
+        renderIdentityDiagnostics(identityDiagnosticsPayload);
+        renderExperimentMetrics(experimentsPayload);
         renderScenarioTraceMetrics(tracePayload);
     } catch (error) {
         document.getElementById('reporting-summary').textContent = `Reporting unavailable: ${error.message}`;
@@ -1734,11 +1801,19 @@ async function loadReportingWorkspace() {
         const sourceTable = document.getElementById('reporting-source-table');
         const identitySummary = document.getElementById('reporting-identity-summary');
         const identityTable = document.getElementById('reporting-identity-table');
+        const identityDiagSummary = document.getElementById('reporting-identity-diagnostics-summary');
+        const identityDiagTable = document.getElementById('reporting-identity-diagnostics-table');
+        const experimentSummary = document.getElementById('reporting-experiment-summary');
+        const experimentTable = document.getElementById('reporting-experiment-table');
         const traceTable = document.getElementById('reporting-scenario-trace-table');
         if (attributionTable) attributionTable.innerHTML = '<tr><td colspan="9" class="text-danger">Failed to load attribution data.</td></tr>';
         if (sourceTable) sourceTable.innerHTML = '<tr><td colspan="6" class="text-danger">Failed to load attribution data.</td></tr>';
         if (identitySummary) identitySummary.textContent = `Identity analytics unavailable: ${error.message}`;
         if (identityTable) identityTable.innerHTML = '<tr><td colspan="7" class="text-danger">Failed to load identity analytics.</td></tr>';
+        if (identityDiagSummary) identityDiagSummary.textContent = `Identity diagnostics unavailable: ${error.message}`;
+        if (identityDiagTable) identityDiagTable.innerHTML = '<tr><td colspan="3" class="text-danger">Failed to load identity diagnostics.</td></tr>';
+        if (experimentSummary) experimentSummary.textContent = `Experiment analytics unavailable: ${error.message}`;
+        if (experimentTable) experimentTable.innerHTML = '<tr><td colspan="7" class="text-danger">Failed to load experiment analytics.</td></tr>';
         if (traceTable) traceTable.innerHTML = '<tr><td colspan="6" class="text-danger">Failed to load scenario trace analytics.</td></tr>';
     }
 }
@@ -1802,6 +1877,33 @@ function exportReportingCsv() {
                 item.remaining,
                 item.drop_rate,
                 (item.top_rules || []).map(rule => `${rule.rule}:${rule.count}`).join('|')
+            ]);
+        });
+    }
+    if (reportingLastIdentityDiagnostics) {
+        rows.push([]);
+        rows.push(['orphan_external_events', 'unknown_run_external_events', 'run_external_mismatch_events', 'external_ids_only_in_events', 'external_ids_only_in_runs']);
+        const summary = reportingLastIdentityDiagnostics.summary || {};
+        rows.push([
+            summary.orphan_external_events ?? 0,
+            summary.unknown_run_external_events ?? 0,
+            summary.run_external_mismatch_events ?? 0,
+            summary.external_ids_only_in_events ?? 0,
+            summary.external_ids_only_in_runs ?? 0
+        ]);
+    }
+    if (reportingLastExperiments) {
+        rows.push([]);
+        rows.push(['variant_id', 'runs', 'impressions', 'clicks', 'conversions', 'ctr', 'conversion_rate']);
+        (reportingLastExperiments.variants || []).forEach(item => {
+            rows.push([
+                item.variant_id,
+                item.runs,
+                item.impressions,
+                item.clicks,
+                item.conversions,
+                item.ctr,
+                item.conversion_rate
             ]);
         });
     }

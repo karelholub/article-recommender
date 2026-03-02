@@ -132,6 +132,59 @@ def _safe_article_age_days(scraped_at: str) -> Optional[int]:
         return None
 
 
+def _resolve_experiment_assignment(
+    experiment: Optional[Dict],
+    effective_user_id: str,
+) -> Optional[Dict]:
+    if not isinstance(experiment, dict):
+        return None
+    experiment_id = str(experiment.get("experiment_id", "")).strip()
+    variants = experiment.get("variants") or []
+    if not experiment_id or not isinstance(variants, list) or not variants:
+        return None
+
+    normalized = []
+    total_weight = 0.0
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        variant_id = str(variant.get("variant_id", "")).strip()
+        weight = float(variant.get("weight", 0.0))
+        if not variant_id or weight <= 0:
+            continue
+        normalized.append(
+            {
+                "variant_id": variant_id,
+                "weight": weight,
+                "config_id": str(variant.get("config_id", "")).strip() or None,
+                "scenario_id": str(variant.get("scenario_id", "")).strip() or None,
+                "source_overrides": _normalize_string_list(variant.get("sources")),
+            }
+        )
+        total_weight += weight
+    if not normalized or total_weight <= 0:
+        return None
+
+    token = f"{experiment_id}:{effective_user_id}"
+    bucket = int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+    cursor = 0.0
+    selected = normalized[-1]
+    for candidate in normalized:
+        cursor += candidate["weight"] / total_weight
+        if bucket <= cursor:
+            selected = candidate
+            break
+    return {
+        "experiment_id": experiment_id,
+        "variant_id": selected["variant_id"],
+        "bucket": round(bucket, 6),
+        "selected_config_id": selected["config_id"],
+        "selected_scenario_id": selected["scenario_id"],
+        "selected_sources": selected["source_overrides"],
+        "variants_total": len(normalized),
+    }
+
+
 def _resolve_article_source(article_id: Optional[str]) -> str:
     if not recommender or not article_id:
         return "unknown"
@@ -1681,6 +1734,7 @@ def query_recommendations():
         requested_sources = payload.get("sources") or []
         config_id = payload.get("config_id", "balanced")
         ranking_config = payload.get("ranking_config")
+        experiment = payload.get("experiment")
         scenario_id = (payload.get("scenario_id") or "").strip() or None
         scenario_ids = payload.get("scenario_ids") or []
         if scenario_ids and not scenario_id:
@@ -1697,6 +1751,16 @@ def query_recommendations():
                 requested_sources = scenario_rule_set.get("include_sources") or []
             if not ranking_config and scenario_rule_set.get("ranking_config_id"):
                 config_id = scenario_rule_set.get("ranking_config_id")
+
+        experiment_assignment = _resolve_experiment_assignment(experiment, effective_user_id)
+        if experiment_assignment:
+            if experiment_assignment.get("selected_scenario_id"):
+                scenario_id = experiment_assignment["selected_scenario_id"]
+                scenario = store.get_scenario(scenario_id) if scenario_id else None
+            if experiment_assignment.get("selected_config_id"):
+                config_id = experiment_assignment["selected_config_id"]
+            if experiment_assignment.get("selected_sources"):
+                requested_sources = experiment_assignment["selected_sources"]
 
         decision_context = _build_decision_context(requested_sources, config_id, ranking_config)
         effective_config_id = decision_context["effective_config_id"]
@@ -1739,6 +1803,7 @@ def query_recommendations():
                 "effective_ranking_config": effective_ranking_config,
                 "scenario_id": scenario_id,
                 "scenario_trace": scenario_trace,
+                "experiment_assignment": experiment_assignment,
             },
             recommendations=recs,
             request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
@@ -1775,6 +1840,7 @@ def query_recommendations():
                 "effective_ranking_config": effective_ranking_config,
                 "scenario_id": scenario_id,
                 "scenario_trace": scenario_trace,
+                "experiment_assignment": experiment_assignment,
                 "recommendations": recs,
             }
         )
@@ -1860,12 +1926,23 @@ def recommendations_cms():
             user_reads = recommender.user_profiles.get(user_id, [])
         requested_sources = data.get("sources") or []
         config_id = str(data.get("config_id", "balanced")).strip() or "balanced"
+        experiment = data.get("experiment")
         scenario_id = str(data.get("scenario_id", "")).strip() or None
         scenario = store.get_scenario(scenario_id) if scenario_id else None
         if scenario and scenario.get("rule_set", {}).get("include_sources") and not requested_sources:
             requested_sources = scenario["rule_set"]["include_sources"]
         if scenario and scenario.get("rule_set", {}).get("ranking_config_id"):
             config_id = scenario["rule_set"]["ranking_config_id"]
+
+        experiment_assignment = _resolve_experiment_assignment(experiment, effective_user_id)
+        if experiment_assignment:
+            if experiment_assignment.get("selected_scenario_id"):
+                scenario_id = experiment_assignment["selected_scenario_id"]
+                scenario = store.get_scenario(scenario_id) if scenario_id else None
+            if experiment_assignment.get("selected_config_id"):
+                config_id = experiment_assignment["selected_config_id"]
+            if experiment_assignment.get("selected_sources"):
+                requested_sources = experiment_assignment["selected_sources"]
 
         decision_context = _build_decision_context(requested_sources, config_id, None)
         selected_sources = decision_context["selected_sources"]
@@ -1895,6 +1972,7 @@ def recommendations_cms():
                 "top_n": top_n,
                 "api_surface": "cms",
                 "scenario_trace": scenario_trace,
+                "experiment_assignment": experiment_assignment,
             },
             recommendations=recs,
             request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
@@ -1945,6 +2023,7 @@ def recommendations_cms():
                 "selected_sources": selected_sources,
                 "source_defaults_applied": decision_context["source_defaults_applied"],
                 "scenario_trace": scenario_trace,
+                "experiment_assignment": experiment_assignment,
             },
         }
         if idempotency_key:
@@ -2659,6 +2738,160 @@ def metrics_identity():
         )
     except Exception as e:
         logger.error(f"Error computing identity metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/identity/diagnostics", methods=["GET"])
+def metrics_identity_diagnostics():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        limit_events = max(1, min(200000, int(request.args.get("limit_events", 50000))))
+        limit_runs = max(1, min(20000, int(request.args.get("limit_runs", 5000))))
+
+        runs = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+        run_external: Dict[str, str] = {}
+        run_ids = set()
+        run_external_ids = set()
+        for run in runs:
+            run_id = run.get("run_id")
+            if not run_id:
+                continue
+            run_ids.add(run_id)
+            external = str((run.get("request", {}) or {}).get("external_user_id") or "").strip()
+            if external:
+                run_external[run_id] = external
+                run_external_ids.add(external)
+
+        events = store.list_events(limit=limit_events, days=days)
+        orphan_external_events = 0
+        unknown_run_external_events = 0
+        run_external_mismatch = 0
+        event_external_ids = set()
+        mismatch_samples = []
+
+        for event in events:
+            external = str(event.get("external_user_id") or "").strip()
+            if not external:
+                continue
+            event_external_ids.add(external)
+            run_id = str(event.get("run_id") or "").strip()
+            if not run_id:
+                orphan_external_events += 1
+                continue
+            if run_id not in run_ids:
+                unknown_run_external_events += 1
+                continue
+            run_external_id = run_external.get(run_id, "")
+            if run_external_id and run_external_id != external:
+                run_external_mismatch += 1
+                if len(mismatch_samples) < 10:
+                    mismatch_samples.append(
+                        {
+                            "run_id": run_id,
+                            "event_external_user_id": external,
+                            "run_external_user_id": run_external_id,
+                        }
+                    )
+
+        return jsonify(
+            {
+                "window_days": days,
+                "summary": {
+                    "runs_analyzed": len(run_ids),
+                    "events_analyzed": len(events),
+                    "orphan_external_events": orphan_external_events,
+                    "unknown_run_external_events": unknown_run_external_events,
+                    "run_external_mismatch_events": run_external_mismatch,
+                    "external_ids_only_in_events": len(event_external_ids - run_external_ids),
+                    "external_ids_only_in_runs": len(run_external_ids - event_external_ids),
+                },
+                "mismatch_samples": mismatch_samples,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error computing identity diagnostics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/experiments", methods=["GET"])
+def metrics_experiments():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        experiment_id = str(request.args.get("experiment_id", "")).strip()
+        limit_runs = max(1, min(20000, int(request.args.get("limit_runs", 5000))))
+        limit_events = max(1, min(200000, int(request.args.get("limit_events", 100000))))
+
+        runs = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+        run_assignments: Dict[str, Dict] = {}
+        by_variant: Dict[str, Dict] = {}
+        experiment_ids = set()
+        for run in runs:
+            assignment = (run.get("request", {}) or {}).get("experiment_assignment") or {}
+            exp_id = str(assignment.get("experiment_id") or "").strip()
+            variant_id = str(assignment.get("variant_id") or "").strip()
+            if not exp_id or not variant_id:
+                continue
+            if experiment_id and exp_id != experiment_id:
+                continue
+            run_id = run.get("run_id")
+            if not run_id:
+                continue
+            experiment_ids.add(exp_id)
+            run_assignments[run_id] = {"experiment_id": exp_id, "variant_id": variant_id}
+            bucket = by_variant.setdefault(
+                variant_id,
+                {
+                    "variant_id": variant_id,
+                    "runs": 0,
+                    "impressions": 0,
+                    "clicks": 0,
+                    "conversions": 0,
+                },
+            )
+            bucket["runs"] += 1
+
+        events = store.list_events(limit=limit_events, days=days)
+        for event in events:
+            run_id = event.get("run_id")
+            assignment = run_assignments.get(run_id)
+            if not assignment:
+                continue
+            event_type = event.get("event_type")
+            if event_type not in {"impression", "click", "conversion"}:
+                continue
+            bucket = by_variant[assignment["variant_id"]]
+            bucket[f"{event_type}s"] += 1
+
+        variants = []
+        for bucket in by_variant.values():
+            impressions = bucket["impressions"]
+            clicks = bucket["clicks"]
+            variants.append(
+                {
+                    **bucket,
+                    "ctr": round((clicks / impressions), 4) if impressions else 0.0,
+                    "conversion_rate": round((bucket["conversions"] / clicks), 4) if clicks else 0.0,
+                }
+            )
+        variants.sort(key=lambda item: item["runs"], reverse=True)
+
+        return jsonify(
+            {
+                "window_days": days,
+                "experiment_id": experiment_id or (next(iter(experiment_ids)) if len(experiment_ids) == 1 else None),
+                "experiments_seen": sorted(experiment_ids),
+                "variants": variants,
+                "runs_with_assignment": len(run_assignments),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error computing experiment metrics: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 

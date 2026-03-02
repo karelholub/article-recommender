@@ -145,8 +145,15 @@ def test_recommendation_query_persists_run_and_exposes_metrics():
             'top_n': 2,
             'sources': [source],
             'config_id': 'balanced',
-        },
-    )
+                'experiment': {
+                    'experiment_id': 'exp-homepage-config',
+                    'variants': [
+                        {'variant_id': 'control', 'weight': 0.5, 'config_id': 'balanced'},
+                        {'variant_id': 'variant', 'weight': 0.5, 'config_id': 'balanced'},
+                    ],
+                },
+            },
+        )
 
     assert response.status_code == 200
     payload = response.get_json()
@@ -155,6 +162,8 @@ def test_recommendation_query_persists_run_and_exposes_metrics():
     assert 'source_defaults_applied' in payload
     assert 'recommendations' in payload
     assert 'run_id' in payload
+    assert 'experiment_assignment' in payload
+    assert payload['experiment_assignment']['experiment_id'] == 'exp-homepage-config'
     assert isinstance(payload['recommendations'], list)
 
     run_detail_resp = client.get(f"/api/recommendation-runs/{payload['run_id']}")
@@ -162,6 +171,7 @@ def test_recommendation_query_persists_run_and_exposes_metrics():
     run_payload = run_detail_resp.get_json()
     assert run_payload['run_id'] == payload['run_id']
     assert 'items' in run_payload
+    assert run_payload['request']['experiment_assignment']['experiment_id'] == 'exp-homepage-config'
     assert 'scenario_trace' in run_payload.get('request', {})
 
     flow_resp = client.get(f"/api/recommendation-runs/{payload['run_id']}/decision-flow")
@@ -181,6 +191,12 @@ def test_recommendation_query_persists_run_and_exposes_metrics():
     metrics = metrics_resp.get_json()
     assert 'runs_analyzed' in metrics
     assert 'avg_score' in metrics
+
+    exp_metrics_resp = client.get('/api/metrics/experiments?days=3650&experiment_id=exp-homepage-config')
+    assert exp_metrics_resp.status_code == 200
+    exp_metrics = exp_metrics_resp.get_json()
+    assert exp_metrics['runs_with_assignment'] >= 1
+    assert exp_metrics['variants']
 
 
 def test_recommendation_context_endpoint_reflects_source_defaults():
@@ -833,6 +849,12 @@ def test_identity_and_scenario_trace_metrics_endpoints():
     assert 'top_external_users' in identity_payload
     assert identity_payload['summary']['unique_external_users'] >= 1
     assert any(item['external_user_id'] == 'identity-ext-1' for item in identity_payload['top_external_users'])
+
+    diagnostics_resp = client.get('/api/metrics/identity/diagnostics?days=3650&limit_events=50000&limit_runs=5000')
+    assert diagnostics_resp.status_code == 200
+    diagnostics_payload = diagnostics_resp.get_json()
+    assert 'summary' in diagnostics_payload
+    assert 'orphan_external_events' in diagnostics_payload['summary']
 
     trace_resp = client.get(f'/api/metrics/scenario-traces?days=3650&limit_runs=1000&scenario_ids={scenario_id}')
     assert trace_resp.status_code == 200
