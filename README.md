@@ -166,6 +166,7 @@ python embed.py
 - `GET /api/cdp/meiro/profiles/<external_user_id>/derive`: Preview derived recommender traits from raw Meiro attributes
 - `POST /api/cdp/meiro/profiles/<external_user_id>/derive`: Persist derived `preferred_sources`/`source_weights`/segments into cached profile
   - persistence is guardrailed; endpoint returns `409` when guardrails fail unless `force=true`
+- `POST /api/cdp/meiro/mapping/preview`: Validate mapping paths and derivation against a sample payload before saving mapping
 - `POST /api/cdp/meiro/profiles/upsert`: Upsert CDP profile payload (webhook/manual ingest)
 - `POST /api/cdp/meiro/sync`: Pull profile(s) from Meiro API by external IDs
   - supports either `request_url_template` (e.g. `.../wbs?segment=107&attribute=stitching_meiro_id&value={external_user_id}`) or `base_url + profile_endpoint_template`
@@ -206,12 +207,14 @@ Meiro mapping also supports derivation guardrails:
 - `DELETE /api/scenarios/<scenario_id>`: Delete scenario
 - `GET /api/similar/<article_id>?sources=...&config_id=...&top_n=...`: Similar articles with filters/config
 - `POST /api/recommendations/query`: Structured recommendation query
+- `POST /api/recommendations/batch`: Execute multiple recommendation queries in one request (`requests[]`, per-item status)
 - `POST /api/recommendation-context`: Resolve effective source/config context without executing ranking
   - if `external_user_id` is provided, engine applies CDP mapping and returns `cdp_context`
 - `GET /api/recommendation-runs?limit=20`: Recent recommendation runs
 - `GET /api/recommendation-runs/<run_id>`: Full trace for one run
 - `GET /api/recommendation-runs/<run_id>/decision-flow`: Per-item scenario decision waterfall (kept/filtered, score before/after, boost, reason, final rank)
 - `GET /api/metrics/offline?limit_runs=100`: Offline aggregate metrics from stored runs
+- `GET /api/metrics/offline/config-compare?baseline_config_id=...&candidate_config_id=...`: Replay historical contexts and compare config quality metrics/lift
 - `POST /api/metrics/offline/snapshots`: Persist a quality snapshot from offline metrics (label/window/limit metadata)
 - `GET /api/metrics/offline/snapshots?snapshot_type=offline_quality&limit=30`: List persisted quality snapshots
 - `GET /api/metrics/offline/snapshots/compare?baseline_id=<id>&candidate_id=<id>`: Compare two snapshots with metric deltas
@@ -234,6 +237,9 @@ Meiro mapping also supports derivation guardrails:
 - `GET /api/metrics/scenario-traces?days=30&limit_runs=1000&scenario_ids=homepage&top_rules=25`: Aggregated scenario trace/rule impact diagnostics from persisted recommendation runs
 - `POST /api/metrics/rollups/rebuild`: Rebuild daily event rollups for reporting windows
 - `GET /api/metrics/rollups/daily?days=30&scenario_ids=homepage&source=www.e15.cz`: Inspect persisted daily rollup rows
+- `POST /api/ranking-configs/<config_id>/auto-tune`: Preview/apply feedback-driven source-weight tuning with guardrails
+- `POST /api/ranking-configs/promote`: Promote one config payload into another config ID (e.g., candidate -> `balanced`)
+- `POST /api/ranking-configs/promote-with-guard`: Promote candidate only when configured acceptance thresholds pass (NDCG/CTR lift + regression tolerances)
 - `GET /api/engine/config`: Full runtime engine configuration snapshot (sources/configs/scenarios/scheduler)
   - alias: `/api/v1/engine/config`
 - `GET /api/observability/overview?days=7`: SLA-oriented operational snapshot (recommendation latency stats, events throughput, connector failure rate)

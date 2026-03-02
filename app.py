@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import threading
 import traceback
@@ -16,7 +17,7 @@ from flask import Flask, abort, jsonify, render_template, request
 from store import RecommenderStore
 from bootstrap_data import ensure_data_files
 from connector_pipeline import ConnectorIngestionService
-from meiro_adapter import MeiroAdapter
+from meiro_adapter import MeiroAdapter, _get_by_path
 from config.logging_config import setup_logging
 from recommend import RecommenderFactory
 
@@ -1058,6 +1059,22 @@ def _compute_observability_snapshot(days: int) -> Dict:
     p95_idx = int(0.95 * (len(duration_samples) - 1)) if duration_samples else 0
     p95_ms = duration_samples[p95_idx] if duration_samples else None
     avg_ms = (sum(duration_samples) / len(duration_samples)) if duration_samples else None
+    surface_rows = store.list_runs_with_request(limit=5000, offset=0, days=days)
+    by_surface: Dict[str, Dict[str, float]] = {}
+    for run in surface_rows:
+        req = run.get("request") or {}
+        surface = str(req.get("api_surface") or "query").strip() or "query"
+        bucket = by_surface.setdefault(
+            surface,
+            {"surface": surface, "runs": 0.0, "duration_total_ms": 0.0, "with_external_id": 0.0},
+        )
+        bucket["runs"] += 1.0
+        duration = (run.get("summary") or {}).get("duration_ms")
+        if isinstance(duration, (int, float)):
+            bucket["duration_total_ms"] += float(duration)
+        external_user_id = str(req.get("external_user_id") or "").strip()
+        if external_user_id:
+            bucket["with_external_id"] += 1.0
 
     event_rows = store.list_events(limit=5000, offset=0, days=days)
     events_total = len(event_rows)
@@ -1106,6 +1123,19 @@ def _compute_observability_snapshot(days: int) -> Dict:
     if latest_rollup_at:
         rollup_lag_hours = max(0.0, round((datetime.now() - latest_rollup_at).total_seconds() / 3600.0, 2))
     thresholds = store.get_alert_thresholds()
+    surface_items = []
+    for bucket in by_surface.values():
+        runs_count = int(bucket["runs"])
+        surface_items.append(
+            {
+                "surface": bucket["surface"],
+                "runs": runs_count,
+                "share": round((runs_count / rec_count_window), 4) if rec_count_window else 0.0,
+                "avg_duration_ms": round(bucket["duration_total_ms"] / runs_count, 2) if runs_count else None,
+                "external_id_share": round((bucket["with_external_id"] / runs_count), 4) if runs_count else 0.0,
+            }
+        )
+    surface_items.sort(key=lambda item: item["runs"], reverse=True)
 
     return {
         "api_version": "v1",
@@ -1115,6 +1145,7 @@ def _compute_observability_snapshot(days: int) -> Dict:
             "runs": rec_count_window,
             "avg_duration_ms": round(avg_ms, 2) if avg_ms is not None else None,
             "p95_duration_ms": round(p95_ms, 2) if p95_ms is not None else None,
+            "surfaces": surface_items,
         },
         "events": {
             "total": events_total,
@@ -1967,6 +1998,70 @@ def cdp_meiro_profile_derive(external_user_id):
         return jsonify({"error": str(e)}), 400
 
 
+@app.route("/api/cdp/meiro/mapping/preview", methods=["POST"])
+def cdp_meiro_mapping_preview():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json() or {}
+        sample_payload = payload.get("payload")
+        if not isinstance(sample_payload, dict):
+            return jsonify({"error": "payload must be a JSON object"}), 400
+
+        integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+        mapping = _normalize_meiro_mapping(integration.get("mapping"))
+        override = payload.get("mapping")
+        if isinstance(override, dict):
+            merged = dict(mapping)
+            merged.update(override)
+            mapping = _normalize_meiro_mapping(merged)
+
+        adapter = MeiroAdapter(integration.get("config") or {})
+        profile = adapter.normalize_profile(
+            sample_payload,
+            mapping=mapping,
+            fallback_external_user_id=str(payload.get("fallback_external_user_id", "")).strip(),
+        )
+        derived = _derive_reco_fields_from_meiro_traits(profile.traits or {})
+        guardrail = _apply_derivation_guardrails(derived, mapping)
+        existing_profile = store.get_cdp_profile(_MEIRO_PROVIDER, profile.external_user_id) or {
+            "traits": {},
+            "segments": [],
+        }
+        diff = _build_derivation_diff(existing_profile, guardrail)
+
+        return jsonify(
+            {
+                "provider": _MEIRO_PROVIDER,
+                "external_user_id": profile.external_user_id,
+                "segments": profile.segments,
+                "trait_keys_count": len(profile.traits.keys()),
+                "trait_keys_sample": sorted(list(profile.traits.keys()))[:25],
+                "path_resolution": {
+                    "external_id_path": {
+                        "path": mapping.get("external_id_path"),
+                        "value": _get_by_path(sample_payload, mapping.get("external_id_path", ""), None),
+                    },
+                    "traits_path": {
+                        "path": mapping.get("traits_path"),
+                        "is_object": isinstance(_get_by_path(sample_payload, mapping.get("traits_path", ""), {}), dict),
+                    },
+                    "segments_path": {
+                        "path": mapping.get("segments_path"),
+                        "value": _get_by_path(sample_payload, mapping.get("segments_path", ""), []),
+                    },
+                },
+                "derived": derived,
+                "guardrail": guardrail,
+                "diff": diff,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error previewing CDP mapping: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
 @app.route("/api/cdp/meiro/profiles/upsert", methods=["POST"])
 def cdp_meiro_profile_upsert():
     if not store:
@@ -2639,6 +2734,272 @@ def ranking_config_detail(config_id):
         return jsonify({"error": str(e)}), 400
 
 
+@app.route("/api/ranking-configs/promote", methods=["POST"])
+def ranking_config_promote():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json() or {}
+        source_config_id = str(payload.get("source_config_id", "")).strip()
+        target_config_id = str(payload.get("target_config_id", "balanced")).strip() or "balanced"
+        if not source_config_id:
+            return jsonify({"error": "source_config_id is required"}), 400
+        source = store.get_config(source_config_id)
+        if not source:
+            return jsonify({"error": f"Unknown source config: {source_config_id}"}), 404
+        source_config, source_version, _is_system = source
+        promoted_payload = dict(source_config)
+        promoted_payload["config_id"] = target_config_id
+        recommender._resolve_config(config_id=target_config_id, ranking_config=promoted_payload)
+        version = store.create_or_update_config(target_config_id, promoted_payload, is_system=False)
+        _record_audit(
+            action="promote",
+            resource_type="ranking_config",
+            resource_id=target_config_id,
+            payload=payload,
+            extra={"source_config_id": source_config_id, "source_version": source_version, "version": version},
+        )
+        return jsonify(
+            {
+                "target_config_id": target_config_id,
+                "target_version": version,
+                "source_config_id": source_config_id,
+                "source_version": source_version,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error promoting ranking config: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/ranking-configs/promote-with-guard", methods=["POST"])
+def ranking_config_promote_with_guard():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json() or {}
+        baseline_config_id = str(payload.get("baseline_config_id", "balanced")).strip() or "balanced"
+        candidate_config_id = str(payload.get("candidate_config_id", "")).strip()
+        target_config_id = str(payload.get("target_config_id", "balanced")).strip() or "balanced"
+        if not candidate_config_id:
+            return jsonify({"error": "candidate_config_id is required"}), 400
+
+        compare = _compute_offline_config_compare_result(
+            baseline_config_id=baseline_config_id,
+            candidate_config_id=candidate_config_id,
+            days=max(1, min(365, int(payload.get("days", 30)))),
+            limit_runs=max(10, min(5000, int(payload.get("limit_runs", 300)))),
+            limit_events=max(1000, min(200000, int(payload.get("limit_events", 100000)))),
+            top_n=max(1, min(20, int(payload.get("top_n", 5)))),
+            require_relevant=bool(payload.get("require_relevant", True)),
+        )
+        guard_eval = _evaluate_promotion_guard(compare, payload.get("guard") or {})
+        if not guard_eval.get("passed"):
+            return jsonify(
+                {
+                    "error": "Promotion guard rejected candidate config",
+                    "guard_evaluation": guard_eval,
+                    "comparison": compare,
+                }
+            ), 409
+
+        source = store.get_config(candidate_config_id)
+        if not source:
+            return jsonify({"error": f"Unknown candidate config: {candidate_config_id}"}), 404
+        source_config, source_version, _is_system = source
+        promoted_payload = dict(source_config)
+        promoted_payload["config_id"] = target_config_id
+        recommender._resolve_config(config_id=target_config_id, ranking_config=promoted_payload)
+        version = store.create_or_update_config(target_config_id, promoted_payload, is_system=False)
+        _record_audit(
+            action="promote_with_guard",
+            resource_type="ranking_config",
+            resource_id=target_config_id,
+            payload=payload,
+            extra={
+                "source_config_id": candidate_config_id,
+                "source_version": source_version,
+                "version": version,
+                "guard": guard_eval.get("guard"),
+            },
+        )
+        return jsonify(
+            {
+                "target_config_id": target_config_id,
+                "target_version": version,
+                "source_config_id": candidate_config_id,
+                "source_version": source_version,
+                "guard_evaluation": guard_eval,
+                "comparison": compare,
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        logger.error(f"Error promoting ranking config with guard: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/ranking-configs/<config_id>/auto-tune", methods=["POST"])
+def ranking_config_auto_tune(config_id):
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json(silent=True) or {}
+        days = max(1, min(365, int(payload.get("days", 30))))
+        limit_events = max(100, min(200000, int(payload.get("limit_events", 100000))))
+        limit_runs = max(10, min(20000, int(payload.get("limit_runs", 5000))))
+        min_impressions = max(1, min(10000, int(payload.get("min_impressions", 50))))
+        learning_rate = max(0.01, min(2.0, float(payload.get("learning_rate", 0.5))))
+        max_weight_delta = max(0.01, min(1.0, float(payload.get("max_weight_delta", 0.25))))
+        min_source_weight = max(0.1, min(5.0, float(payload.get("min_source_weight", 0.5))))
+        max_source_weight = max(min_source_weight, min(10.0, float(payload.get("max_source_weight", 3.0))))
+        max_sources_changed = max(1, min(200, int(payload.get("max_sources_changed", 30))))
+        apply = bool(payload.get("apply", False))
+
+        existing = store.get_config(config_id)
+        if not existing:
+            return jsonify({"error": f"Unknown config_id: {config_id}"}), 404
+        config_payload, config_version, _is_system = existing
+        source_weights = dict((config_payload.get("source_weights") or {}))
+
+        runs = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+        run_ids = {
+            row.get("run_id")
+            for row in runs
+            if row.get("config_id") == config_id and row.get("run_id")
+        }
+        if not run_ids:
+            return jsonify(
+                {
+                    "config_id": config_id,
+                    "config_version": config_version,
+                    "days": days,
+                    "analyzed_runs": 0,
+                    "analyzed_events": 0,
+                    "proposed_updates": [],
+                    "applied": False,
+                    "reason": "No runs found for config in selected window",
+                }
+            )
+
+        events = store.list_events(limit=limit_events, days=days)
+        source_stats: Dict[str, Dict[str, float]] = {}
+        analyzed_events = 0
+        for event in events:
+            if event.get("run_id") not in run_ids:
+                continue
+            event_type = event.get("event_type")
+            if event_type not in {"impression", "click", "conversion"}:
+                continue
+            source = _resolve_event_source(event)
+            bucket = source_stats.setdefault(
+                source,
+                {"impressions": 0.0, "clicks": 0.0, "conversions": 0.0},
+            )
+            if event_type == "impression":
+                bucket["impressions"] += 1.0
+            elif event_type == "click":
+                bucket["clicks"] += 1.0
+            elif event_type == "conversion":
+                bucket["conversions"] += 1.0
+            analyzed_events += 1
+
+        total_impressions = sum(item["impressions"] for item in source_stats.values())
+        total_clicks = sum(item["clicks"] for item in source_stats.values())
+        global_ctr = (total_clicks / total_impressions) if total_impressions else 0.0
+        if global_ctr <= 0:
+            return jsonify(
+                {
+                    "config_id": config_id,
+                    "config_version": config_version,
+                    "days": days,
+                    "analyzed_runs": len(run_ids),
+                    "analyzed_events": analyzed_events,
+                    "global_ctr": global_ctr,
+                    "proposed_updates": [],
+                    "applied": False,
+                    "reason": "Global CTR is zero; no safe tuning signal",
+                }
+            )
+
+        proposals = []
+        for source, stats in source_stats.items():
+            impressions = float(stats.get("impressions", 0.0))
+            if impressions < min_impressions:
+                continue
+            clicks = float(stats.get("clicks", 0.0))
+            ctr = clicks / impressions if impressions else 0.0
+            relative_lift = (ctr / global_ctr) - 1.0
+            raw_delta = relative_lift * learning_rate
+            bounded_delta = max(-max_weight_delta, min(max_weight_delta, raw_delta))
+            current_weight = float(source_weights.get(source, 1.0))
+            proposed_weight = current_weight * (1.0 + bounded_delta)
+            proposed_weight = max(min_source_weight, min(max_source_weight, proposed_weight))
+            if abs(proposed_weight - current_weight) < 0.01:
+                continue
+            proposals.append(
+                {
+                    "source": source,
+                    "impressions": int(impressions),
+                    "clicks": int(clicks),
+                    "ctr": round(ctr, 6),
+                    "global_ctr": round(global_ctr, 6),
+                    "relative_lift": round(relative_lift, 6),
+                    "delta_pct": round((proposed_weight / current_weight) - 1.0, 6) if current_weight else None,
+                    "current_weight": round(current_weight, 6),
+                    "proposed_weight": round(proposed_weight, 6),
+                }
+            )
+        proposals.sort(key=lambda item: abs(item.get("delta_pct") or 0.0), reverse=True)
+        proposals = proposals[:max_sources_changed]
+
+        applied_version = None
+        if apply and proposals:
+            updated_config = dict(config_payload)
+            updated_weights = dict(source_weights)
+            for item in proposals:
+                updated_weights[item["source"]] = float(item["proposed_weight"])
+            updated_config["source_weights"] = updated_weights
+            recommender._resolve_config(config_id=config_id, ranking_config=updated_config)
+            applied_version = store.create_or_update_config(config_id, updated_config, is_system=False)
+            _record_audit(
+                action="auto_tune",
+                resource_type="ranking_config",
+                resource_id=config_id,
+                payload=payload,
+                extra={"from_version": config_version, "to_version": applied_version, "changed_sources": len(proposals)},
+            )
+
+        return jsonify(
+            {
+                "config_id": config_id,
+                "config_version": config_version,
+                "applied_version": applied_version,
+                "applied": bool(applied_version),
+                "days": days,
+                "analyzed_runs": len(run_ids),
+                "analyzed_events": analyzed_events,
+                "global_ctr": round(global_ctr, 6),
+                "parameters": {
+                    "min_impressions": min_impressions,
+                    "learning_rate": learning_rate,
+                    "max_weight_delta": max_weight_delta,
+                    "min_source_weight": min_source_weight,
+                    "max_source_weight": max_source_weight,
+                    "max_sources_changed": max_sources_changed,
+                },
+                "proposed_updates": proposals,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error auto-tuning ranking config: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
 @app.route("/api/scenarios", methods=["GET", "POST"])
 def scenarios():
     if not store:
@@ -2730,161 +3091,249 @@ def scenario_detail(scenario_id):
         return jsonify({"error": str(e)}), 400
 
 
+def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "query") -> Dict[str, Any]:
+    started_at = datetime.now()
+    user_id = payload.get("user_id", "demo_user")
+    external_user_id = str(payload.get("external_user_id", "")).strip() or None
+    effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
+    user_reads = payload.get("user_reads") or recommender.user_profiles.get(effective_user_id, [])
+    if not user_reads:
+        user_reads = recommender.user_profiles.get(user_id, [])
+    top_n = int(payload.get("top_n", 5))
+    requested_sources = payload.get("sources") or []
+    config_explicit = bool(str(payload.get("config_id", "")).strip())
+    config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
+    ranking_config = payload.get("ranking_config")
+    experiment = payload.get("experiment")
+    scenario_id = (payload.get("scenario_id") or "").strip() or None
+    scenario_explicit = bool(scenario_id)
+    scenario_ids = payload.get("scenario_ids") or []
+    if scenario_ids and not scenario_id:
+        scenario_id = str(scenario_ids[0]).strip() or None
+        scenario_explicit = bool(scenario_id)
+    cdp_context = _resolve_cdp_personalization(
+        external_user_id=external_user_id,
+        requested_sources=requested_sources,
+        scenario_id=scenario_id,
+        config_id=config_id,
+        scenario_explicit=scenario_explicit,
+        config_explicit=config_explicit,
+    )
+    requested_sources = cdp_context.get("requested_sources") or requested_sources
+    if not scenario_explicit and cdp_context.get("selected_scenario_id"):
+        scenario_id = cdp_context.get("selected_scenario_id")
+    if not config_explicit and cdp_context.get("selected_config_id"):
+        config_id = cdp_context.get("selected_config_id")
+    scenario = None
+    if scenario_id:
+        scenario = store.get_scenario(scenario_id)
+        if not scenario:
+            raise ValueError(f"Scenario not found: {scenario_id}")
+        if not scenario.get("enabled", True):
+            raise ValueError(f"Scenario is disabled: {scenario_id}")
+        scenario_rule_set = scenario.get("rule_set") or {}
+        if not requested_sources and scenario_rule_set.get("include_sources"):
+            requested_sources = scenario_rule_set.get("include_sources") or []
+        if not ranking_config and scenario_rule_set.get("ranking_config_id"):
+            config_id = scenario_rule_set.get("ranking_config_id")
+
+    experiment_assignment = _resolve_experiment_assignment(experiment, effective_user_id)
+    if experiment_assignment:
+        if experiment_assignment.get("selected_scenario_id"):
+            scenario_id = experiment_assignment["selected_scenario_id"]
+            scenario = store.get_scenario(scenario_id) if scenario_id else None
+        if experiment_assignment.get("selected_config_id"):
+            config_id = experiment_assignment["selected_config_id"]
+        if experiment_assignment.get("selected_sources"):
+            requested_sources = experiment_assignment["selected_sources"]
+
+    decision_context = _build_decision_context(requested_sources, config_id, ranking_config)
+    effective_config_id = decision_context["effective_config_id"]
+    config_version = decision_context["config_version"]
+    selected_sources = decision_context["selected_sources"]
+    source_defaults = decision_context["source_defaults_applied"]
+    effective_ranking_config = decision_context["effective_ranking_config"]
+    cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
+    if cdp_source_overrides:
+        source_weights = dict(effective_ranking_config.get("source_weights") or {})
+        for source, weight in cdp_source_overrides.items():
+            if source in selected_sources and weight > 0:
+                source_weights[source] = float(weight)
+        effective_ranking_config["source_weights"] = source_weights
+    if scenario:
+        excluded_sources = set(_normalize_string_list(scenario.get("rule_set", {}).get("exclude_sources")))
+        if excluded_sources:
+            selected_sources = [source for source in selected_sources if source not in excluded_sources]
+
+    if selected_sources:
+        recs = recommender.recommend_for_user(
+            effective_user_id,
+            recommender.article_vectors,
+            user_reads,
+            top_n=top_n,
+            sources=selected_sources,
+            config_id=effective_config_id,
+            ranking_config=effective_ranking_config,
+        )
+    else:
+        recs = []
+    recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
+    recs = recs[: max(1, top_n)]
+
+    run_id = store.persist_recommendation_run(
+        user_id=effective_user_id,
+        config_id=effective_config_id,
+        config_version=config_version,
+        request_payload={
+            "user_id": user_id,
+            "effective_user_id": effective_user_id,
+            "external_user_id": external_user_id,
+            "user_reads": user_reads,
+            "top_n": top_n,
+            "sources": selected_sources,
+            "config_id": effective_config_id,
+            "effective_ranking_config": effective_ranking_config,
+            "scenario_id": scenario_id,
+            "scenario_trace": scenario_trace,
+            "experiment_assignment": experiment_assignment,
+            "cdp_context": cdp_context,
+            "api_surface": api_surface,
+        },
+        recommendations=recs,
+        request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
+    )
+    track_impressions = bool(payload.get("track_impressions", True))
+    if track_impressions and recs:
+        store.record_events(
+            [
+                {
+                    "event_type": "impression",
+                    "run_id": run_id,
+                    "article_id": rec.get("article_id"),
+                    "scenario_id": scenario_id,
+                    "user_id": effective_user_id,
+                    "external_user_id": external_user_id,
+                    "rank_position": idx,
+                    "metadata": {"score": rec.get("score"), "source": rec.get("source")},
+                }
+                for idx, rec in enumerate(recs, start=1)
+            ]
+        )
+
+    return {
+        "run_id": run_id,
+        "user_id": user_id,
+        "effective_user_id": effective_user_id,
+        "external_user_id": external_user_id,
+        "top_n": top_n,
+        "sources": selected_sources,
+        "config_id": effective_config_id,
+        "config_version": config_version,
+        "source_defaults_applied": source_defaults,
+        "effective_ranking_config": effective_ranking_config,
+        "scenario_id": scenario_id,
+        "scenario_trace": scenario_trace,
+        "experiment_assignment": experiment_assignment,
+        "cdp_context": cdp_context,
+        "recommendations": recs,
+    }
+
+
 @app.route("/api/recommendations/query", methods=["POST"])
 def query_recommendations():
     if not recommender or not store:
         return jsonify({"error": "Recommender not initialized"}), 500
 
     try:
+        payload = request.get_json() or {}
+        return jsonify(_execute_recommendation_query(payload, api_surface="query"))
+    except Exception as e:
+        logger.error(f"Error querying recommendations: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/recommendations/batch", methods=["POST"])
+def query_recommendations_batch():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
         started_at = datetime.now()
         payload = request.get_json() or {}
-        user_id = payload.get("user_id", "demo_user")
-        external_user_id = str(payload.get("external_user_id", "")).strip() or None
-        effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
-        user_reads = payload.get("user_reads") or recommender.user_profiles.get(effective_user_id, [])
-        if not user_reads:
-            user_reads = recommender.user_profiles.get(user_id, [])
-        top_n = int(payload.get("top_n", 5))
-        requested_sources = payload.get("sources") or []
-        config_explicit = bool(str(payload.get("config_id", "")).strip())
-        config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
-        ranking_config = payload.get("ranking_config")
-        experiment = payload.get("experiment")
-        scenario_id = (payload.get("scenario_id") or "").strip() or None
-        scenario_explicit = bool(scenario_id)
-        scenario_ids = payload.get("scenario_ids") or []
-        if scenario_ids and not scenario_id:
-            scenario_id = str(scenario_ids[0]).strip() or None
-            scenario_explicit = bool(scenario_id)
-        cdp_context = _resolve_cdp_personalization(
-            external_user_id=external_user_id,
-            requested_sources=requested_sources,
-            scenario_id=scenario_id,
-            config_id=config_id,
-            scenario_explicit=scenario_explicit,
-            config_explicit=config_explicit,
-        )
-        requested_sources = cdp_context.get("requested_sources") or requested_sources
-        if not scenario_explicit and cdp_context.get("selected_scenario_id"):
-            scenario_id = cdp_context.get("selected_scenario_id")
-        if not config_explicit and cdp_context.get("selected_config_id"):
-            config_id = cdp_context.get("selected_config_id")
-        scenario = None
-        if scenario_id:
-            scenario = store.get_scenario(scenario_id)
-            if not scenario:
-                return jsonify({"error": f"Scenario not found: {scenario_id}"}), 404
-            if not scenario.get("enabled", True):
-                return jsonify({"error": f"Scenario is disabled: {scenario_id}"}), 400
-            scenario_rule_set = scenario.get("rule_set") or {}
-            if not requested_sources and scenario_rule_set.get("include_sources"):
-                requested_sources = scenario_rule_set.get("include_sources") or []
-            if not ranking_config and scenario_rule_set.get("ranking_config_id"):
-                config_id = scenario_rule_set.get("ranking_config_id")
+        requests_payload = payload.get("requests") or []
+        if not isinstance(requests_payload, list) or not requests_payload:
+            return jsonify({"error": "requests must be a non-empty array"}), 400
+        if len(requests_payload) > 100:
+            return jsonify({"error": "Maximum batch size is 100"}), 400
+        continue_on_error = bool(payload.get("continue_on_error", True))
 
-        experiment_assignment = _resolve_experiment_assignment(experiment, effective_user_id)
-        if experiment_assignment:
-            if experiment_assignment.get("selected_scenario_id"):
-                scenario_id = experiment_assignment["selected_scenario_id"]
-                scenario = store.get_scenario(scenario_id) if scenario_id else None
-            if experiment_assignment.get("selected_config_id"):
-                config_id = experiment_assignment["selected_config_id"]
-            if experiment_assignment.get("selected_sources"):
-                requested_sources = experiment_assignment["selected_sources"]
+        results = []
+        success_count = 0
+        for index, item in enumerate(requests_payload):
+            if not isinstance(item, dict):
+                error_payload = {
+                    "index": index,
+                    "request_id": None,
+                    "status": "error",
+                    "error": "Each request item must be an object",
+                }
+                results.append(error_payload)
+                if not continue_on_error:
+                    return jsonify(
+                        {
+                            "api_version": "v1",
+                            "count": len(requests_payload),
+                            "success_count": success_count,
+                            "error_count": len(results) - success_count,
+                            "results": results,
+                        }
+                    ), 400
+                continue
 
-        decision_context = _build_decision_context(requested_sources, config_id, ranking_config)
-        effective_config_id = decision_context["effective_config_id"]
-        config_version = decision_context["config_version"]
-        selected_sources = decision_context["selected_sources"]
-        source_defaults = decision_context["source_defaults_applied"]
-        effective_ranking_config = decision_context["effective_ranking_config"]
-        cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
-        if cdp_source_overrides:
-            source_weights = dict(effective_ranking_config.get("source_weights") or {})
-            for source, weight in cdp_source_overrides.items():
-                if source in selected_sources and weight > 0:
-                    source_weights[source] = float(weight)
-            effective_ranking_config["source_weights"] = source_weights
-        if scenario:
-            excluded_sources = set(_normalize_string_list(scenario.get("rule_set", {}).get("exclude_sources")))
-            if excluded_sources:
-                selected_sources = [source for source in selected_sources if source not in excluded_sources]
-
-        if selected_sources:
-            recs = recommender.recommend_for_user(
-                effective_user_id,
-                recommender.article_vectors,
-                user_reads,
-                top_n=top_n,
-                sources=selected_sources,
-                config_id=effective_config_id,
-                ranking_config=effective_ranking_config,
-            )
-        else:
-            recs = []
-        recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
-        recs = recs[: max(1, top_n)]
-
-        run_id = store.persist_recommendation_run(
-            user_id=effective_user_id,
-            config_id=effective_config_id,
-            config_version=config_version,
-            request_payload={
-                "user_id": user_id,
-                "effective_user_id": effective_user_id,
-                "external_user_id": external_user_id,
-                "user_reads": user_reads,
-                "top_n": top_n,
-                "sources": selected_sources,
-                "config_id": effective_config_id,
-                "effective_ranking_config": effective_ranking_config,
-                "scenario_id": scenario_id,
-                "scenario_trace": scenario_trace,
-                "experiment_assignment": experiment_assignment,
-                "cdp_context": cdp_context,
-            },
-            recommendations=recs,
-            request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
-        )
-        track_impressions = bool(payload.get("track_impressions", True))
-        if track_impressions and recs:
-            store.record_events(
-                [
+            request_id = str(item.get("request_id", "")).strip() or None
+            try:
+                result = _execute_recommendation_query(item, api_surface="batch")
+                results.append(
                     {
-                        "event_type": "impression",
-                        "run_id": run_id,
-                        "article_id": rec.get("article_id"),
-                        "scenario_id": scenario_id,
-                        "user_id": effective_user_id,
-                        "external_user_id": external_user_id,
-                        "rank_position": idx,
-                        "metadata": {"score": rec.get("score"), "source": rec.get("source")},
+                        "index": index,
+                        "request_id": request_id,
+                        "status": "ok",
+                        "result": result,
                     }
-                    for idx, rec in enumerate(recs, start=1)
-                ]
-            )
+                )
+                success_count += 1
+            except Exception as exc:
+                results.append(
+                    {
+                        "index": index,
+                        "request_id": request_id,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+                if not continue_on_error:
+                    return jsonify(
+                        {
+                            "api_version": "v1",
+                            "count": len(requests_payload),
+                            "success_count": success_count,
+                            "error_count": len(results) - success_count,
+                            "results": results,
+                        }
+                    ), 400
 
         return jsonify(
             {
-                "run_id": run_id,
-                "user_id": user_id,
-                "effective_user_id": effective_user_id,
-                "external_user_id": external_user_id,
-                "top_n": top_n,
-                "sources": selected_sources,
-                "config_id": effective_config_id,
-                "config_version": config_version,
-                "source_defaults_applied": source_defaults,
-                "effective_ranking_config": effective_ranking_config,
-                "scenario_id": scenario_id,
-                "scenario_trace": scenario_trace,
-                "experiment_assignment": experiment_assignment,
-                "cdp_context": cdp_context,
-                "recommendations": recs,
+                "api_version": "v1",
+                "count": len(requests_payload),
+                "success_count": success_count,
+                "error_count": len(results) - success_count,
+                "duration_ms": int((datetime.now() - started_at).total_seconds() * 1000),
+                "results": results,
             }
         )
     except Exception as e:
-        logger.error(f"Error querying recommendations: {str(e)}")
+        logger.error(f"Error running batch recommendations: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
 
@@ -3157,6 +3606,255 @@ def get_offline_metrics():
         return jsonify(metrics)
     except Exception as e:
         logger.error(f"Error computing offline metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+def _compute_offline_config_compare_result(
+    baseline_config_id: str,
+    candidate_config_id: str,
+    days: int,
+    limit_runs: int,
+    limit_events: int,
+    top_n: int,
+    require_relevant: bool,
+) -> Dict[str, Any]:
+    if not store.get_config(baseline_config_id):
+        raise ValueError(f"Unknown baseline_config_id: {baseline_config_id}")
+    if not store.get_config(candidate_config_id):
+        raise ValueError(f"Unknown candidate_config_id: {candidate_config_id}")
+
+    events = store.list_events(limit=limit_events, days=days)
+    relevant_by_run: Dict[str, set] = {}
+    for event in events:
+        if event.get("event_type") not in {"click", "conversion"}:
+            continue
+        run_id = str(event.get("run_id") or "").strip()
+        article_id = str(event.get("article_id") or "").strip()
+        if not run_id or not article_id:
+            continue
+        relevant_by_run.setdefault(run_id, set()).add(article_id)
+
+    runs = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+    baseline_rows: List[Dict[str, float]] = []
+    candidate_rows: List[Dict[str, float]] = []
+    evaluated = 0
+    skipped_no_relevant = 0
+    skipped_missing_context = 0
+
+    baseline_run_ids = set()
+    candidate_run_ids = set()
+    for row in runs:
+        run_id = str(row.get("run_id") or "").strip()
+        cfg = str(row.get("config_id") or "").strip()
+        if run_id and cfg == baseline_config_id:
+            baseline_run_ids.add(run_id)
+        if run_id and cfg == candidate_config_id:
+            candidate_run_ids.add(run_id)
+
+    def _ctr_for_run_ids(run_ids: set) -> Tuple[float, int, int]:
+        impressions = 0
+        clicks = 0
+        for event in events:
+            run_id = str(event.get("run_id") or "").strip()
+            if run_id not in run_ids:
+                continue
+            if event.get("event_type") == "impression":
+                impressions += 1
+            elif event.get("event_type") == "click":
+                clicks += 1
+        ctr = (clicks / impressions) if impressions else 0.0
+        return ctr, impressions, clicks
+
+    baseline_ctr, baseline_impressions, baseline_clicks = _ctr_for_run_ids(baseline_run_ids)
+    candidate_ctr, candidate_impressions, candidate_clicks = _ctr_for_run_ids(candidate_run_ids)
+
+    for run in runs:
+        run_id = str(run.get("run_id") or "").strip()
+        relevant = relevant_by_run.get(run_id, set())
+        if require_relevant and not relevant:
+            skipped_no_relevant += 1
+            continue
+        req = run.get("request") or {}
+        user_id = str(req.get("effective_user_id") or req.get("user_id") or run.get("user_id") or "").strip()
+        user_reads = req.get("user_reads") or recommender.user_profiles.get(user_id, [])
+        requested_sources = req.get("sources") or []
+        scenario_id = str(req.get("scenario_id") or "").strip() or None
+        if not user_id:
+            skipped_missing_context += 1
+            continue
+        baseline_recs = _safe_recommend_for_config(
+            user_id=user_id,
+            user_reads=user_reads,
+            top_n=top_n,
+            requested_sources=requested_sources,
+            config_id=baseline_config_id,
+            scenario_id=scenario_id,
+        )
+        candidate_recs = _safe_recommend_for_config(
+            user_id=user_id,
+            user_reads=user_reads,
+            top_n=top_n,
+            requested_sources=requested_sources,
+            config_id=candidate_config_id,
+            scenario_id=scenario_id,
+        )
+        if not baseline_recs and not candidate_recs:
+            skipped_missing_context += 1
+            continue
+        baseline_rows.append(_compute_recommendation_quality_metrics(baseline_recs, relevant))
+        candidate_rows.append(_compute_recommendation_quality_metrics(candidate_recs, relevant))
+        evaluated += 1
+
+    baseline_metrics = _aggregate_quality_metrics(baseline_rows)
+    candidate_metrics = _aggregate_quality_metrics(candidate_rows)
+    baseline_metrics["historical_ctr"] = round(baseline_ctr, 6)
+    candidate_metrics["historical_ctr"] = round(candidate_ctr, 6)
+    deltas = []
+    for key in sorted(set(baseline_metrics.keys()) | set(candidate_metrics.keys())):
+        b = float(baseline_metrics.get(key, 0.0))
+        c = float(candidate_metrics.get(key, 0.0))
+        delta = c - b
+        delta_pct = (delta / b) if b != 0 else None
+        deltas.append(
+            {
+                "metric": key,
+                "baseline": round(b, 6),
+                "candidate": round(c, 6),
+                "delta": round(delta, 6),
+                "delta_pct": round(delta_pct, 6) if delta_pct is not None else None,
+            }
+        )
+
+    return {
+        "api_version": "v1",
+        "window_days": days,
+        "top_n": top_n,
+        "baseline_config_id": baseline_config_id,
+        "candidate_config_id": candidate_config_id,
+        "runs_considered": len(runs),
+        "runs_evaluated": evaluated,
+        "skipped_no_relevant": skipped_no_relevant,
+        "skipped_missing_context": skipped_missing_context,
+        "require_relevant": require_relevant,
+        "baseline_metrics": baseline_metrics,
+        "candidate_metrics": candidate_metrics,
+        "deltas": deltas,
+        "historical_events": {
+            "baseline": {"impressions": baseline_impressions, "clicks": baseline_clicks},
+            "candidate": {"impressions": candidate_impressions, "clicks": candidate_clicks},
+        },
+    }
+
+
+def _evaluate_promotion_guard(compare_payload: Dict[str, Any], guard: Dict[str, Any]) -> Dict[str, Any]:
+    baseline = compare_payload.get("baseline_metrics") or {}
+    candidate = compare_payload.get("candidate_metrics") or {}
+
+    min_ndcg_lift = float(guard.get("min_ndcg_lift", 0.0))
+    min_ctr_lift = float(guard.get("min_ctr_lift", 0.0))
+    max_precision_drop = float(guard.get("max_precision_drop", 0.0))
+    max_recall_drop = float(guard.get("max_recall_drop", 0.0))
+    max_mrr_drop = float(guard.get("max_mrr_drop", 0.0))
+
+    checks = []
+
+    ndcg_delta = float(candidate.get("ndcg_at_k", 0.0)) - float(baseline.get("ndcg_at_k", 0.0))
+    checks.append(
+        {
+            "metric": "ndcg_at_k_delta",
+            "value": round(ndcg_delta, 6),
+            "target": round(min_ndcg_lift, 6),
+            "operator": ">=",
+            "pass": ndcg_delta >= min_ndcg_lift,
+        }
+    )
+
+    ctr_delta = float(candidate.get("historical_ctr", 0.0)) - float(baseline.get("historical_ctr", 0.0))
+    checks.append(
+        {
+            "metric": "historical_ctr_delta",
+            "value": round(ctr_delta, 6),
+            "target": round(min_ctr_lift, 6),
+            "operator": ">=",
+            "pass": ctr_delta >= min_ctr_lift,
+        }
+    )
+
+    precision_drop = float(baseline.get("precision_at_k", 0.0)) - float(candidate.get("precision_at_k", 0.0))
+    checks.append(
+        {
+            "metric": "precision_drop",
+            "value": round(precision_drop, 6),
+            "target": round(max_precision_drop, 6),
+            "operator": "<=",
+            "pass": precision_drop <= max_precision_drop,
+        }
+    )
+
+    recall_drop = float(baseline.get("recall_at_k", 0.0)) - float(candidate.get("recall_at_k", 0.0))
+    checks.append(
+        {
+            "metric": "recall_drop",
+            "value": round(recall_drop, 6),
+            "target": round(max_recall_drop, 6),
+            "operator": "<=",
+            "pass": recall_drop <= max_recall_drop,
+        }
+    )
+
+    mrr_drop = float(baseline.get("mrr", 0.0)) - float(candidate.get("mrr", 0.0))
+    checks.append(
+        {
+            "metric": "mrr_drop",
+            "value": round(mrr_drop, 6),
+            "target": round(max_mrr_drop, 6),
+            "operator": "<=",
+            "pass": mrr_drop <= max_mrr_drop,
+        }
+    )
+
+    passed = all(item["pass"] for item in checks)
+    return {
+        "passed": passed,
+        "checks": checks,
+        "guard": {
+            "min_ndcg_lift": min_ndcg_lift,
+            "min_ctr_lift": min_ctr_lift,
+            "max_precision_drop": max_precision_drop,
+            "max_recall_drop": max_recall_drop,
+            "max_mrr_drop": max_mrr_drop,
+        },
+    }
+
+
+@app.route("/api/metrics/offline/config-compare", methods=["GET"])
+def compare_offline_configs():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        limit_runs = max(10, min(5000, int(request.args.get("limit_runs", 500))))
+        limit_events = max(1000, min(200000, int(request.args.get("limit_events", 100000))))
+        top_n = max(1, min(20, int(request.args.get("top_n", 5))))
+        baseline_config_id = str(request.args.get("baseline_config_id", "balanced")).strip() or "balanced"
+        candidate_config_id = str(request.args.get("candidate_config_id", "")).strip()
+        require_relevant = request.args.get("require_relevant", "true").lower() != "false"
+        if not candidate_config_id:
+            return jsonify({"error": "candidate_config_id is required"}), 400
+        return jsonify(
+            _compute_offline_config_compare_result(
+                baseline_config_id=baseline_config_id,
+                candidate_config_id=candidate_config_id,
+                days=days,
+                limit_runs=limit_runs,
+                limit_events=limit_events,
+                top_n=top_n,
+                require_relevant=require_relevant,
+            )
+        )
+    except Exception as e:
+        logger.error(f"Error comparing offline configs: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
@@ -4080,6 +4778,95 @@ def _compute_experiment_metrics(days: int, experiment_id: str, limit_runs: int, 
         "variants": variants,
         "runs_with_assignment": len(run_assignments),
     }
+
+
+def _compute_recommendation_quality_metrics(
+    recommendations: List[Dict[str, Any]],
+    relevant_article_ids: set,
+) -> Dict[str, float]:
+    top_k = max(1, len(recommendations))
+    hit_positions = []
+    for idx, rec in enumerate(recommendations, start=1):
+        if rec.get("article_id") in relevant_article_ids:
+            hit_positions.append(idx)
+    hits = len(hit_positions)
+    precision_at_k = hits / top_k
+    recall_at_k = (hits / len(relevant_article_ids)) if relevant_article_ids else 0.0
+    mrr = (1.0 / hit_positions[0]) if hit_positions else 0.0
+
+    dcg = 0.0
+    for rank in hit_positions:
+        dcg += 1.0 / math.log2(rank + 1)
+    ideal_hits = min(len(relevant_article_ids), top_k)
+    idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_hits + 1))
+    ndcg_at_k = (dcg / idcg) if idcg > 0 else 0.0
+
+    unique_sources = {rec.get("source", "unknown") for rec in recommendations}
+    source_coverage_at_k = len(unique_sources) / top_k if top_k else 0.0
+    avg_score = sum(float(rec.get("score", 0.0)) for rec in recommendations) / top_k if top_k else 0.0
+    freshness_values = []
+    for rec in recommendations:
+        features = rec.get("features") or {}
+        freshness = features.get("freshness")
+        if isinstance(freshness, (int, float)):
+            freshness_values.append(float(freshness))
+    avg_freshness = (sum(freshness_values) / len(freshness_values)) if freshness_values else 0.0
+
+    return {
+        "precision_at_k": precision_at_k,
+        "recall_at_k": recall_at_k,
+        "ndcg_at_k": ndcg_at_k,
+        "mrr": mrr,
+        "source_coverage_at_k": source_coverage_at_k,
+        "avg_score": avg_score,
+        "avg_freshness": avg_freshness,
+    }
+
+
+def _aggregate_quality_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
+    if not rows:
+        return {
+            "precision_at_k": 0.0,
+            "recall_at_k": 0.0,
+            "ndcg_at_k": 0.0,
+            "mrr": 0.0,
+            "source_coverage_at_k": 0.0,
+            "avg_score": 0.0,
+            "avg_freshness": 0.0,
+        }
+    totals: Dict[str, float] = {}
+    for row in rows:
+        for key, value in row.items():
+            totals[key] = totals.get(key, 0.0) + float(value)
+    return {key: round(totals[key] / len(rows), 6) for key in totals}
+
+
+def _safe_recommend_for_config(
+    user_id: str,
+    user_reads: List[str],
+    top_n: int,
+    requested_sources: List[str],
+    config_id: str,
+    scenario_id: Optional[str] = None,
+) -> List[Dict]:
+    context = _build_decision_context(requested_sources, config_id, None)
+    selected_sources = context.get("selected_sources") or []
+    if not selected_sources:
+        return []
+    recommendations = recommender.recommend_for_user(
+        user_id,
+        recommender.article_vectors,
+        user_reads,
+        top_n=top_n,
+        sources=selected_sources,
+        config_id=context["effective_config_id"],
+        ranking_config=context["effective_ranking_config"],
+    )
+    if scenario_id:
+        scenario = store.get_scenario(scenario_id)
+        if scenario and scenario.get("enabled", True):
+            recommendations, _trace = _apply_scenario_rules(recommendations, scenario, include_decisions=False)
+    return recommendations[:top_n]
 
 
 @app.route("/api/metrics/experiments", methods=["GET"])

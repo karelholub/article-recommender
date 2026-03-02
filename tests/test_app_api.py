@@ -383,6 +383,167 @@ def test_cdp_meiro_endpoints_and_context():
     assert 'runs' in runs_payload
 
 
+def test_cdp_meiro_mapping_preview_endpoint():
+    client = app.test_client()
+    preview = client.post(
+        '/api/cdp/meiro/mapping/preview',
+        json={
+            'payload': {
+                'customer_entity_id': 'ext-preview-1',
+                'returned_attributes': {
+                    'web_all_products_viewed_3': [
+                        '["2026-03-02T12:00:49","sku","name","200","tops","Brand","https://www.e15.cz/a","img"]'
+                    ]
+                },
+            },
+            'mapping': {
+                'external_id_path': 'customer_entity_id',
+                'traits_path': 'returned_attributes',
+                'derivation_min_source_events': 1,
+                'derivation_min_category_events': 0,
+            },
+        },
+    )
+    assert preview.status_code == 200
+    payload = preview.get_json()
+    assert payload['provider'] == 'meiro'
+    assert payload['external_user_id'] == 'ext-preview-1'
+    assert 'path_resolution' in payload
+    assert 'derived' in payload
+    assert 'guardrail' in payload
+
+
+def test_recommendations_batch_endpoint():
+    client = app.test_client()
+    article_ids = list(recommender.article_vectors.keys())
+    source = recommender.extract_source(
+        recommender.article_vectors[article_ids[0]].get('metadata', {}).get('url', '')
+    )
+
+    response = client.post(
+        '/api/recommendations/batch',
+        json={
+            'continue_on_error': True,
+            'requests': [
+                {
+                    'request_id': 'batch-1',
+                    'user_id': 'demo_user',
+                    'user_reads': [article_ids[0]],
+                    'top_n': 2,
+                    'sources': [source],
+                    'config_id': 'balanced',
+                },
+                {
+                    'request_id': 'batch-2',
+                    'user_id': 'demo_user',
+                    'user_reads': [article_ids[1]],
+                    'top_n': 2,
+                    'sources': [source],
+                    'config_id': 'balanced',
+                },
+            ],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['count'] == 2
+    assert payload['success_count'] == 2
+    assert payload['error_count'] == 0
+    assert len(payload['results']) == 2
+    assert payload['results'][0]['status'] == 'ok'
+    assert payload['results'][0]['request_id'] == 'batch-1'
+    assert payload['results'][0]['result']['run_id']
+
+
+def test_offline_config_compare_and_promote_endpoints():
+    client = app.test_client()
+    config_id = f"candidate_{uuid.uuid4().hex[:8]}"
+    create = client.post(
+        '/api/ranking-configs',
+        json={
+            'config_id': config_id,
+            'weights': {'semantic': 0.6, 'freshness': 0.1, 'topic': 0.2, 'source': 0.1},
+            'time_decay_days': 14,
+            'source_weights': {'www.e15.cz': 1.2},
+        },
+    )
+    assert create.status_code == 201
+
+    compare = client.get(
+        f'/api/metrics/offline/config-compare?days=3650&baseline_config_id=balanced&candidate_config_id={config_id}&limit_runs=200&top_n=5&require_relevant=false'
+    )
+    assert compare.status_code == 200
+    compare_payload = compare.get_json()
+    assert compare_payload['baseline_config_id'] == 'balanced'
+    assert compare_payload['candidate_config_id'] == config_id
+    assert 'deltas' in compare_payload
+    assert 'historical_ctr' in compare_payload['baseline_metrics']
+
+    promote = client.post(
+        '/api/ranking-configs/promote',
+        json={'source_config_id': config_id, 'target_config_id': 'balanced'},
+    )
+    assert promote.status_code == 200
+    promote_payload = promote.get_json()
+    assert promote_payload['source_config_id'] == config_id
+    assert promote_payload['target_config_id'] == 'balanced'
+
+    guarded_reject = client.post(
+        '/api/ranking-configs/promote-with-guard',
+        json={
+            'baseline_config_id': 'balanced',
+            'candidate_config_id': config_id,
+            'target_config_id': 'balanced',
+            'days': 3650,
+            'limit_runs': 200,
+            'top_n': 5,
+            'require_relevant': False,
+            'guard': {'min_ndcg_lift': 0.9},
+        },
+    )
+    assert guarded_reject.status_code == 409
+    reject_payload = guarded_reject.get_json()
+    assert 'guard_evaluation' in reject_payload
+    assert reject_payload['guard_evaluation']['passed'] is False
+
+    guarded_pass = client.post(
+        '/api/ranking-configs/promote-with-guard',
+        json={
+            'baseline_config_id': 'balanced',
+            'candidate_config_id': config_id,
+            'target_config_id': 'balanced',
+            'days': 3650,
+            'limit_runs': 200,
+            'top_n': 5,
+            'require_relevant': False,
+            'guard': {'min_ndcg_lift': -1.0, 'min_ctr_lift': -1.0},
+        },
+    )
+    assert guarded_pass.status_code == 200
+    guarded_pass_payload = guarded_pass.get_json()
+    assert guarded_pass_payload['guard_evaluation']['passed'] is True
+    assert guarded_pass_payload['source_config_id'] == config_id
+
+
+def test_ranking_config_auto_tune_preview():
+    client = app.test_client()
+    response = client.post(
+        '/api/ranking-configs/balanced/auto-tune',
+        json={
+            'days': 3650,
+            'min_impressions': 1,
+            'learning_rate': 0.3,
+            'max_weight_delta': 0.2,
+            'apply': False,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['config_id'] == 'balanced'
+    assert 'proposed_updates' in payload
+    assert payload['applied'] is False
+
+
 def test_disabled_source_not_used_by_default_query():
     client = app.test_client()
     sources_payload = client.get('/api/sources').get_json()

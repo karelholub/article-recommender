@@ -75,6 +75,19 @@
             </div>
         </div>
     </div>
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Mapping Preview</strong>
+                <button id="preview-cdp-mapping" class="btn btn-sm btn-outline-secondary">Preview Mapping</button>
+            </div>
+            <div class="card-body">
+                <textarea id="cdp-preview-payload" class="form-control form-control-sm mb-2" rows="8" placeholder='{"customer_entity_id":"...","returned_attributes":{}}'></textarea>
+                <input id="cdp-preview-fallback-external-id" class="form-control form-control-sm mb-2" placeholder="fallback external ID (optional)">
+                <pre id="cdp-mapping-preview-output" class="small mb-0">Paste a sample Meiro payload and run preview.</pre>
+            </div>
+        </div>
+    </div>
     <div class="col-12">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">

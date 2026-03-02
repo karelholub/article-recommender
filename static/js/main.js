@@ -23,8 +23,33 @@ let reportingLastExperiments = null;
 let reportingLastExperimentComparison = null;
 let reportingQualitySnapshots = [];
 let reportingLastQualityCompare = null;
+let reportingLastConfigCompare = null;
 let cdpIntegration = null;
 let recommendationRuns = [];
+const GUARD_PRESET_STORAGE_KEY = 'reporting_guard_preset_v1';
+const GUARD_PRESETS = {
+    conservative: {
+        min_ndcg_lift: 0.01,
+        min_ctr_lift: 0.002,
+        max_precision_drop: 0.005,
+        max_recall_drop: 0.005,
+        max_mrr_drop: 0.005
+    },
+    balanced: {
+        min_ndcg_lift: 0.0,
+        min_ctr_lift: 0.0,
+        max_precision_drop: 0.02,
+        max_recall_drop: 0.02,
+        max_mrr_drop: 0.02
+    },
+    aggressive: {
+        min_ndcg_lift: -0.005,
+        min_ctr_lift: -0.001,
+        max_precision_drop: 0.05,
+        max_recall_drop: 0.05,
+        max_mrr_drop: 0.05
+    }
+};
 
 function hasElement(id) {
     return Boolean(document.getElementById(id));
@@ -35,13 +60,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('article-list')) loadArticles();
     if (hasElement('article-stats')) loadStats();
     if (hasElement('source-filters') || hasElement('reporting-source-filter')) loadSources();
-    if (hasElement('ranking-config')) loadRankingConfigs();
+    if (hasElement('ranking-config') || hasElement('config-compare-baseline')) loadRankingConfigs();
     if (hasElement('scenario-select') || hasElement('reporting-scenario-filter') || hasElement('scenario-id')) loadScenarios();
     if (hasElement('offline-metrics')) loadOfflineMetrics();
     if (hasElement('scenario-metrics')) loadScenarioMetrics();
     if (hasElement('scenario-source-metrics')) loadScenarioSourceMetrics();
     if (hasElement('threshold-p95-ms')) loadAlertThresholds();
     if (hasElement('sli-overview')) loadSliOverview();
+    if (hasElement('surface-metrics-summary')) loadRecommendationSurfaceMetrics();
     if (hasElement('alert-incidents')) loadAlertIncidents();
     if (hasElement('cleanup-status')) loadCleanupStatus();
     if (hasElement('rollups-status')) loadRollupsStatus();
@@ -66,6 +92,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('reporting-summary')) {
         loadReportingWorkspace();
         loadQualitySnapshotHistory();
+    }
+    if (hasElement('guard-preset')) {
+        loadGuardPresetFromStorage();
     }
     setupEventListeners();
 });
@@ -674,21 +703,26 @@ async function loadRankingConfigs() {
         rankingConfigs = data.configs || {};
 
         const select = document.getElementById('ranking-config');
-        const configIds = Object.keys(rankingConfigs);
-        select.innerHTML = configIds.map(id => `<option value="${id}">${id}</option>`).join('');
+        if (select) {
+            const configIds = Object.keys(rankingConfigs);
+            select.innerHTML = configIds.map(id => `<option value="${id}">${id}</option>`).join('');
 
-        if (data.default_config_id && rankingConfigs[data.default_config_id]) {
-            select.value = data.default_config_id;
+            if (data.default_config_id && rankingConfigs[data.default_config_id]) {
+                select.value = data.default_config_id;
+            }
+            populateRankingConfigEditor(select.value);
         }
+        renderConfigCompareSelectors();
         renderRuleBuilderConfigOptions();
-        populateRankingConfigEditor(select.value);
         loadDecisionContext();
     } catch (error) {
         console.error('Error loading ranking configs:', error);
-        document.getElementById('ranking-config').innerHTML = '<option value="balanced">balanced</option>';
+        const select = document.getElementById('ranking-config');
+        if (select) select.innerHTML = '<option value="balanced">balanced</option>';
         rankingConfigs = {};
         renderRuleBuilderConfigOptions();
-        populateRankingConfigEditor('balanced');
+        renderConfigCompareSelectors();
+        if (select) populateRankingConfigEditor('balanced');
     }
 }
 
@@ -1216,6 +1250,48 @@ function renderSliOverview(payload) {
     `;
 }
 
+function renderRecommendationSurfaceMetrics(payload) {
+    const summary = document.getElementById('surface-metrics-summary');
+    const table = document.getElementById('surface-metrics-table');
+    if (!summary || !table) return;
+    const rec = payload.recommendation_api || {};
+    const surfaces = rec.surfaces || [];
+    summary.innerHTML = `
+        <strong>Window:</strong> ${payload.window_days} days
+        | <strong>Total runs:</strong> ${rec.runs ?? 0}
+        | <strong>P95:</strong> ${rec.p95_duration_ms ?? 'n/a'} ms
+        | <strong>Avg:</strong> ${rec.avg_duration_ms ?? 'n/a'} ms
+    `;
+    const rows = surfaces.map(item => `
+        <tr>
+            <td>${item.surface}</td>
+            <td>${item.runs ?? 0}</td>
+            <td>${(Number(item.share || 0) * 100).toFixed(1)}%</td>
+            <td>${item.avg_duration_ms == null ? 'n/a' : Number(item.avg_duration_ms).toFixed(2)}</td>
+            <td>${(Number(item.external_id_share || 0) * 100).toFixed(1)}%</td>
+        </tr>
+    `).join('');
+    table.innerHTML = rows || '<tr><td colspan="5" class="text-muted">No recommendation runs in selected window.</td></tr>';
+}
+
+async function loadRecommendationSurfaceMetrics() {
+    const summary = document.getElementById('surface-metrics-summary');
+    const table = document.getElementById('surface-metrics-table');
+    if (!summary || !table) return;
+    try {
+        const response = await fetch('/api/observability/overview?days=30');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load observability overview');
+        }
+        const payload = await response.json();
+        renderRecommendationSurfaceMetrics(payload);
+    } catch (error) {
+        summary.textContent = `Surface metrics unavailable: ${error.message}`;
+        table.innerHTML = '<tr><td colspan="5" class="text-danger">Failed to load surface metrics.</td></tr>';
+    }
+}
+
 async function loadSliOverview() {
     try {
         const persist = document.getElementById('persist-incidents-on-sli')?.checked;
@@ -1368,14 +1444,28 @@ async function loadCdpConfig() {
         document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(payload.mapping?.scenario_segment_map || {}, null, 2);
         document.getElementById('cdp-config-segment-map').value = JSON.stringify(payload.mapping?.config_segment_map || {}, null, 2);
         document.getElementById('cdp-segment-priority').value = (payload.mapping?.segment_priority || []).join(', ');
+        const previewInput = document.getElementById('cdp-preview-payload');
+        if (previewInput && !previewInput.value.trim()) {
+            previewInput.value = JSON.stringify(
+                {
+                    customer_entity_id: 'external-user-id',
+                    returned_attributes: {
+                        web_all_products_viewed_3: [
+                            '["2026-03-02T12:00:49","sku","name","200","tops","Brand","https://source.example/a","img"]'
+                        ]
+                    }
+                },
+                null,
+                2
+            );
+        }
         if (statusEl) statusEl.textContent = `Loaded. Updated at ${payload.updated_at || 'n/a'}.`;
     } catch (error) {
         if (statusEl) statusEl.textContent = `CDP config unavailable: ${error.message}`;
     }
 }
 
-async function saveCdpConfig() {
-    const statusEl = document.getElementById('cdp-config-status');
+function collectCdpMappingFromForm() {
     let scenarioMap = {};
     let configMap = {};
     try {
@@ -1389,6 +1479,30 @@ async function saveCdpConfig() {
     if (weightRange.length !== 2 || !Number.isFinite(weightRange[0]) || !Number.isFinite(weightRange[1])) {
         throw new Error('Invalid derivation weight range (expected min:max)');
     }
+    return {
+        external_id_path: (document.getElementById('cdp-external-id-path').value || '').trim(),
+        traits_path: (document.getElementById('cdp-traits-path').value || '').trim(),
+        segments_path: (document.getElementById('cdp-segments-path').value || '').trim(),
+        fixed_segments: (document.getElementById('cdp-fixed-segments').value || '').split(',').map(item => item.trim()).filter(Boolean),
+        preferred_sources_trait: (document.getElementById('cdp-preferred-sources-trait').value || '').trim(),
+        excluded_sources_trait: (document.getElementById('cdp-excluded-sources-trait').value || '').trim(),
+        source_weights_trait: (document.getElementById('cdp-source-weights-trait').value || '').trim(),
+        source_weight_trait_prefix: (document.getElementById('cdp-source-weight-prefix').value || '').trim(),
+        derivation_min_source_events: Number(document.getElementById('cdp-derivation-min-source-events').value || 3),
+        derivation_min_category_events: Number(document.getElementById('cdp-derivation-min-category-events').value || 1),
+        derivation_max_preferred_sources: Number(document.getElementById('cdp-derivation-max-sources').value || 5),
+        derivation_min_source_weight: Number(weightRange[0]),
+        derivation_max_source_weight: Number(weightRange[1]),
+        derivation_allowed_sources: (document.getElementById('cdp-derivation-allowlist').value || '').split(',').map(item => item.trim()).filter(Boolean),
+        derivation_blocked_sources: (document.getElementById('cdp-derivation-blocklist').value || '').split(',').map(item => item.trim()).filter(Boolean),
+        scenario_segment_map: scenarioMap,
+        config_segment_map: configMap,
+        segment_priority: (document.getElementById('cdp-segment-priority').value || '').split(',').map(item => item.trim()).filter(Boolean)
+    };
+}
+
+async function saveCdpConfig() {
+    const statusEl = document.getElementById('cdp-config-status');
     const payload = {
         enabled: document.getElementById('cdp-enabled').checked,
         config: {
@@ -1399,26 +1513,7 @@ async function saveCdpConfig() {
             timeout_seconds: Number(document.getElementById('cdp-timeout-seconds').value || 5),
             request_retries: Number(document.getElementById('cdp-request-retries').value || 2)
         },
-        mapping: {
-            external_id_path: (document.getElementById('cdp-external-id-path').value || '').trim(),
-            traits_path: (document.getElementById('cdp-traits-path').value || '').trim(),
-            segments_path: (document.getElementById('cdp-segments-path').value || '').trim(),
-            fixed_segments: (document.getElementById('cdp-fixed-segments').value || '').split(',').map(item => item.trim()).filter(Boolean),
-            preferred_sources_trait: (document.getElementById('cdp-preferred-sources-trait').value || '').trim(),
-            excluded_sources_trait: (document.getElementById('cdp-excluded-sources-trait').value || '').trim(),
-            source_weights_trait: (document.getElementById('cdp-source-weights-trait').value || '').trim(),
-            source_weight_trait_prefix: (document.getElementById('cdp-source-weight-prefix').value || '').trim(),
-            derivation_min_source_events: Number(document.getElementById('cdp-derivation-min-source-events').value || 3),
-            derivation_min_category_events: Number(document.getElementById('cdp-derivation-min-category-events').value || 1),
-            derivation_max_preferred_sources: Number(document.getElementById('cdp-derivation-max-sources').value || 5),
-            derivation_min_source_weight: Number(weightRange[0]),
-            derivation_max_source_weight: Number(weightRange[1]),
-            derivation_allowed_sources: (document.getElementById('cdp-derivation-allowlist').value || '').split(',').map(item => item.trim()).filter(Boolean),
-            derivation_blocked_sources: (document.getElementById('cdp-derivation-blocklist').value || '').split(',').map(item => item.trim()).filter(Boolean),
-            scenario_segment_map: scenarioMap,
-            config_segment_map: configMap,
-            segment_priority: (document.getElementById('cdp-segment-priority').value || '').split(',').map(item => item.trim()).filter(Boolean)
-        },
+        mapping: collectCdpMappingFromForm(),
         actor_id: getOperatorId() || undefined
     };
     if (statusEl) statusEl.textContent = 'Saving CDP config...';
@@ -1587,6 +1682,34 @@ async function deriveCdpProfile(persist = false) {
     }
 }
 
+async function previewCdpMapping() {
+    const output = document.getElementById('cdp-mapping-preview-output');
+    if (!output) return;
+    let samplePayload = {};
+    try {
+        samplePayload = JSON.parse(document.getElementById('cdp-preview-payload')?.value || '{}');
+    } catch (_error) {
+        throw new Error('Invalid JSON in sample payload');
+    }
+    output.textContent = 'Previewing mapping...';
+    const response = await fetch('/api/cdp/meiro/mapping/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            payload: samplePayload,
+            fallback_external_user_id: (document.getElementById('cdp-preview-fallback-external-id')?.value || '').trim(),
+            mapping: collectCdpMappingFromForm(),
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to preview mapping');
+    }
+    const preview = await response.json();
+    output.textContent = JSON.stringify(preview, null, 2);
+}
+
 async function runCleanupNow() {
     const container = document.getElementById('cleanup-status');
     container.textContent = 'Running cleanup...';
@@ -1685,6 +1808,35 @@ async function loadDecisionContext() {
     } catch (error) {
         container.textContent = `Failed to load decision context: ${error.message}`;
     }
+}
+
+async function runBatchRecommendations() {
+    const input = document.getElementById('batch-recommendation-requests');
+    const output = document.getElementById('batch-recommendation-output');
+    if (!input || !output) return;
+    let requestsPayload = [];
+    try {
+        requestsPayload = JSON.parse(input.value || '[]');
+    } catch (_error) {
+        throw new Error('Invalid batch JSON payload');
+    }
+    if (!Array.isArray(requestsPayload) || !requestsPayload.length) {
+        throw new Error('Batch payload must be a non-empty array');
+    }
+    output.textContent = 'Running batch...';
+    const response = await fetch('/api/recommendations/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            continue_on_error: Boolean(document.getElementById('batch-continue-on-error')?.checked),
+            requests: requestsPayload
+        })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Batch request failed');
+    }
+    output.textContent = JSON.stringify(payload, null, 2);
 }
 
 async function loadEngineConfigSnapshot() {
@@ -2120,6 +2272,54 @@ function renderQualitySnapshotCompare(payload) {
     }
 }
 
+function renderConfigCompareSelectors() {
+    const baseline = document.getElementById('config-compare-baseline');
+    const candidate = document.getElementById('config-compare-candidate');
+    if (!baseline || !candidate) return;
+    const configs = Object.values(rankingConfigs || {});
+    const options = configs.map(item => {
+        const configId = item?.config?.config_id || '';
+        const version = item?.version ?? 0;
+        return `<option value="${configId}">${configId} (v${version})</option>`;
+    }).join('');
+    baseline.innerHTML = options || '<option value="">No configs</option>';
+    candidate.innerHTML = options || '<option value="">No configs</option>';
+    if (configs.length) {
+        if (!baseline.value) baseline.value = 'balanced';
+        if (!baseline.value) baseline.value = configs[0]?.config?.config_id || '';
+        if (!candidate.value || candidate.value === baseline.value) {
+            const alternative = configs.find(item => (item?.config?.config_id || '') !== baseline.value);
+            candidate.value = alternative?.config?.config_id || baseline.value;
+        }
+    }
+}
+
+function renderConfigCompareResult(payload) {
+    reportingLastConfigCompare = payload;
+    const summary = document.getElementById('reporting-config-compare-summary');
+    const table = document.getElementById('reporting-config-compare-table');
+    if (summary) {
+        summary.innerHTML = `
+            <strong>Runs:</strong> considered ${payload.runs_considered ?? 0}, evaluated ${payload.runs_evaluated ?? 0}
+            | <strong>Skipped no relevant:</strong> ${payload.skipped_no_relevant ?? 0}
+            | <strong>Baseline:</strong> ${payload.baseline_config_id}
+            | <strong>Candidate:</strong> ${payload.candidate_config_id}
+        `;
+    }
+    if (table) {
+        const rows = (payload.deltas || []).map(item => `
+            <tr>
+                <td>${item.metric}</td>
+                <td>${Number(item.baseline || 0).toFixed(6)}</td>
+                <td>${Number(item.candidate || 0).toFixed(6)}</td>
+                <td>${Number(item.delta || 0).toFixed(6)}</td>
+                <td>${item.delta_pct == null ? 'n/a' : `${(Number(item.delta_pct) * 100).toFixed(2)}%`}</td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="5" class="text-muted">No config comparison data.</td></tr>';
+    }
+}
+
 async function loadQualitySnapshotHistory() {
     const summary = document.getElementById('reporting-quality-summary');
     try {
@@ -2175,6 +2375,182 @@ async function compareQualitySnapshots() {
     }
     const payload = await response.json();
     renderQualitySnapshotCompare(payload);
+}
+
+async function runOfflineConfigCompare() {
+    const baselineId = document.getElementById('config-compare-baseline')?.value || '';
+    const candidateId = document.getElementById('config-compare-candidate')?.value || '';
+    if (!baselineId || !candidateId) {
+        throw new Error('Select baseline and candidate configs');
+    }
+    const days = Math.max(1, Math.min(365, Number(document.getElementById('reporting-days')?.value || 30)));
+    const topN = Math.max(1, Math.min(20, Number(document.getElementById('config-compare-top-n')?.value || 5)));
+    const limitRuns = Math.max(10, Math.min(5000, Number(document.getElementById('config-compare-limit-runs')?.value || 300)));
+    const requireRelevant = Boolean(document.getElementById('config-compare-require-relevant')?.checked);
+    const summary = document.getElementById('reporting-config-compare-summary');
+    if (summary) summary.textContent = 'Running config comparison...';
+
+    const params = new URLSearchParams({
+        days: String(days),
+        baseline_config_id: baselineId,
+        candidate_config_id: candidateId,
+        top_n: String(topN),
+        limit_runs: String(limitRuns),
+        require_relevant: requireRelevant ? 'true' : 'false'
+    });
+    const response = await fetch(`/api/metrics/offline/config-compare?${params.toString()}`);
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to compare ranking configs');
+    }
+    const payload = await response.json();
+    renderConfigCompareResult(payload);
+}
+
+async function promoteCandidateConfig() {
+    const sourceConfigId = document.getElementById('config-compare-candidate')?.value || '';
+    if (!sourceConfigId) {
+        throw new Error('Select candidate config to promote');
+    }
+    const response = await fetch('/api/ranking-configs/promote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            source_config_id: sourceConfigId,
+            target_config_id: 'balanced',
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to promote config');
+    }
+    const payload = await response.json();
+    const summary = document.getElementById('reporting-config-compare-summary');
+    if (summary) summary.textContent = `Promoted ${payload.source_config_id} to ${payload.target_config_id} v${payload.target_version}.`;
+    await loadRankingConfigs();
+}
+
+function collectPromotionGuardFromUi() {
+    return {
+        min_ndcg_lift: Number(document.getElementById('guard-min-ndcg-lift')?.value || 0),
+        min_ctr_lift: Number(document.getElementById('guard-min-ctr-lift')?.value || 0),
+        max_precision_drop: Number(document.getElementById('guard-max-precision-drop')?.value || 0),
+        max_recall_drop: Number(document.getElementById('guard-max-recall-drop')?.value || 0),
+        max_mrr_drop: Number(document.getElementById('guard-max-mrr-drop')?.value || 0)
+    };
+}
+
+function applyGuardPreset(presetName, persist = true) {
+    const preset = GUARD_PRESETS[presetName];
+    const select = document.getElementById('guard-preset');
+    if (!preset || !select) return;
+    select.value = presetName;
+    const pairs = [
+        ['guard-min-ndcg-lift', preset.min_ndcg_lift],
+        ['guard-min-ctr-lift', preset.min_ctr_lift],
+        ['guard-max-precision-drop', preset.max_precision_drop],
+        ['guard-max-recall-drop', preset.max_recall_drop],
+        ['guard-max-mrr-drop', preset.max_mrr_drop]
+    ];
+    pairs.forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (el) el.value = Number(value).toFixed(3);
+    });
+    if (persist) localStorage.setItem(GUARD_PRESET_STORAGE_KEY, presetName);
+}
+
+function loadGuardPresetFromStorage() {
+    const select = document.getElementById('guard-preset');
+    if (!select) return;
+    const stored = localStorage.getItem(GUARD_PRESET_STORAGE_KEY);
+    const preset = GUARD_PRESETS[stored] ? stored : 'balanced';
+    applyGuardPreset(preset, false);
+    select.value = preset;
+}
+
+function markGuardPresetCustom() {
+    const select = document.getElementById('guard-preset');
+    if (!select) return;
+    select.value = 'custom';
+    localStorage.setItem(GUARD_PRESET_STORAGE_KEY, 'custom');
+}
+
+async function promoteWithGuard() {
+    const baselineId = document.getElementById('config-compare-baseline')?.value || '';
+    const candidateId = document.getElementById('config-compare-candidate')?.value || '';
+    if (!baselineId || !candidateId) {
+        throw new Error('Select baseline and candidate configs');
+    }
+    const days = Math.max(1, Math.min(365, Number(document.getElementById('reporting-days')?.value || 30)));
+    const topN = Math.max(1, Math.min(20, Number(document.getElementById('config-compare-top-n')?.value || 5)));
+    const limitRuns = Math.max(10, Math.min(5000, Number(document.getElementById('config-compare-limit-runs')?.value || 300)));
+    const requireRelevant = Boolean(document.getElementById('config-compare-require-relevant')?.checked);
+    const summary = document.getElementById('reporting-config-compare-summary');
+    if (summary) summary.textContent = 'Evaluating promotion guard...';
+
+    const response = await fetch('/api/ranking-configs/promote-with-guard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            baseline_config_id: baselineId,
+            candidate_config_id: candidateId,
+            target_config_id: 'balanced',
+            days,
+            top_n: topN,
+            limit_runs: limitRuns,
+            require_relevant: requireRelevant,
+            guard: collectPromotionGuardFromUi(),
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        if (response.status === 409) {
+            renderConfigCompareResult(payload.comparison || {});
+            const failedChecks = (payload.guard_evaluation?.checks || []).filter(item => !item.pass);
+            const msg = failedChecks.map(item => `${item.metric} ${item.value} ${item.operator} ${item.target} (failed)`).join(' | ');
+            if (summary) summary.textContent = `Guard blocked promotion: ${msg || 'threshold not met'}`;
+            return;
+        }
+        throw new Error(payload.error || 'Failed guarded promotion');
+    }
+    renderConfigCompareResult(payload.comparison || {});
+    if (summary) summary.textContent = `Guard passed. Promoted ${payload.source_config_id} to ${payload.target_config_id} v${payload.target_version}.`;
+    await loadRankingConfigs();
+}
+
+async function autoTuneRankingConfig(apply = false) {
+    const output = document.getElementById('autotune-output');
+    if (!output) return;
+    const configId = document.getElementById('ranking-config')?.value || '';
+    if (!configId) {
+        throw new Error('Select a ranking config first');
+    }
+    output.textContent = apply ? 'Applying auto-tune...' : 'Calculating auto-tune preview...';
+    const response = await fetch(`/api/ranking-configs/${encodeURIComponent(configId)}/auto-tune`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            days: Number(document.getElementById('autotune-days')?.value || 30),
+            min_impressions: Number(document.getElementById('autotune-min-impressions')?.value || 50),
+            learning_rate: Number(document.getElementById('autotune-learning-rate')?.value || 0.5),
+            max_weight_delta: Number(document.getElementById('autotune-max-delta')?.value || 0.25),
+            min_source_weight: Number(document.getElementById('autotune-min-weight')?.value || 0.5),
+            max_source_weight: Number(document.getElementById('autotune-max-weight')?.value || 3.0),
+            apply,
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to auto-tune config');
+    }
+    const result = await response.json();
+    output.textContent = JSON.stringify(result, null, 2);
+    if (result.applied) {
+        await loadRankingConfigs();
+    }
 }
 
 async function loadReportingWorkspace() {
@@ -2830,6 +3206,42 @@ function setupEventListeners() {
             showError(error.message || 'Failed to compare snapshots');
         }
     });
+    on('run-config-compare', 'click', async () => {
+        try {
+            await runOfflineConfigCompare();
+        } catch (error) {
+            showError(error.message || 'Failed to compare ranking configs');
+        }
+    });
+    on('promote-candidate-config', 'click', async () => {
+        try {
+            await promoteCandidateConfig();
+        } catch (error) {
+            showError(error.message || 'Failed to promote config');
+        }
+    });
+    on('promote-with-guard', 'click', async () => {
+        try {
+            await promoteWithGuard();
+        } catch (error) {
+            showError(error.message || 'Failed guarded promotion');
+        }
+    });
+    on('apply-guard-preset', 'click', () => {
+        const preset = document.getElementById('guard-preset')?.value || 'balanced';
+        if (preset === 'custom') return;
+        applyGuardPreset(preset, true);
+    });
+    on('guard-preset', 'change', (event) => {
+        const preset = event.target.value || 'balanced';
+        if (preset === 'custom') {
+            localStorage.setItem(GUARD_PRESET_STORAGE_KEY, 'custom');
+            return;
+        }
+        applyGuardPreset(preset, true);
+    });
+    ['guard-min-ndcg-lift', 'guard-min-ctr-lift', 'guard-max-precision-drop', 'guard-max-recall-drop', 'guard-max-mrr-drop']
+        .forEach((id) => on(id, 'input', markGuardPresetCustom));
     on('compare-experiment-variants', 'click', async () => {
         try {
             await compareExperimentVariants();
@@ -2877,6 +3289,20 @@ function setupEventListeners() {
         } catch (error) {
             setRankingConfigStatus(error.message || 'Failed to delete ranking config', true);
             showError(error.message || 'Failed to delete ranking config');
+        }
+    });
+    on('preview-autotune', 'click', async () => {
+        try {
+            await autoTuneRankingConfig(false);
+        } catch (error) {
+            showError(error.message || 'Failed to preview auto-tune');
+        }
+    });
+    on('apply-autotune', 'click', async () => {
+        try {
+            await autoTuneRankingConfig(true);
+        } catch (error) {
+            showError(error.message || 'Failed to apply auto-tune');
         }
     });
     on('create-connector', 'click', async () => {
@@ -2945,6 +3371,7 @@ function setupEventListeners() {
         }
     });
     on('refresh-sli', 'click', loadSliOverview);
+    on('refresh-surface-metrics', 'click', loadRecommendationSurfaceMetrics);
     on('persist-incidents-on-sli', 'change', loadSliOverview);
     on('save-alert-thresholds', 'click', async () => {
         try {
@@ -3035,6 +3462,20 @@ function setupEventListeners() {
             await deriveCdpProfile(true);
         } catch (error) {
             showError(error.message || 'Failed to persist derivation');
+        }
+    });
+    on('preview-cdp-mapping', 'click', async () => {
+        try {
+            await previewCdpMapping();
+        } catch (error) {
+            showError(error.message || 'Failed to preview CDP mapping');
+        }
+    });
+    on('run-batch-recommendations', 'click', async () => {
+        try {
+            await runBatchRecommendations();
+        } catch (error) {
+            showError(error.message || 'Failed to run batch recommendations');
         }
     });
     on('refresh-audit-logs', 'click', loadAuditLogs);
