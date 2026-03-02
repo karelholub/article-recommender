@@ -40,13 +40,15 @@ class ConnectorIngestionService:
     def __init__(self, embed_file: Path, vector_dim: int = 64):
         self.embed_file = Path(embed_file)
         self.vector_dim = vector_dim
+        self.cluster_count = 8
         self.session = requests.Session()
         self.session.headers.update(
             {
                 "User-Agent": (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                )
+                ),
+                "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
             }
         )
 
@@ -102,7 +104,7 @@ class ConnectorIngestionService:
                 continue
 
             vector = self._embed_text(f"{title}\n{content}")
-            cluster = self._cluster_for_text(content)
+            cluster = self._cluster_for_vector(vector)
             existing[article_id] = {
                 "vector": vector,
                 "cluster": cluster,
@@ -169,9 +171,11 @@ class ConnectorIngestionService:
         if not base_url:
             raise ValueError("Section connector requires config.base_url")
 
+        self._prime_consent(base_url)
         response = self.session.get(base_url, timeout=12)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "lxml")
+        self._strip_overlays(soup)
         links = self._extract_links(soup, base_url)
         results: List[Dict] = []
         for link in links[:max_articles]:
@@ -184,15 +188,29 @@ class ConnectorIngestionService:
         base_host = urlparse(base_url).netloc
         deduped: List[str] = []
         seen = set()
-        for anchor in soup.select("a[href]"):
+        selectors = ["article a[href]", "main a[href]", "[data-testid*='article'] a[href]", "a[href]"]
+        anchors = []
+        for selector in selectors:
+            anchors = soup.select(selector)
+            if anchors:
+                break
+
+        for anchor in anchors:
             href = (anchor.get("href") or "").strip()
             if not href:
+                continue
+            if href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:"):
                 continue
             full_url = urljoin(base_url, href)
             parsed = urlparse(full_url)
             if parsed.netloc != base_host:
                 continue
             if parsed.path.count("/") < 2:
+                continue
+            if self._is_non_article_path(parsed.path):
+                continue
+            text = self._clean_text(anchor.get_text(" ", strip=True)).lower()
+            if self._looks_like_navigation_tab(text):
                 continue
             if full_url in seen:
                 continue
@@ -202,12 +220,14 @@ class ConnectorIngestionService:
 
     def _extract_article(self, url: str) -> Optional[Dict]:
         try:
+            self._prime_consent(url)
             response = self.session.get(url, timeout=12)
             response.raise_for_status()
         except Exception:
             return None
 
         soup = BeautifulSoup(response.text, "lxml")
+        self._strip_overlays(soup)
         title = self._clean_text(self._first_text(soup, ["h1.article-title", "h1.title", "h1"]))
         if not title:
             return None
@@ -251,9 +271,113 @@ class ConnectorIngestionService:
         vec = vec / norm
         return [float(x) for x in vec.tolist()]
 
-    def _cluster_for_text(self, text: str) -> int:
-        digest = hashlib.md5(text.encode("utf-8")).digest()  # nosec - non-cryptographic bucketing
-        return int.from_bytes(digest[:2], "big") % 8
+    def _cluster_for_vector(self, vector: List[float]) -> int:
+        vec = np.array(vector, dtype=np.float32)
+        norm = float(np.linalg.norm(vec))
+        if norm > 0:
+            vec = vec / norm
+        best_cluster = 0
+        best_score = -1.0
+        for idx in range(self.cluster_count):
+            centroid = self._cluster_anchor(idx, len(vec))
+            score = float(np.dot(vec, centroid))
+            if score > best_score:
+                best_score = score
+                best_cluster = idx
+        return int(best_cluster)
+
+    @staticmethod
+    def _cluster_anchor(idx: int, dim: int) -> np.ndarray:
+        seed = hashlib.sha1(f"cluster-anchor-{idx}".encode("utf-8")).digest()
+        values = np.frombuffer(seed * ((dim // len(seed)) + 1), dtype=np.uint8)[:dim]
+        vec = values.astype(np.float32) - 127.5
+        norm = float(np.linalg.norm(vec))
+        if norm == 0:
+            vec[0] = 1.0
+            norm = 1.0
+        return vec / norm
+
+    @staticmethod
+    def _looks_like_navigation_tab(text: str) -> bool:
+        if not text:
+            return False
+        tab_tokens = {
+            "cookie",
+            "cookies",
+            "souhlas",
+            "nastaveni",
+            "nastavení",
+            "preference",
+            "preferences",
+            "privacy",
+            "gdpr",
+            "menu",
+            "domu",
+            "domů",
+            "home",
+            "rubriky",
+            "sections",
+            "tema",
+            "téma",
+            "video",
+        }
+        return any(token in text for token in tab_tokens)
+
+    @staticmethod
+    def _is_non_article_path(path: str) -> bool:
+        lowered = path.lower()
+        blocked = (
+            "/tag/",
+            "/autor/",
+            "/autori/",
+            "/predplatne",
+            "/predplatné",
+            "/subscribe",
+            "/login",
+            "/prihlaseni",
+            "/přihlášení",
+            "/nastaveni",
+            "/nastavení",
+            "/preferences",
+            "/privacy",
+            "/cookies",
+            "/kontakt",
+            "/about",
+            "/newsletter",
+            "/rss",
+        )
+        return any(token in lowered for token in blocked)
+
+    def _prime_consent(self, url: str) -> None:
+        """Seed common consent cookies to reduce CMP overlay blocking."""
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        for name, value in (
+            ("cookie_consent", "accepted"),
+            ("cookies_accepted", "true"),
+            ("cmpconsent", "yes"),
+            ("euconsent-v2", "accepted"),
+        ):
+            self.session.cookies.set(name, value, domain=domain)
+
+    @staticmethod
+    def _strip_overlays(soup: BeautifulSoup) -> None:
+        selectors = [
+            "[id*='cookie']",
+            "[class*='cookie']",
+            "[id*='consent']",
+            "[class*='consent']",
+            "[id*='privacy']",
+            "[class*='privacy']",
+            "[id*='gdpr']",
+            "[class*='gdpr']",
+            "[role='dialog']",
+            ".modal",
+            ".overlay",
+        ]
+        for selector in selectors:
+            for node in soup.select(selector):
+                node.decompose()
 
     @staticmethod
     def _normalize_datetime(raw: str) -> str:

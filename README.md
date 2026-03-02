@@ -11,6 +11,8 @@ A Flask-based article recommendation system that uses text embeddings to provide
   - Freshness (time decay)
   - Topic clustering
   - Source priors
+- Connector scraping hardened for cookie/consent overlays and noisy preference/navigation tabs
+- Cluster diagnostics in UI (coverage, largest-cluster share, sample titles)
 - Source-aware recommendation filtering
 - Score explainability (feature values + weighted contributions)
 - UI operators console for:
@@ -209,6 +211,7 @@ python embed.py
 - `GET /api/maintenance/cleanup/status`: retention cleanup scheduler state
 - `POST /api/maintenance/cleanup/run-now`: trigger retention cleanup job now
 - `GET /api/stats`: Dataset statistics
+  - includes `cluster_quality` diagnostics
 
 Auth/rate-limit controls (disabled by default):
 - `API_AUTH_ENABLED=true`

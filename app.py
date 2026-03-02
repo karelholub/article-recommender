@@ -2574,12 +2574,23 @@ def get_stats():
             if cluster_topics[cluster]:
                 cluster_topics[cluster] = cluster_topics[cluster][:3]
 
+        total_articles = len(recommender.article_vectors)
+        clustered_total = sum(count for cluster, count in cluster_counts.items() if int(cluster) >= 0)
+        largest_cluster = max((count for cluster, count in cluster_counts.items() if int(cluster) >= 0), default=0)
+        cluster_quality = {
+            "cluster_count": len([cluster for cluster in cluster_counts.keys() if int(cluster) >= 0]),
+            "unclustered_count": int(cluster_counts.get(-1, 0)),
+            "coverage_ratio": round((clustered_total / total_articles), 4) if total_articles else 0.0,
+            "largest_cluster_share": round((largest_cluster / clustered_total), 4) if clustered_total else 0.0,
+        }
+
         return jsonify(
             {
-                "total_articles": len(recommender.article_vectors),
+                "total_articles": total_articles,
                 "cluster_distribution": cluster_counts,
                 "freshness_distribution": freshness_counts,
                 "cluster_topics": cluster_topics,
+                "cluster_quality": cluster_quality,
             }
         )
     except Exception as e:

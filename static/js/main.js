@@ -1888,6 +1888,15 @@ function displayStats(stats) {
         }]
     };
 
+    const clusterTopics = stats.cluster_topics || {};
+    const topicRows = Object.entries(clusterTopics).map(([cluster, titles]) => `
+        <tr>
+            <td>${cluster}</td>
+            <td>${Array.isArray(titles) && titles.length ? titles.join(' | ') : 'n/a'}</td>
+        </tr>
+    `).join('');
+    const quality = stats.cluster_quality || {};
+
     statsContainer.innerHTML = `
         <div class="row">
             <div class="col-md-6">
@@ -1898,6 +1907,17 @@ function displayStats(stats) {
                 <h5 class="mb-3">Topic Clusters</h5>
                 <canvas id="clusterChart"></canvas>
             </div>
+        </div>
+        <div class="mt-3 small text-muted">
+            <strong>Cluster coverage:</strong> ${(Number(quality.coverage_ratio || 0) * 100).toFixed(1)}%
+            | <strong>Largest cluster share:</strong> ${(Number(quality.largest_cluster_share || 0) * 100).toFixed(1)}%
+            | <strong>Cluster count:</strong> ${quality.cluster_count ?? 0}
+        </div>
+        <div class="table-responsive mt-2">
+            <table class="table table-sm mb-0">
+                <thead><tr><th>Cluster</th><th>Top sample titles</th></tr></thead>
+                <tbody>${topicRows || '<tr><td colspan="2" class="text-muted">No cluster topic data.</td></tr>'}</tbody>
+            </table>
         </div>
     `;
 

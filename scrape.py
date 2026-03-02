@@ -9,6 +9,7 @@ import re
 import random
 import unicodedata
 import argparse
+from urllib.parse import urljoin, urlparse
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +41,7 @@ class ArticleScraper:
     def _init_session(self):
         """Initialize session with cookies and initial request"""
         try:
+            self._prime_consent(self.base_url)
             # Make initial request to get cookies
             response = self.session.get(self.base_url, headers=self.headers)
             response.raise_for_status()
@@ -101,6 +103,42 @@ class ArticleScraper:
                 return False
                 
         return True
+
+    def _prime_consent(self, url: str):
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        for name, value in (
+            ('cookie_consent', 'accepted'),
+            ('cookies_accepted', 'true'),
+            ('cmpconsent', 'yes'),
+            ('euconsent-v2', 'accepted'),
+        ):
+            self.session.cookies.set(name, value, domain=domain)
+
+    @staticmethod
+    def _strip_overlays(soup: BeautifulSoup):
+        selectors = [
+            "[id*='cookie']",
+            "[class*='cookie']",
+            "[id*='consent']",
+            "[class*='consent']",
+            "[id*='privacy']",
+            "[class*='privacy']",
+            "[id*='gdpr']",
+            "[class*='gdpr']",
+            "[role='dialog']",
+            ".modal",
+            ".overlay",
+        ]
+        for selector in selectors:
+            for node in soup.select(selector):
+                node.decompose()
+
+    @staticmethod
+    def _looks_like_navigation_tab(text: str) -> bool:
+        txt = (text or "").lower()
+        tokens = {"cookie", "souhlas", "nastaveni", "nastavení", "preferences", "privacy", "gdpr", "menu", "rubriky"}
+        return any(token in txt for token in tokens)
     
     def _get_article_links(self) -> List[str]:
         """Get all article links from the main page"""
@@ -120,6 +158,7 @@ class ArticleScraper:
                 return []
             
             soup = BeautifulSoup(response.text, 'lxml')
+            self._strip_overlays(soup)
             
             # Find all article links
             article_links = []
@@ -132,14 +171,21 @@ class ArticleScraper:
                 'div.article-box a'  # Article boxes
             ]
             
+            base_host = urlparse(self.base_url).netloc
             for selector in selectors:
                 links = soup.select(selector)
                 for link in links:
-                    href = link.get('href', '')
-                    if href and not href.endswith(self.base_url.split('/')[-1]):
-                        full_url = f"https://www.e15.cz{href}" if not href.startswith('http') else href
-                        if self._is_valid_article_url(full_url):
-                            article_links.append(full_url)
+                    href = (link.get('href') or '').strip()
+                    if not href or href.startswith('#') or href.startswith('javascript:'):
+                        continue
+                    full_url = urljoin(self.base_url, href)
+                    parsed = urlparse(full_url)
+                    if parsed.netloc != base_host:
+                        continue
+                    if self._looks_like_navigation_tab(link.get_text(" ", strip=True)):
+                        continue
+                    if self._is_valid_article_url(full_url):
+                        article_links.append(full_url)
             
             # Log the HTML if no links found
             if not article_links:
@@ -157,6 +203,7 @@ class ArticleScraper:
         try:
             # Add random delay
             time.sleep(random.uniform(2, 4))
+            self._prime_consent(url)
             
             response = self.session.get(
                 url,
@@ -170,6 +217,7 @@ class ArticleScraper:
                 return None
             
             soup = BeautifulSoup(response.text, 'lxml')
+            self._strip_overlays(soup)
             
             # Extract article content with multiple selector attempts
             title = None

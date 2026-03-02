@@ -85,11 +85,16 @@ class ArticleEmbedder:
     
     def _cluster_embeddings(self, embeddings: List[List[float]], n_clusters: int = 5) -> List[int]:
         """Cluster similar articles together"""
+        if not embeddings:
+            return []
+        if len(embeddings) == 1:
+            return [0]
         # Normalize embeddings
         normalized_embeddings = normalize(np.array(embeddings))
         
         # Perform clustering
-        kmeans = KMeans(n_clusters=min(n_clusters, len(embeddings)), random_state=42)
+        effective_clusters = max(2, min(n_clusters, len(embeddings)))
+        kmeans = KMeans(n_clusters=effective_clusters, random_state=42, n_init=10)
         clusters = kmeans.fit_predict(normalized_embeddings)
         
         return clusters.tolist()
@@ -135,23 +140,28 @@ class ArticleEmbedder:
             logger.info(f"Processing {len(new_articles)} new/updated articles")
             start_time = time.time()
             
-            # Process in batches
+            # Process in batches for new/updated files
             article_ids = list(new_articles.keys())
             texts = [article['text'] for article in new_articles.values()]
             embeddings = self._process_batch(texts)
-            
-            # Cluster similar articles
-            clusters = self._cluster_embeddings(embeddings)
-            
-            # Update cache with metadata and clusters
-            for article_id, embedding, cluster, article_data in zip(
-                article_ids, embeddings, clusters, new_articles.values()
+
+            # Update cache with fresh vectors/metadata first.
+            for article_id, embedding, article_data in zip(
+                article_ids, embeddings, new_articles.values()
             ):
                 self.embedding_cache[article_id] = {
                     'vector': embedding,
-                    'cluster': int(cluster),
+                    'cluster': 0,
                     'metadata': article_data['metadata']
                 }
+
+            # Recluster the whole dataset for consistent global topic labels.
+            all_ids = list(self.embedding_cache.keys())
+            all_embeddings = [self.embedding_cache[item_id]['vector'] for item_id in all_ids]
+            target_clusters = max(2, min(8, int(np.sqrt(max(2, len(all_embeddings))))))
+            all_clusters = self._cluster_embeddings(all_embeddings, n_clusters=target_clusters)
+            for item_id, cluster in zip(all_ids, all_clusters):
+                self.embedding_cache[item_id]['cluster'] = int(cluster)
             
             # Save updated cache
             self._save_cache(self.embedding_cache)
