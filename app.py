@@ -102,6 +102,40 @@ _DEFAULT_MEIRO_MAPPING = {
     "derivation_max_preferred_sources": 5,
     "derivation_min_source_weight": 1.05,
     "derivation_max_source_weight": 2.0,
+    "personalization_mode": "active",
+    "fallback_mode": "source_defaults",
+    "freshness_sla_hours": 24,
+}
+_MEIRO_MAPPING_PRESETS = {
+    "news_basic": {
+        "label": "News Basic",
+        "mapping": {
+            "external_id_path": "customer_entity_id",
+            "traits_path": "returned_attributes",
+            "segments_path": "",
+            "preferred_sources_trait": "preferred_sources",
+            "excluded_sources_trait": "excluded_sources",
+            "source_weights_trait": "source_weights",
+            "source_weight_trait_prefix": "source_weight_",
+            "personalization_mode": "active",
+            "fallback_mode": "source_defaults",
+            "freshness_sla_hours": 24,
+        },
+    },
+    "news_segments_first": {
+        "label": "News Segments First",
+        "mapping": {
+            "external_id_path": "customer_entity_id",
+            "traits_path": "returned_attributes",
+            "segments_path": "returned_attributes.mx_predicted_lifestyle_interests",
+            "segment_priority": ["premium", "sports", "business", "technology"],
+            "scenario_segment_map": {"premium": "homepage_premium"},
+            "config_segment_map": {"sports": "topic_heavy", "business": "balanced"},
+            "personalization_mode": "observe",
+            "fallback_mode": "source_defaults",
+            "freshness_sla_hours": 12,
+        },
+    },
 }
 _DEFAULT_EMBEDDING_CONFIG = {
     "model_name": os.getenv("EMBEDDING_MODEL_NAME", "paraphrase-multilingual-mpnet-base-v2"),
@@ -242,6 +276,15 @@ def _normalize_meiro_mapping(mapping: Optional[Dict[str, Any]]) -> Dict[str, Any
         merged["derivation_min_source_weight"],
         float(merged.get("derivation_max_source_weight", 2.0)),
     )
+    personalization_mode = str(merged.get("personalization_mode", "active")).strip().lower()
+    if personalization_mode not in {"off", "observe", "active"}:
+        personalization_mode = "active"
+    fallback_mode = str(merged.get("fallback_mode", "source_defaults")).strip().lower()
+    if fallback_mode not in {"none", "source_defaults", "profile_traits"}:
+        fallback_mode = "source_defaults"
+    merged["personalization_mode"] = personalization_mode
+    merged["fallback_mode"] = fallback_mode
+    merged["freshness_sla_hours"] = max(1, min(24 * 30, int(merged.get("freshness_sla_hours", 24))))
     merged["fixed_segments"] = [str(item).strip() for item in merged["fixed_segments"] if str(item).strip()]
     merged["segment_priority"] = [str(item).strip() for item in merged["segment_priority"] if str(item).strip()]
     merged["derivation_allowed_sources"] = [
@@ -501,20 +544,38 @@ def _resolve_cdp_personalization(
         "selected_config_id": config_id,
         "requested_sources": list(requested_sources or []),
         "mapping": _DEFAULT_MEIRO_MAPPING,
+        "personalization_mode": "active",
+        "fallback_mode": "source_defaults",
+        "profile_stale": None,
+        "profile_age_hours": None,
     }
     if not store:
         return base
     integration = store.get_cdp_integration(_MEIRO_PROVIDER)
     mapping = _normalize_meiro_mapping(integration.get("mapping"))
     base["mapping"] = mapping
+    base["personalization_mode"] = mapping.get("personalization_mode", "active")
+    base["fallback_mode"] = mapping.get("fallback_mode", "source_defaults")
     if not integration.get("enabled"):
+        return base
+    if mapping.get("personalization_mode") == "off":
+        base["applied_mode"] = "off"
         return base
     if not external:
         return base
     profile = store.get_cdp_profile(_MEIRO_PROVIDER, external)
     if not profile:
+        base["applied_mode"] = "no_profile"
         return base
     base["profile_found"] = True
+    synced_at = _safe_parse_timestamp(str(profile.get("synced_at", "")))
+    profile_age_hours = None
+    profile_stale = None
+    if synced_at:
+        profile_age_hours = round((datetime.now() - synced_at).total_seconds() / 3600, 3)
+        profile_stale = profile_age_hours > float(mapping.get("freshness_sla_hours", 24))
+    base["profile_age_hours"] = profile_age_hours
+    base["profile_stale"] = profile_stale
     traits = profile.get("traits") or {}
     if not isinstance(traits, dict):
         traits = {}
@@ -564,16 +625,23 @@ def _resolve_cdp_personalization(
                 selected_config_id = candidate
                 break
 
+    allow_apply = mapping.get("personalization_mode") == "active" and (
+        profile_stale is not True or mapping.get("fallback_mode") == "profile_traits"
+    )
+    if mapping.get("personalization_mode") == "observe":
+        allow_apply = False
+
     base.update(
         {
             "applied": bool(profile),
             "preferred_sources": preferred_sources,
             "excluded_sources": excluded_sources,
-            "source_weight_overrides": source_weight_overrides,
-            "selected_scenario_id": selected_scenario_id,
-            "selected_config_id": selected_config_id,
-            "requested_sources": merged_sources,
+            "source_weight_overrides": source_weight_overrides if allow_apply else {},
+            "selected_scenario_id": selected_scenario_id if allow_apply else scenario_id,
+            "selected_config_id": selected_config_id if allow_apply else config_id,
+            "requested_sources": (merged_sources if allow_apply else list(requested_sources or [])),
             "profile_synced_at": profile.get("synced_at"),
+            "applied_mode": (mapping.get("personalization_mode") if allow_apply else f"{mapping.get('personalization_mode')}_no_apply"),
         }
     )
     return base
@@ -667,6 +735,14 @@ def _validate_scenario_rule_set(rule_set: Dict) -> Dict:
             for key, value in (candidate.get("source_boosts") or {}).items()
         },
         "ranking_config_id": str(candidate.get("ranking_config_id", "")).strip() or None,
+        "max_per_source": candidate.get("max_per_source"),
+        "max_per_topic": candidate.get("max_per_topic"),
+        "max_per_section": candidate.get("max_per_section"),
+        "min_freshness": candidate.get("min_freshness"),
+        "recent_boost_days": candidate.get("recent_boost_days"),
+        "recent_boost_factor": candidate.get("recent_boost_factor"),
+        "dedup_by_title": bool(candidate.get("dedup_by_title", False)),
+        "dedup_by_url": bool(candidate.get("dedup_by_url", False)),
     }
 
     if normalized["max_age_days"] is not None:
@@ -676,6 +752,23 @@ def _validate_scenario_rule_set(rule_set: Dict) -> Dict:
     for source, boost in normalized["source_boosts"].items():
         if boost <= 0:
             raise ValueError(f"source_boosts[{source}] must be greater than 0")
+    for key in ("max_per_source", "max_per_topic", "max_per_section"):
+        if normalized.get(key) is not None:
+            normalized[key] = max(1, int(normalized[key]))
+    if normalized.get("min_freshness") is not None:
+        normalized["min_freshness"] = float(normalized["min_freshness"])
+        if normalized["min_freshness"] < 0 or normalized["min_freshness"] > 1:
+            raise ValueError("min_freshness must be between 0 and 1")
+    if normalized.get("recent_boost_days") is not None:
+        normalized["recent_boost_days"] = max(0, int(normalized["recent_boost_days"]))
+    else:
+        normalized["recent_boost_days"] = 0
+    if normalized.get("recent_boost_factor") is not None:
+        normalized["recent_boost_factor"] = float(normalized["recent_boost_factor"])
+    else:
+        normalized["recent_boost_factor"] = 1.0
+    if normalized["recent_boost_factor"] < 0.5 or normalized["recent_boost_factor"] > 5:
+        raise ValueError("recent_boost_factor must be between 0.5 and 5")
 
     return normalized
 
@@ -1419,15 +1512,38 @@ def _apply_scenario_rules(
     source_boosts = {key: float(value) for key, value in (rule_set.get("source_boosts") or {}).items()}
     max_age_days = rule_set.get("max_age_days")
     min_score = rule_set.get("min_score")
+    min_freshness = rule_set.get("min_freshness")
+    max_per_source = rule_set.get("max_per_source")
+    max_per_topic = rule_set.get("max_per_topic")
+    max_per_section = rule_set.get("max_per_section")
+    recent_boost_days = rule_set.get("recent_boost_days")
+    recent_boost_factor = rule_set.get("recent_boost_factor")
+    dedup_by_title = bool(rule_set.get("dedup_by_title", False))
+    dedup_by_url = bool(rule_set.get("dedup_by_url", False))
     if max_age_days is not None:
         max_age_days = max(0, int(max_age_days))
     if min_score is not None:
         min_score = float(min_score)
+    if min_freshness is not None:
+        min_freshness = float(min_freshness)
+    if max_per_source is not None:
+        max_per_source = max(1, int(max_per_source))
+    if max_per_topic is not None:
+        max_per_topic = max(1, int(max_per_topic))
+    if max_per_section is not None:
+        max_per_section = max(1, int(max_per_section))
+    recent_boost_days = max(0, int(recent_boost_days or 0))
+    recent_boost_factor = float(recent_boost_factor or 1.0)
 
     kept = []
     filtered = 0
     reasons: Dict[str, int] = {}
     decisions = []
+    source_counts: Dict[str, int] = {}
+    topic_counts: Dict[str, int] = {}
+    section_counts: Dict[str, int] = {}
+    seen_titles: set = set()
+    seen_urls: set = set()
 
     for rec in recommendations:
         article_id = rec.get("article_id")
@@ -1437,8 +1553,13 @@ def _apply_scenario_rules(
         content = str(article_meta.get("content", rec.get("content", ""))).lower()
         url = str(article_meta.get("url", rec.get("url", "")))
         sections = _extract_sections(article_meta, url)
+        section_primary = sections[0] if sections else "unknown"
+        topic_cluster = str(rec.get("topic_cluster", "unknown"))
         scraped_at = str(article_meta.get("scraped_at", ""))
         age_days = _safe_article_age_days(scraped_at)
+        freshness_score = float((rec.get("features") or {}).get("freshness", rec.get("similarity_components", {}).get("freshness", 1.0)))
+        title_key = str(article_meta.get("title", rec.get("title", ""))).strip().lower()
+        url_key = url.strip().lower()
 
         deny_reason = None
         if include_sources and source not in include_sources:
@@ -1457,8 +1578,20 @@ def _apply_scenario_rules(
             deny_reason = "keyword_excluded"
         elif max_age_days is not None and age_days is not None and age_days > max_age_days:
             deny_reason = "too_old"
+        elif min_freshness is not None and freshness_score < min_freshness:
+            deny_reason = "below_min_freshness"
         elif min_score is not None and float(rec.get("score", 0.0)) < min_score:
             deny_reason = "below_min_score"
+        elif dedup_by_title and title_key and title_key in seen_titles:
+            deny_reason = "dedup_title"
+        elif dedup_by_url and url_key and url_key in seen_urls:
+            deny_reason = "dedup_url"
+        elif max_per_source is not None and source_counts.get(source, 0) >= max_per_source:
+            deny_reason = "cap_source"
+        elif max_per_topic is not None and topic_counts.get(topic_cluster, 0) >= max_per_topic:
+            deny_reason = "cap_topic"
+        elif max_per_section is not None and section_counts.get(section_primary, 0) >= max_per_section:
+            deny_reason = "cap_section"
 
         if deny_reason:
             filtered += 1
@@ -1476,6 +1609,8 @@ def _apply_scenario_rules(
             continue
 
         boost = float(source_boosts.get(source, 1.0))
+        if recent_boost_days > 0 and age_days is not None and age_days <= recent_boost_days:
+            boost *= recent_boost_factor
         updated = dict(rec)
         original_score = float(updated.get("score", 0.0))
         boosted_score = original_score * boost
@@ -1484,6 +1619,13 @@ def _apply_scenario_rules(
         updated["scenario_boost"] = round(boost, 4)
         updated["scenario_id"] = scenario["scenario_id"]
         kept.append(updated)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        topic_counts[topic_cluster] = topic_counts.get(topic_cluster, 0) + 1
+        section_counts[section_primary] = section_counts.get(section_primary, 0) + 1
+        if title_key:
+            seen_titles.add(title_key)
+        if url_key:
+            seen_urls.add(url_key)
         if include_decisions:
             decisions.append(
                 {
@@ -2110,6 +2252,62 @@ def cdp_meiro_config():
         )
     except Exception as e:
         logger.error(f"Error handling CDP config: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro/presets", methods=["GET"])
+def cdp_meiro_mapping_presets():
+    presets = []
+    for preset_id, preset in _MEIRO_MAPPING_PRESETS.items():
+        presets.append(
+            {
+                "preset_id": preset_id,
+                "label": str(preset.get("label") or preset_id),
+                "mapping": _normalize_meiro_mapping(preset.get("mapping") or {}),
+            }
+        )
+    presets.sort(key=lambda item: item["preset_id"])
+    return jsonify({"provider": _MEIRO_PROVIDER, "presets": presets, "count": len(presets)})
+
+
+@app.route("/api/cdp/meiro/fallback-preview", methods=["POST"])
+def cdp_meiro_fallback_preview():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json(silent=True) or {}
+        external_user_id = str(payload.get("external_user_id", "")).strip() or None
+        requested_sources = _normalize_string_list(payload.get("sources"))
+        scenario_id = str(payload.get("scenario_id", "")).strip() or None
+        config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
+        scenario_explicit = bool(payload.get("scenario_explicit", bool(scenario_id)))
+        config_explicit = bool(payload.get("config_explicit", bool(str(payload.get("config_id", "")).strip())))
+        context = _resolve_cdp_personalization(
+            external_user_id=external_user_id,
+            requested_sources=requested_sources,
+            scenario_id=scenario_id,
+            config_id=config_id,
+            scenario_explicit=scenario_explicit,
+            config_explicit=config_explicit,
+        )
+        integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+        mapping = _normalize_meiro_mapping(integration.get("mapping"))
+        return jsonify(
+            {
+                "provider": _MEIRO_PROVIDER,
+                "external_user_id": external_user_id,
+                "requested_sources": requested_sources,
+                "context": context,
+                "mapping": {
+                    "personalization_mode": mapping.get("personalization_mode"),
+                    "fallback_mode": mapping.get("fallback_mode"),
+                    "freshness_sla_hours": mapping.get("freshness_sla_hours"),
+                },
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error previewing CDP fallback behavior: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
 
@@ -2881,6 +3079,36 @@ _start_cleanup_scheduler_if_enabled()
 _start_cdp_scheduler_if_enabled()
 
 
+def _build_ranking_config_payload(config_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    candidate = {
+        "config_id": config_id,
+        "weights": payload.get("weights", {}),
+        "time_decay_days": int(payload.get("time_decay_days", 30)),
+        "source_weights": payload.get("source_weights", {}),
+        "max_per_source": payload.get("max_per_source"),
+        "max_per_topic": payload.get("max_per_topic"),
+        "max_per_section": payload.get("max_per_section"),
+        "hard_max_age_days": payload.get("hard_max_age_days"),
+        "min_freshness": payload.get("min_freshness"),
+        "recent_boost_days": payload.get("recent_boost_days", 0),
+        "recent_boost_factor": payload.get("recent_boost_factor", 1.0),
+        "dedup_by_title": bool(payload.get("dedup_by_title", False)),
+        "dedup_by_url": bool(payload.get("dedup_by_url", False)),
+    }
+    for key in ("max_per_source", "max_per_topic", "max_per_section", "hard_max_age_days"):
+        if candidate.get(key) is not None and str(candidate.get(key)).strip() != "":
+            candidate[key] = int(candidate[key])
+        else:
+            candidate[key] = None
+    if candidate.get("min_freshness") is not None and str(candidate.get("min_freshness")).strip() != "":
+        candidate["min_freshness"] = float(candidate["min_freshness"])
+    else:
+        candidate["min_freshness"] = None
+    candidate["recent_boost_days"] = int(candidate.get("recent_boost_days") or 0)
+    candidate["recent_boost_factor"] = float(candidate.get("recent_boost_factor") or 1.0)
+    return candidate
+
+
 @app.route("/api/ranking-configs", methods=["GET", "POST"])
 def ranking_configs():
     if not recommender or not store:
@@ -2907,12 +3135,7 @@ def ranking_configs():
         if not config_id:
             return jsonify({"error": "config_id is required"}), 400
 
-        config_payload = {
-            "config_id": config_id,
-            "weights": payload.get("weights", {}),
-            "time_decay_days": int(payload.get("time_decay_days", 30)),
-            "source_weights": payload.get("source_weights", {}),
-        }
+        config_payload = _build_ranking_config_payload(config_id, payload)
         # Validate via recommender logic
         recommender._resolve_config(config_id=config_id, ranking_config=config_payload)
 
@@ -2951,12 +3174,7 @@ def ranking_config_detail(config_id):
     # PUT: create new version
     try:
         payload = request.get_json() or {}
-        config_payload = {
-            "config_id": config_id,
-            "weights": payload.get("weights", {}),
-            "time_decay_days": int(payload.get("time_decay_days", 30)),
-            "source_weights": payload.get("source_weights", {}),
-        }
+        config_payload = _build_ranking_config_payload(config_id, payload)
         recommender._resolve_config(config_id=config_id, ranking_config=config_payload)
 
         version = store.create_or_update_config(config_id, config_payload, is_system=False)
@@ -3475,6 +3693,7 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
         "scenario_trace": scenario_trace,
         "experiment_assignment": experiment_assignment,
         "cdp_context": cdp_context,
+        "explainability_schema_version": "v2",
         "recommendations": recs,
     }
 
@@ -3491,6 +3710,190 @@ def query_recommendations():
         logger.error(f"Error querying recommendations: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
+
+
+def _execute_recommendation_diagnostics(payload: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = payload.get("user_id", "demo_user")
+    external_user_id = str(payload.get("external_user_id", "")).strip() or None
+    effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
+    user_reads = payload.get("user_reads") or recommender.user_profiles.get(effective_user_id, [])
+    if not user_reads:
+        user_reads = recommender.user_profiles.get(user_id, [])
+    top_n = int(payload.get("top_n", 5))
+    inspect_count = max(top_n, min(200, int(payload.get("inspect_count", top_n * 10))))
+    requested_sources = payload.get("sources") or []
+    config_explicit = bool(str(payload.get("config_id", "")).strip())
+    config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
+    ranking_config = payload.get("ranking_config")
+    scenario_id = (payload.get("scenario_id") or "").strip() or None
+    scenario_explicit = bool(scenario_id)
+
+    cdp_context = _resolve_cdp_personalization(
+        external_user_id=external_user_id,
+        requested_sources=requested_sources,
+        scenario_id=scenario_id,
+        config_id=config_id,
+        scenario_explicit=scenario_explicit,
+        config_explicit=config_explicit,
+    )
+    requested_sources = cdp_context.get("requested_sources") or requested_sources
+    if not scenario_explicit and cdp_context.get("selected_scenario_id"):
+        scenario_id = cdp_context.get("selected_scenario_id")
+    if not config_explicit and cdp_context.get("selected_config_id"):
+        config_id = cdp_context.get("selected_config_id")
+
+    scenario = None
+    if scenario_id:
+        scenario = store.get_scenario(scenario_id)
+        if scenario and not scenario.get("enabled", True):
+            scenario = None
+
+    decision_context = _build_decision_context(requested_sources, config_id, ranking_config)
+    selected_sources = decision_context["selected_sources"]
+    effective_ranking_config = decision_context["effective_ranking_config"]
+    cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
+    if cdp_source_overrides:
+        source_weights = dict(effective_ranking_config.get("source_weights") or {})
+        for source, weight in cdp_source_overrides.items():
+            if source in selected_sources and weight > 0:
+                source_weights[source] = float(weight)
+        effective_ranking_config["source_weights"] = source_weights
+
+    diagnostics: Dict[str, Any] = {}
+    recs = recommender.recommend_for_user(
+        effective_user_id,
+        recommender.article_vectors,
+        user_reads,
+        top_n=inspect_count,
+        sources=selected_sources,
+        config_id=decision_context["effective_config_id"],
+        ranking_config=effective_ranking_config,
+        diagnostics=diagnostics,
+    )
+    recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
+    return {
+        "user_id": user_id,
+        "effective_user_id": effective_user_id,
+        "external_user_id": external_user_id,
+        "config_id": decision_context["effective_config_id"],
+        "scenario_id": scenario_id,
+        "selected_sources": selected_sources,
+        "diagnostics": diagnostics,
+        "scenario_trace": scenario_trace,
+        "recommendations": recs[: max(1, top_n)],
+        "inspect_count": inspect_count,
+        "explainability_schema_version": "v2",
+    }
+
+
+@app.route("/api/recommendations/why-not", methods=["POST"])
+def why_not_recommendation():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json() or {}
+        target_article_id = str(payload.get("article_id", "")).strip() or None
+        response = _execute_recommendation_diagnostics(payload)
+        selected = {str(item.get("article_id")): idx + 1 for idx, item in enumerate(response.get("recommendations") or [])}
+        pre_excluded = response.get("diagnostics", {}).get("excluded") or []
+        scenario_decisions = (response.get("scenario_trace") or {}).get("decisions") or []
+
+        reason_index: Dict[str, Dict[str, Any]] = {}
+        for item in pre_excluded:
+            aid = str(item.get("article_id") or "").strip()
+            if aid and aid not in reason_index:
+                reason_index[aid] = {"stage": "ranking", **item}
+        for item in scenario_decisions:
+            aid = str(item.get("article_id") or "").strip()
+            if aid and item.get("status") == "filtered":
+                reason_index[aid] = {
+                    "stage": "scenario",
+                    "reason_code": item.get("reason"),
+                    "score_before": item.get("score_before"),
+                }
+
+        if target_article_id:
+            shown_rank = selected.get(target_article_id)
+            return jsonify(
+                {
+                    "api_version": "v1",
+                    "article_id": target_article_id,
+                    "shown": bool(shown_rank),
+                    "rank": shown_rank,
+                    "reason": (None if shown_rank else reason_index.get(target_article_id, {"reason_code": "not_in_candidate_pool"})),
+                    "context": {
+                        "config_id": response.get("config_id"),
+                        "scenario_id": response.get("scenario_id"),
+                        "selected_sources": response.get("selected_sources"),
+                    },
+                }
+            )
+
+        reason_counts: Dict[str, int] = {}
+        for item in reason_index.values():
+            reason = str(item.get("reason_code") or "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        return jsonify(
+            {
+                "api_version": "v1",
+                "explainability_schema_version": "v2",
+                "reason_counts": reason_counts,
+                "excluded_samples": [{"article_id": aid, **info} for aid, info in list(reason_index.items())[:50]],
+                "selected_count": len(selected),
+                "context": {
+                    "config_id": response.get("config_id"),
+                    "scenario_id": response.get("scenario_id"),
+                    "selected_sources": response.get("selected_sources"),
+                },
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error computing why-not recommendation: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/explainability/schema", methods=["GET"])
+def explainability_schema():
+    return jsonify(
+        {
+            "api_version": "v1",
+            "schema_version": "v2",
+            "ranking_reason_codes": [
+                "hard_max_age_days",
+                "min_freshness",
+                "dedup_title",
+                "dedup_url",
+                "cap_source",
+                "cap_topic",
+                "cap_section",
+            ],
+            "scenario_reason_codes": [
+                "source_not_included",
+                "source_excluded",
+                "section_not_included",
+                "section_excluded",
+                "article_excluded",
+                "keyword_not_included",
+                "keyword_excluded",
+                "too_old",
+                "below_min_freshness",
+                "below_min_score",
+                "dedup_title",
+                "dedup_url",
+                "cap_source",
+                "cap_topic",
+                "cap_section",
+            ],
+            "recommendation_fields": [
+                "features",
+                "feature_contributions",
+                "explanation",
+                "explanation_details",
+                "scenario_boost",
+            ],
+        }
+    )
 
 
 @app.route("/api/recommendations/batch", methods=["POST"])

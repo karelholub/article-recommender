@@ -89,6 +89,50 @@
                 </div>
                 <label class="form-label small mb-1" for="ranking-time-decay-days">Time Decay (days)</label>
                 <input id="ranking-time-decay-days" class="form-control form-control-sm mb-2" type="number" min="1" placeholder="7">
+                <div class="row g-2 mb-2">
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="ranking-hard-max-age-days">Hard Max Age (days)</label>
+                        <input id="ranking-hard-max-age-days" class="form-control form-control-sm" type="number" min="0" placeholder="30">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="ranking-min-freshness">Min Freshness (0-1)</label>
+                        <input id="ranking-min-freshness" class="form-control form-control-sm" type="number" min="0" max="1" step="0.01" placeholder="0.20">
+                    </div>
+                </div>
+                <div class="row g-2 mb-2">
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="ranking-max-per-source">Max / Source</label>
+                        <input id="ranking-max-per-source" class="form-control form-control-sm" type="number" min="1" placeholder="2">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="ranking-max-per-topic">Max / Topic</label>
+                        <input id="ranking-max-per-topic" class="form-control form-control-sm" type="number" min="1" placeholder="3">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="ranking-max-per-section">Max / Section</label>
+                        <input id="ranking-max-per-section" class="form-control form-control-sm" type="number" min="1" placeholder="3">
+                    </div>
+                </div>
+                <div class="row g-2 mb-2">
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="ranking-recent-boost-days">Recent Boost Window (days)</label>
+                        <input id="ranking-recent-boost-days" class="form-control form-control-sm" type="number" min="0" placeholder="2">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="ranking-recent-boost-factor">Recent Boost Factor</label>
+                        <input id="ranking-recent-boost-factor" class="form-control form-control-sm" type="number" min="0.5" max="5" step="0.01" placeholder="1.15">
+                    </div>
+                </div>
+                <div class="d-flex gap-3 mb-2">
+                    <div class="form-check">
+                        <input id="ranking-dedup-by-title" class="form-check-input" type="checkbox">
+                        <label class="form-check-label small" for="ranking-dedup-by-title">Dedup by title</label>
+                    </div>
+                    <div class="form-check">
+                        <input id="ranking-dedup-by-url" class="form-check-input" type="checkbox">
+                        <label class="form-check-label small" for="ranking-dedup-by-url">Dedup by URL</label>
+                    </div>
+                </div>
                 <label class="form-label small mb-1" for="ranking-source-weights-json">Source Weights JSON (optional)</label>
                 <textarea id="ranking-source-weights-json" class="form-control form-control-sm mb-2" rows="3" placeholder='{"www.e15.cz":1.1}'></textarea>
                 <small class="field-hint">Use source domain keys with multiplier values.</small>
@@ -175,6 +219,46 @@
                         <input id="rule-min-score" class="form-control form-control-sm" type="number" min="0" step="0.0001" placeholder="0.1000">
                     </div>
                 </div>
+                <div class="row g-2 mb-2">
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="rule-min-freshness">Minimum Freshness (0-1)</label>
+                        <input id="rule-min-freshness" class="form-control form-control-sm" type="number" min="0" max="1" step="0.01" placeholder="0.20">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="rule-recent-boost-factor">Recent Boost Factor</label>
+                        <input id="rule-recent-boost-factor" class="form-control form-control-sm" type="number" min="0.5" max="5" step="0.01" placeholder="1.10">
+                    </div>
+                </div>
+                <div class="row g-2 mb-2">
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="rule-max-per-source">Max / Source</label>
+                        <input id="rule-max-per-source" class="form-control form-control-sm" type="number" min="1" placeholder="2">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="rule-max-per-topic">Max / Topic</label>
+                        <input id="rule-max-per-topic" class="form-control form-control-sm" type="number" min="1" placeholder="3">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1" for="rule-max-per-section">Max / Section</label>
+                        <input id="rule-max-per-section" class="form-control form-control-sm" type="number" min="1" placeholder="3">
+                    </div>
+                </div>
+                <div class="row g-2 mb-2">
+                    <div class="col-6">
+                        <label class="form-label small mb-1" for="rule-recent-boost-days">Recent Boost Window (days)</label>
+                        <input id="rule-recent-boost-days" class="form-control form-control-sm" type="number" min="0" placeholder="2">
+                    </div>
+                    <div class="col-6 d-flex align-items-end gap-3">
+                        <div class="form-check">
+                            <input id="rule-dedup-by-title" class="form-check-input" type="checkbox">
+                            <label class="form-check-label small" for="rule-dedup-by-title">Dedup title</label>
+                        </div>
+                        <div class="form-check">
+                            <input id="rule-dedup-by-url" class="form-check-input" type="checkbox">
+                            <label class="form-check-label small" for="rule-dedup-by-url">Dedup URL</label>
+                        </div>
+                    </div>
+                </div>
                 <label class="form-label small mb-1" for="rule-ranking-config-id">Override Ranking Config (optional)</label>
                 <select id="rule-ranking-config-id" class="form-select form-select-sm mb-2"><option value="">None</option></select>
                 <label class="form-label small mb-1" for="rule-source-boosts-json">Source Boosts JSON</label>
@@ -215,6 +299,16 @@
                     </div>
                 </div>
                 <pre id="batch-recommendation-output" class="small mb-0">No batch execution yet.</pre>
+            </div>
+        </div>
+        <div class="card mt-4">
+            <div class="card-header"><strong>Why-Not Analyzer</strong></div>
+            <div class="card-body">
+                <div class="section-hint">Inspect why a specific article was not selected in the current recommendation context.</div>
+                <label class="form-label small mb-1" for="why-not-article-id">Article ID (optional)</label>
+                <input id="why-not-article-id" class="form-control form-control-sm mb-2" placeholder="article_id">
+                <button id="run-why-not" class="btn btn-sm btn-outline-secondary mb-2">Run Why-Not</button>
+                <pre id="why-not-output" class="small mb-0">No why-not analysis yet.</pre>
             </div>
         </div>
     </div>

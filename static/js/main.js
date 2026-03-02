@@ -4,6 +4,7 @@ let articles = [];
 let sourceOptions = [];
 let rankingConfigs = {};
 let scenarios = [];
+let cdpMappingPresets = [];
 let connectors = [];
 let alertThresholds = {};
 const connectorRunsCache = {};
@@ -87,6 +88,7 @@ document.addEventListener('DOMContentLoaded', () => {
         setInterval(loadSchedulerStatus, 15000);
     }
     if (hasElement('cdp-base-url')) {
+        loadCdpMappingPresets();
         loadCdpConfig();
         loadCdpProfiles();
         loadCdpSchedulerStatus();
@@ -776,6 +778,20 @@ function populateRankingConfigEditor(configId) {
     document.getElementById('weight-topic').value = Number(weights.topic ?? 0.2);
     document.getElementById('weight-source').value = Number(weights.source ?? 0.1);
     document.getElementById('ranking-time-decay-days').value = Number(config.time_decay_days ?? 30);
+    document.getElementById('ranking-hard-max-age-days').value =
+        config.hard_max_age_days == null ? '' : Number(config.hard_max_age_days);
+    document.getElementById('ranking-min-freshness').value =
+        config.min_freshness == null ? '' : Number(config.min_freshness);
+    document.getElementById('ranking-max-per-source').value =
+        config.max_per_source == null ? '' : Number(config.max_per_source);
+    document.getElementById('ranking-max-per-topic').value =
+        config.max_per_topic == null ? '' : Number(config.max_per_topic);
+    document.getElementById('ranking-max-per-section').value =
+        config.max_per_section == null ? '' : Number(config.max_per_section);
+    document.getElementById('ranking-recent-boost-days').value = Number(config.recent_boost_days ?? 0);
+    document.getElementById('ranking-recent-boost-factor').value = Number(config.recent_boost_factor ?? 1.0);
+    document.getElementById('ranking-dedup-by-title').checked = Boolean(config.dedup_by_title);
+    document.getElementById('ranking-dedup-by-url').checked = Boolean(config.dedup_by_url);
     document.getElementById('ranking-source-weights-json').value = JSON.stringify(config.source_weights || {}, null, 2);
     if (record) {
         const systemLabel = record.is_system ? 'system' : 'custom';
@@ -795,6 +811,15 @@ function collectRankingConfigPayloadFromEditor() {
     const topic = Number(document.getElementById('weight-topic').value);
     const source = Number(document.getElementById('weight-source').value);
     const timeDecayDays = Number(document.getElementById('ranking-time-decay-days').value);
+    const hardMaxAgeRaw = (document.getElementById('ranking-hard-max-age-days').value || '').trim();
+    const minFreshnessRaw = (document.getElementById('ranking-min-freshness').value || '').trim();
+    const maxPerSourceRaw = (document.getElementById('ranking-max-per-source').value || '').trim();
+    const maxPerTopicRaw = (document.getElementById('ranking-max-per-topic').value || '').trim();
+    const maxPerSectionRaw = (document.getElementById('ranking-max-per-section').value || '').trim();
+    const recentBoostDaysRaw = (document.getElementById('ranking-recent-boost-days').value || '').trim();
+    const recentBoostFactorRaw = (document.getElementById('ranking-recent-boost-factor').value || '').trim();
+    const dedupByTitle = Boolean(document.getElementById('ranking-dedup-by-title').checked);
+    const dedupByUrl = Boolean(document.getElementById('ranking-dedup-by-url').checked);
     const sourceWeights = parseJsonObjectInput(
         document.getElementById('ranking-source-weights-json').value,
         'Source weights'
@@ -809,13 +834,38 @@ function collectRankingConfigPayloadFromEditor() {
     if (!Number.isFinite(timeDecayDays) || timeDecayDays < 1) {
         throw new Error('Time decay days must be >= 1.');
     }
+    const parseOptionalInt = (raw, label, min) => {
+        if (!raw) return null;
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed < min) {
+            throw new Error(`${label} must be >= ${min}.`);
+        }
+        return Math.round(parsed);
+    };
+    const parseOptionalFloat = (raw, label, min, max = null) => {
+        if (!raw) return null;
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed < min || (max != null && parsed > max)) {
+            throw new Error(`${label} must be between ${min}${max != null ? ` and ${max}` : ''}.`);
+        }
+        return parsed;
+    };
     return {
         configId,
         payload: {
             config_id: configId,
             weights,
             time_decay_days: Math.round(timeDecayDays),
-            source_weights: sourceWeights
+            source_weights: sourceWeights,
+            hard_max_age_days: parseOptionalInt(hardMaxAgeRaw, 'Hard max age days', 0),
+            min_freshness: parseOptionalFloat(minFreshnessRaw, 'Min freshness', 0, 1),
+            max_per_source: parseOptionalInt(maxPerSourceRaw, 'Max per source', 1),
+            max_per_topic: parseOptionalInt(maxPerTopicRaw, 'Max per topic', 1),
+            max_per_section: parseOptionalInt(maxPerSectionRaw, 'Max per section', 1),
+            recent_boost_days: parseOptionalInt(recentBoostDaysRaw, 'Recent boost window', 0) ?? 0,
+            recent_boost_factor: parseOptionalFloat(recentBoostFactorRaw, 'Recent boost factor', 0.5, 5) ?? 1.0,
+            dedup_by_title: dedupByTitle,
+            dedup_by_url: dedupByUrl
         }
     };
 }
@@ -1039,6 +1089,18 @@ function populateRuleBuilderFromRuleSet(ruleSet) {
         rules.max_age_days === null || rules.max_age_days === undefined ? '' : Number(rules.max_age_days);
     document.getElementById('rule-min-score').value =
         rules.min_score === null || rules.min_score === undefined ? '' : Number(rules.min_score);
+    document.getElementById('rule-min-freshness').value =
+        rules.min_freshness === null || rules.min_freshness === undefined ? '' : Number(rules.min_freshness);
+    document.getElementById('rule-max-per-source').value =
+        rules.max_per_source === null || rules.max_per_source === undefined ? '' : Number(rules.max_per_source);
+    document.getElementById('rule-max-per-topic').value =
+        rules.max_per_topic === null || rules.max_per_topic === undefined ? '' : Number(rules.max_per_topic);
+    document.getElementById('rule-max-per-section').value =
+        rules.max_per_section === null || rules.max_per_section === undefined ? '' : Number(rules.max_per_section);
+    document.getElementById('rule-recent-boost-days').value = Number(rules.recent_boost_days ?? 0);
+    document.getElementById('rule-recent-boost-factor').value = Number(rules.recent_boost_factor ?? 1.0);
+    document.getElementById('rule-dedup-by-title').checked = Boolean(rules.dedup_by_title);
+    document.getElementById('rule-dedup-by-url').checked = Boolean(rules.dedup_by_url);
     document.getElementById('rule-ranking-config-id').value = rules.ranking_config_id || '';
     document.getElementById('rule-source-boosts-json').value = JSON.stringify(rules.source_boosts || {}, null, 2);
 }
@@ -1046,6 +1108,12 @@ function populateRuleBuilderFromRuleSet(ruleSet) {
 function collectRuleBuilderRuleSet() {
     const maxAgeRaw = document.getElementById('rule-max-age-days').value;
     const minScoreRaw = document.getElementById('rule-min-score').value;
+    const minFreshnessRaw = document.getElementById('rule-min-freshness').value;
+    const maxPerSourceRaw = document.getElementById('rule-max-per-source').value;
+    const maxPerTopicRaw = document.getElementById('rule-max-per-topic').value;
+    const maxPerSectionRaw = document.getElementById('rule-max-per-section').value;
+    const recentBoostDaysRaw = document.getElementById('rule-recent-boost-days').value;
+    const recentBoostFactorRaw = document.getElementById('rule-recent-boost-factor').value;
     const sourceBoosts = parseJsonObjectInput(
         document.getElementById('rule-source-boosts-json').value,
         'Rule source boosts'
@@ -1065,6 +1133,29 @@ function collectRuleBuilderRuleSet() {
     if (minScore !== null && (!Number.isFinite(minScore) || minScore < 0)) {
         throw new Error('Rule min score must be >= 0.');
     }
+    const minFreshness = minFreshnessRaw === '' ? null : Number(minFreshnessRaw);
+    if (minFreshness !== null && (!Number.isFinite(minFreshness) || minFreshness < 0 || minFreshness > 1)) {
+        throw new Error('Rule min freshness must be between 0 and 1.');
+    }
+    const parseOptionalCap = (raw, label) => {
+        if (raw === '') return null;
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+            throw new Error(`${label} must be >= 1.`);
+        }
+        return Math.round(parsed);
+    };
+    const maxPerSource = parseOptionalCap(maxPerSourceRaw, 'Rule max per source');
+    const maxPerTopic = parseOptionalCap(maxPerTopicRaw, 'Rule max per topic');
+    const maxPerSection = parseOptionalCap(maxPerSectionRaw, 'Rule max per section');
+    const recentBoostDays = recentBoostDaysRaw === '' ? 0 : Number(recentBoostDaysRaw);
+    if (!Number.isFinite(recentBoostDays) || recentBoostDays < 0) {
+        throw new Error('Rule recent boost days must be >= 0.');
+    }
+    const recentBoostFactor = recentBoostFactorRaw === '' ? 1.0 : Number(recentBoostFactorRaw);
+    if (!Number.isFinite(recentBoostFactor) || recentBoostFactor < 0.5 || recentBoostFactor > 5) {
+        throw new Error('Rule recent boost factor must be between 0.5 and 5.');
+    }
     return {
         include_sources: parseCsvInput(document.getElementById('rule-include-sources').value),
         exclude_sources: parseCsvInput(document.getElementById('rule-exclude-sources').value),
@@ -1075,6 +1166,14 @@ function collectRuleBuilderRuleSet() {
         exclude_article_ids: parseCsvInput(document.getElementById('rule-exclude-article-ids').value),
         max_age_days: maxAgeDays === null ? null : Math.round(maxAgeDays),
         min_score: minScore,
+        min_freshness: minFreshness,
+        max_per_source: maxPerSource,
+        max_per_topic: maxPerTopic,
+        max_per_section: maxPerSection,
+        recent_boost_days: Math.round(recentBoostDays),
+        recent_boost_factor: recentBoostFactor,
+        dedup_by_title: Boolean(document.getElementById('rule-dedup-by-title').checked),
+        dedup_by_url: Boolean(document.getElementById('rule-dedup-by-url').checked),
         source_boosts: sourceBoosts,
         ranking_config_id: (document.getElementById('rule-ranking-config-id').value || '').trim() || null
     };
@@ -1474,6 +1573,11 @@ async function loadCdpConfig() {
         document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(payload.mapping?.scenario_segment_map || {}, null, 2);
         document.getElementById('cdp-config-segment-map').value = JSON.stringify(payload.mapping?.config_segment_map || {}, null, 2);
         document.getElementById('cdp-segment-priority').value = (payload.mapping?.segment_priority || []).join(', ');
+        document.getElementById('cdp-personalization-mode').value = payload.mapping?.personalization_mode || 'active';
+        document.getElementById('cdp-fallback-mode').value = payload.mapping?.fallback_mode || 'source_defaults';
+        document.getElementById('cdp-freshness-sla-hours').value = Number(payload.mapping?.freshness_sla_hours ?? 24);
+        const mappingJson = document.getElementById('cdp-mapping-json');
+        if (mappingJson) mappingJson.value = JSON.stringify(payload.mapping || {}, null, 2);
         const previewInput = document.getElementById('cdp-preview-payload');
         if (previewInput && !previewInput.value.trim()) {
             previewInput.value = JSON.stringify(
@@ -1493,6 +1597,111 @@ async function loadCdpConfig() {
     } catch (error) {
         if (statusEl) statusEl.textContent = `CDP config unavailable: ${error.message}`;
     }
+}
+
+async function loadCdpMappingPresets() {
+    const select = document.getElementById('cdp-mapping-preset');
+    if (!select) return;
+    try {
+        const response = await fetch('/api/cdp/meiro/presets');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load mapping presets');
+        }
+        const payload = await response.json();
+        cdpMappingPresets = payload.presets || [];
+        const options = ['<option value="">Select preset</option>']
+            .concat(cdpMappingPresets.map(item => `<option value="${item.preset_id}">${item.label} (${item.preset_id})</option>`));
+        select.innerHTML = options.join('');
+    } catch (error) {
+        select.innerHTML = '<option value="">Presets unavailable</option>';
+    }
+}
+
+function applyCdpPresetToForm() {
+    const presetId = document.getElementById('cdp-mapping-preset')?.value || '';
+    if (!presetId) {
+        throw new Error('Choose a mapping preset first.');
+    }
+    const preset = cdpMappingPresets.find(item => item.preset_id === presetId);
+    if (!preset) {
+        throw new Error(`Unknown mapping preset: ${presetId}`);
+    }
+    const merged = {
+        ...collectCdpMappingFromForm(),
+        ...(preset.mapping || {}),
+    };
+    document.getElementById('cdp-external-id-path').value = merged.external_id_path || '';
+    document.getElementById('cdp-traits-path').value = merged.traits_path || '';
+    document.getElementById('cdp-segments-path').value = merged.segments_path || '';
+    document.getElementById('cdp-fixed-segments').value = (merged.fixed_segments || []).join(', ');
+    document.getElementById('cdp-preferred-sources-trait').value = merged.preferred_sources_trait || '';
+    document.getElementById('cdp-excluded-sources-trait').value = merged.excluded_sources_trait || '';
+    document.getElementById('cdp-source-weights-trait').value = merged.source_weights_trait || '';
+    document.getElementById('cdp-source-weight-prefix').value = merged.source_weight_trait_prefix || '';
+    document.getElementById('cdp-derivation-min-source-events').value = Number(merged.derivation_min_source_events ?? 3);
+    document.getElementById('cdp-derivation-min-category-events').value = Number(merged.derivation_min_category_events ?? 1);
+    document.getElementById('cdp-derivation-max-sources').value = Number(merged.derivation_max_preferred_sources ?? 5);
+    document.getElementById('cdp-derivation-weight-range').value = `${Number(merged.derivation_min_source_weight ?? 1.05)}:${Number(merged.derivation_max_source_weight ?? 2.0)}`;
+    document.getElementById('cdp-derivation-allowlist').value = (merged.derivation_allowed_sources || []).join(', ');
+    document.getElementById('cdp-derivation-blocklist').value = (merged.derivation_blocked_sources || []).join(', ');
+    document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(merged.scenario_segment_map || {}, null, 2);
+    document.getElementById('cdp-config-segment-map').value = JSON.stringify(merged.config_segment_map || {}, null, 2);
+    document.getElementById('cdp-segment-priority').value = (merged.segment_priority || []).join(', ');
+    document.getElementById('cdp-personalization-mode').value = merged.personalization_mode || 'active';
+    document.getElementById('cdp-fallback-mode').value = merged.fallback_mode || 'source_defaults';
+    document.getElementById('cdp-freshness-sla-hours').value = Number(merged.freshness_sla_hours ?? 24);
+    const mappingJson = document.getElementById('cdp-mapping-json');
+    if (mappingJson) mappingJson.value = JSON.stringify(merged, null, 2);
+    const statusEl = document.getElementById('cdp-config-status');
+    if (statusEl) statusEl.textContent = `Applied preset ${preset.label} to form. Save to persist.`;
+}
+
+function exportCdpMappingJson() {
+    const mapping = collectCdpMappingFromForm();
+    const target = document.getElementById('cdp-mapping-json');
+    if (!target) return;
+    target.value = JSON.stringify(mapping, null, 2);
+}
+
+function importCdpMappingJson() {
+    const target = document.getElementById('cdp-mapping-json');
+    if (!target) return;
+    let parsed = {};
+    try {
+        parsed = JSON.parse(target.value || '{}');
+    } catch (_error) {
+        throw new Error('Mapping JSON is invalid');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Mapping JSON must be an object');
+    }
+    const merged = _normalizeImportedCdpMapping(parsed);
+    document.getElementById('cdp-external-id-path').value = merged.external_id_path || '';
+    document.getElementById('cdp-traits-path').value = merged.traits_path || '';
+    document.getElementById('cdp-segments-path').value = merged.segments_path || '';
+    document.getElementById('cdp-fixed-segments').value = (merged.fixed_segments || []).join(', ');
+    document.getElementById('cdp-preferred-sources-trait').value = merged.preferred_sources_trait || '';
+    document.getElementById('cdp-excluded-sources-trait').value = merged.excluded_sources_trait || '';
+    document.getElementById('cdp-source-weights-trait').value = merged.source_weights_trait || '';
+    document.getElementById('cdp-source-weight-prefix').value = merged.source_weight_trait_prefix || '';
+    document.getElementById('cdp-derivation-min-source-events').value = Number(merged.derivation_min_source_events ?? 3);
+    document.getElementById('cdp-derivation-min-category-events').value = Number(merged.derivation_min_category_events ?? 1);
+    document.getElementById('cdp-derivation-max-sources').value = Number(merged.derivation_max_preferred_sources ?? 5);
+    document.getElementById('cdp-derivation-weight-range').value = `${Number(merged.derivation_min_source_weight ?? 1.05)}:${Number(merged.derivation_max_source_weight ?? 2.0)}`;
+    document.getElementById('cdp-derivation-allowlist').value = (merged.derivation_allowed_sources || []).join(', ');
+    document.getElementById('cdp-derivation-blocklist').value = (merged.derivation_blocked_sources || []).join(', ');
+    document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(merged.scenario_segment_map || {}, null, 2);
+    document.getElementById('cdp-config-segment-map').value = JSON.stringify(merged.config_segment_map || {}, null, 2);
+    document.getElementById('cdp-segment-priority').value = (merged.segment_priority || []).join(', ');
+    document.getElementById('cdp-personalization-mode').value = merged.personalization_mode || 'active';
+    document.getElementById('cdp-fallback-mode').value = merged.fallback_mode || 'source_defaults';
+    document.getElementById('cdp-freshness-sla-hours').value = Number(merged.freshness_sla_hours ?? 24);
+}
+
+function _normalizeImportedCdpMapping(mapping) {
+    const current = collectCdpMappingFromForm();
+    return { ...current, ...(mapping || {}) };
 }
 
 function collectCdpMappingFromForm() {
@@ -1527,7 +1736,10 @@ function collectCdpMappingFromForm() {
         derivation_blocked_sources: (document.getElementById('cdp-derivation-blocklist').value || '').split(',').map(item => item.trim()).filter(Boolean),
         scenario_segment_map: scenarioMap,
         config_segment_map: configMap,
-        segment_priority: (document.getElementById('cdp-segment-priority').value || '').split(',').map(item => item.trim()).filter(Boolean)
+        segment_priority: (document.getElementById('cdp-segment-priority').value || '').split(',').map(item => item.trim()).filter(Boolean),
+        personalization_mode: (document.getElementById('cdp-personalization-mode').value || 'active').trim(),
+        fallback_mode: (document.getElementById('cdp-fallback-mode').value || 'source_defaults').trim(),
+        freshness_sla_hours: Number(document.getElementById('cdp-freshness-sla-hours').value || 24),
     };
 }
 
@@ -1738,6 +1950,34 @@ async function previewCdpMapping() {
     }
     const preview = await response.json();
     output.textContent = JSON.stringify(preview, null, 2);
+}
+
+async function previewCdpFallback() {
+    const output = document.getElementById('cdp-mapping-preview-output');
+    if (!output) return;
+    const externalUserId = (document.getElementById('cdp-fallback-preview-external-id')?.value || '').trim();
+    if (!externalUserId) {
+        throw new Error('Enter fallback preview external user ID');
+    }
+    output.textContent = 'Previewing fallback behavior...';
+    const response = await fetch('/api/cdp/meiro/fallback-preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            external_user_id: externalUserId,
+            sources: [],
+            config_id: 'balanced',
+            scenario_id: '',
+            scenario_explicit: false,
+            config_explicit: false,
+        }),
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to preview CDP fallback');
+    }
+    const payload = await response.json();
+    output.textContent = JSON.stringify(payload, null, 2);
 }
 
 async function runCleanupNow() {
@@ -3559,6 +3799,8 @@ async function showSimilarArticles() {
         similarList.innerHTML = similarArticles.map(article => {
             const contrib = article.feature_contributions || {};
             const components = article.similarity_components || {};
+            const details = article.explanation_details || {};
+            const reasons = Array.isArray(details.reasons) ? details.reasons.join(', ') : '';
             return `
                 <div class="similar-article fade-in">
                     <h5>${article.title || 'No Title'}</h5>
@@ -3586,6 +3828,9 @@ async function showSimilarArticles() {
                         <small class="text-muted d-block mt-1">
                             Weighted contributions: semantic ${formatContribution(contrib.semantic)}, freshness ${formatContribution(contrib.freshness)}, topic ${formatContribution(contrib.topic)}, source ${formatContribution(contrib.source)}
                         </small>
+                        <small class="text-muted d-block mt-1">
+                            Age: ${article.age_days == null ? 'n/a' : `${article.age_days}d`} | Topic cluster: ${article.topic_cluster ?? 'n/a'} | Section: ${article.section ?? 'n/a'}
+                        </small>
                         <small class="text-muted d-block mt-1">${article.explanation || ''}</small>
                         <small class="text-muted d-block mt-1">Overall Score: ${(article.score * 100).toFixed(1)}%</small>
                         <details class="mt-2">
@@ -3594,6 +3839,7 @@ async function showSimilarArticles() {
                                 <div>Similarity components:</div>
                                 <code>semantic=${formatContribution(components.semantic)} freshness=${formatContribution(components.freshness)} topic=${formatContribution(components.topic)} source=${formatContribution(components.source)}</code>
                                 ${article.score_before_scenario != null ? `<div class="mt-1">Scenario score: ${formatContribution(article.score_before_scenario)} -> ${formatContribution(article.score)} (boost ${formatContribution(article.scenario_boost)})</div>` : ''}
+                                ${reasons ? `<div class="mt-1">Reason tags: <code>${reasons}</code></div>` : ''}
                                 <div class="mt-1">Config: <code>${article.config_id || 'n/a'}</code> | Scenario: <code>${article.scenario_id || 'none'}</code></div>
                             </div>
                         </details>
@@ -3628,6 +3874,38 @@ async function showSimilarArticles() {
             </div>
         `;
     }
+}
+
+async function runWhyNotAnalysis() {
+    const output = document.getElementById('why-not-output');
+    if (!output) return;
+    const articleId = (document.getElementById('why-not-article-id')?.value || '').trim();
+    const configId = document.getElementById('ranking-config')?.value || 'balanced';
+    const scenarioId = getSelectedScenarioId();
+    const externalUserId = getExternalUserId();
+    const userReads = currentArticle?.article_id ? [currentArticle.article_id] : [];
+    output.textContent = 'Running why-not analysis...';
+    const response = await fetch('/api/recommendations/why-not', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            user_id: 'demo_user',
+            user_reads: userReads,
+            top_n: 5,
+            inspect_count: 60,
+            sources: getSelectedSources(),
+            config_id: configId,
+            scenario_id: scenarioId || undefined,
+            external_user_id: externalUserId || undefined,
+            article_id: articleId || undefined,
+        }),
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to run why-not analysis');
+    }
+    const payload = await response.json();
+    output.textContent = JSON.stringify(payload, null, 2);
 }
 
 function formatContribution(value) {
@@ -4092,11 +4370,48 @@ function setupEventListeners() {
             showError(error.message || 'Failed to persist derivation');
         }
     });
+    on('apply-cdp-preset', 'click', () => {
+        try {
+            applyCdpPresetToForm();
+        } catch (error) {
+            showError(error.message || 'Failed to apply CDP preset');
+        }
+    });
+    on('export-cdp-mapping', 'click', () => {
+        try {
+            exportCdpMappingJson();
+        } catch (error) {
+            showError(error.message || 'Failed to export CDP mapping');
+        }
+    });
+    on('import-cdp-mapping', 'click', () => {
+        try {
+            importCdpMappingJson();
+        } catch (error) {
+            showError(error.message || 'Failed to import CDP mapping');
+        }
+    });
     on('preview-cdp-mapping', 'click', async () => {
         try {
             await previewCdpMapping();
         } catch (error) {
             showError(error.message || 'Failed to preview CDP mapping');
+        }
+    });
+    on('preview-cdp-fallback', 'click', async () => {
+        try {
+            await previewCdpFallback();
+        } catch (error) {
+            showError(error.message || 'Failed to preview CDP fallback');
+        }
+    });
+    on('run-why-not', 'click', async () => {
+        try {
+            await runWhyNotAnalysis();
+        } catch (error) {
+            showError(error.message || 'Failed to run why-not analysis');
+            const output = document.getElementById('why-not-output');
+            if (output) output.textContent = error.message || 'Why-not analysis failed';
         }
     });
     on('run-batch-recommendations', 'click', async () => {

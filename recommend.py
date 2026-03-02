@@ -8,6 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
+import re
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -23,6 +24,15 @@ class RankingConfig:
     weights: Dict[str, float]
     time_decay_days: int
     source_weights: Dict[str, float]
+    max_per_source: Optional[int] = None
+    max_per_topic: Optional[int] = None
+    max_per_section: Optional[int] = None
+    hard_max_age_days: Optional[int] = None
+    min_freshness: Optional[float] = None
+    recent_boost_days: int = 0
+    recent_boost_factor: float = 1.0
+    dedup_by_title: bool = False
+    dedup_by_url: bool = False
 
 
 PRESET_RANKING_CONFIGS: Dict[str, RankingConfig] = {
@@ -31,24 +41,56 @@ PRESET_RANKING_CONFIGS: Dict[str, RankingConfig] = {
         weights={"semantic": 0.45, "freshness": 0.2, "topic": 0.25, "source": 0.1},
         time_decay_days=30,
         source_weights={},
+        max_per_source=2,
+        max_per_topic=3,
+        max_per_section=3,
+        hard_max_age_days=None,
+        min_freshness=None,
+        recent_boost_days=2,
+        recent_boost_factor=1.08,
+        dedup_by_title=True,
+        dedup_by_url=True,
     ),
     "semantic_heavy": RankingConfig(
         config_id="semantic_heavy",
         weights={"semantic": 0.65, "freshness": 0.1, "topic": 0.2, "source": 0.05},
         time_decay_days=45,
         source_weights={},
+        max_per_source=3,
+        max_per_topic=4,
+        max_per_section=4,
+        recent_boost_days=1,
+        recent_boost_factor=1.03,
+        dedup_by_title=True,
+        dedup_by_url=True,
     ),
     "freshness_heavy": RankingConfig(
         config_id="freshness_heavy",
         weights={"semantic": 0.3, "freshness": 0.45, "topic": 0.15, "source": 0.1},
         time_decay_days=14,
         source_weights={},
+        max_per_source=2,
+        max_per_topic=3,
+        max_per_section=3,
+        hard_max_age_days=7,
+        min_freshness=0.35,
+        recent_boost_days=3,
+        recent_boost_factor=1.12,
+        dedup_by_title=True,
+        dedup_by_url=True,
     ),
     "topic_heavy": RankingConfig(
         config_id="topic_heavy",
         weights={"semantic": 0.3, "freshness": 0.15, "topic": 0.45, "source": 0.1},
         time_decay_days=30,
         source_weights={},
+        max_per_source=2,
+        max_per_topic=2,
+        max_per_section=3,
+        recent_boost_days=2,
+        recent_boost_factor=1.05,
+        dedup_by_title=True,
+        dedup_by_url=True,
     ),
 }
 
@@ -239,6 +281,15 @@ class AdvancedRecommender(BaseRecommender):
             },
             time_decay_days=max(1, time_decay_days),
             source_weights={},
+            max_per_source=None,
+            max_per_topic=None,
+            max_per_section=None,
+            hard_max_age_days=None,
+            min_freshness=None,
+            recent_boost_days=0,
+            recent_boost_factor=1.0,
+            dedup_by_title=False,
+            dedup_by_url=False,
         )
 
     @staticmethod
@@ -279,6 +330,15 @@ class AdvancedRecommender(BaseRecommender):
             "weights": cfg.weights,
             "time_decay_days": cfg.time_decay_days,
             "source_weights": cfg.source_weights,
+            "max_per_source": cfg.max_per_source,
+            "max_per_topic": cfg.max_per_topic,
+            "max_per_section": cfg.max_per_section,
+            "hard_max_age_days": cfg.hard_max_age_days,
+            "min_freshness": cfg.min_freshness,
+            "recent_boost_days": cfg.recent_boost_days,
+            "recent_boost_factor": cfg.recent_boost_factor,
+            "dedup_by_title": cfg.dedup_by_title,
+            "dedup_by_url": cfg.dedup_by_url,
         } for name, cfg in PRESET_RANKING_CONFIGS.items()}
 
         configs[self.legacy_default_config.config_id] = {
@@ -286,6 +346,15 @@ class AdvancedRecommender(BaseRecommender):
             "weights": self.legacy_default_config.weights,
             "time_decay_days": self.legacy_default_config.time_decay_days,
             "source_weights": self.legacy_default_config.source_weights,
+            "max_per_source": self.legacy_default_config.max_per_source,
+            "max_per_topic": self.legacy_default_config.max_per_topic,
+            "max_per_section": self.legacy_default_config.max_per_section,
+            "hard_max_age_days": self.legacy_default_config.hard_max_age_days,
+            "min_freshness": self.legacy_default_config.min_freshness,
+            "recent_boost_days": self.legacy_default_config.recent_boost_days,
+            "recent_boost_factor": self.legacy_default_config.recent_boost_factor,
+            "dedup_by_title": self.legacy_default_config.dedup_by_title,
+            "dedup_by_url": self.legacy_default_config.dedup_by_url,
         }
         return configs
 
@@ -298,14 +367,49 @@ class AdvancedRecommender(BaseRecommender):
             weights = ranking_config.get("weights", {})
             time_decay_days = int(ranking_config.get("time_decay_days", self.time_decay_days))
             source_weights = ranking_config.get("source_weights", {})
+            max_per_source = ranking_config.get("max_per_source")
+            max_per_topic = ranking_config.get("max_per_topic")
+            max_per_section = ranking_config.get("max_per_section")
+            hard_max_age_days = ranking_config.get("hard_max_age_days")
+            min_freshness = ranking_config.get("min_freshness")
+            recent_boost_days = int(ranking_config.get("recent_boost_days", 0))
+            recent_boost_factor = float(ranking_config.get("recent_boost_factor", 1.0))
+            dedup_by_title = bool(ranking_config.get("dedup_by_title", False))
+            dedup_by_url = bool(ranking_config.get("dedup_by_url", False))
             self._validate_weights(weights)
             if time_decay_days <= 0:
                 raise ValueError("time_decay_days must be greater than 0")
+            for key, raw in (
+                ("max_per_source", max_per_source),
+                ("max_per_topic", max_per_topic),
+                ("max_per_section", max_per_section),
+            ):
+                if raw is not None and int(raw) < 1:
+                    raise ValueError(f"{key} must be >= 1 when provided")
+            if hard_max_age_days is not None and int(hard_max_age_days) < 0:
+                raise ValueError("hard_max_age_days must be >= 0 when provided")
+            if min_freshness is not None:
+                min_freshness = float(min_freshness)
+                if min_freshness < 0 or min_freshness > 1:
+                    raise ValueError("min_freshness must be between 0 and 1")
+            if recent_boost_days < 0:
+                raise ValueError("recent_boost_days must be >= 0")
+            if recent_boost_factor < 0.5 or recent_boost_factor > 5:
+                raise ValueError("recent_boost_factor must be between 0.5 and 5")
             return RankingConfig(
                 config_id=ranking_config.get("config_id", "custom"),
                 weights=weights,
                 time_decay_days=time_decay_days,
                 source_weights=source_weights,
+                max_per_source=(int(max_per_source) if max_per_source is not None else None),
+                max_per_topic=(int(max_per_topic) if max_per_topic is not None else None),
+                max_per_section=(int(max_per_section) if max_per_section is not None else None),
+                hard_max_age_days=(int(hard_max_age_days) if hard_max_age_days is not None else None),
+                min_freshness=min_freshness,
+                recent_boost_days=recent_boost_days,
+                recent_boost_factor=recent_boost_factor,
+                dedup_by_title=dedup_by_title,
+                dedup_by_url=dedup_by_url,
             )
 
         if config_id == self.legacy_default_config.config_id:
@@ -326,6 +430,16 @@ class AdvancedRecommender(BaseRecommender):
         except (KeyError, ValueError):
             return 1.0
 
+    def _article_age_days(self, article_id: str) -> Optional[int]:
+        try:
+            scraped_at = datetime.strptime(
+                self.article_vectors[article_id]["metadata"]["scraped_at"],
+                "%Y-%m-%d %H:%M:%S",
+            )
+            return max(0, (datetime.now() - scraped_at).days)
+        except (KeyError, ValueError):
+            return None
+
     @staticmethod
     def _calculate_cluster_similarity(user_clusters: List[int], article_cluster: int) -> float:
         if not user_clusters:
@@ -345,6 +459,29 @@ class AdvancedRecommender(BaseRecommender):
         top_txt = ", ".join(f"{name}={value:.3f}" for name, value in top)
         return f"Top drivers: {top_txt}. Source: {source}."
 
+    @staticmethod
+    def _normalize_title_key(title: str) -> str:
+        text = re.sub(r"\s+", " ", str(title or "").strip().lower())
+        text = re.sub(r"[^a-z0-9 ]+", "", text)
+        return text
+
+    @staticmethod
+    def _extract_primary_section(article_data: Dict) -> str:
+        metadata = article_data.get("metadata", {}) or {}
+        for key in ("section", "rubrika", "category"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+        categories = metadata.get("categories")
+        if isinstance(categories, list) and categories:
+            first = str(categories[0]).strip().lower()
+            if first:
+                return first
+        url = str(metadata.get("url", ""))
+        parsed = urlparse(url)
+        path_parts = [part for part in parsed.path.split("/") if part.strip()]
+        return (path_parts[0].strip().lower() if path_parts else "unknown")
+
     def recommend_for_user(
         self,
         user_id: str,
@@ -354,6 +491,7 @@ class AdvancedRecommender(BaseRecommender):
         sources: Optional[List[str]] = None,
         config_id: str = "balanced",
         ranking_config: Optional[Dict] = None,
+        diagnostics: Optional[Dict[str, List[Dict]]] = None,
     ) -> List[Dict[str, float]]:
         if not user_reads:
             return []
@@ -399,8 +537,16 @@ class AdvancedRecommender(BaseRecommender):
         semantic_similarities = cosine_similarity([user_profile_vector], candidate_vectors)[0]
 
         recommendations = []
+        excluded = []
         for aid, semantic_sim, cluster in zip(candidate_ids, semantic_similarities, candidate_clusters):
             freshness = self._calculate_time_decay(aid, config.time_decay_days)
+            age_days = self._article_age_days(aid)
+            if config.hard_max_age_days is not None and age_days is not None and age_days > config.hard_max_age_days:
+                excluded.append({"article_id": aid, "reason_code": "hard_max_age_days", "age_days": age_days})
+                continue
+            if config.min_freshness is not None and freshness < config.min_freshness:
+                excluded.append({"article_id": aid, "reason_code": "min_freshness", "freshness": round(float(freshness), 4)})
+                continue
             topic = self._calculate_cluster_similarity(user_clusters, cluster)
             source_score = self._calculate_source_score(aid, config.source_weights)
             source = self.extract_source(article_vectors[aid].get("metadata", {}).get("url", ""))
@@ -416,6 +562,9 @@ class AdvancedRecommender(BaseRecommender):
                 for key in config.weights.keys()
             }
             final_score = float(sum(contributions.values()))
+            if config.recent_boost_days and config.recent_boost_factor > 0 and age_days is not None and age_days <= config.recent_boost_days:
+                final_score = float(final_score * config.recent_boost_factor)
+                contributions["freshness"] = float(contributions.get("freshness", 0.0) * config.recent_boost_factor)
 
             article_data = article_vectors[aid]
             recommendations.append(
@@ -430,16 +579,93 @@ class AdvancedRecommender(BaseRecommender):
                         "semantic": round(features["semantic"], 4),
                         "freshness": round(features["freshness"], 4),
                         "topic": round(features["topic"], 4),
+                        "source": round(features["source"], 4),
                     },
                     "features": {k: round(v, 4) for k, v in features.items()},
                     "feature_contributions": {k: round(v, 4) for k, v in contributions.items()},
                     "config_id": config.config_id,
+                    "age_days": age_days,
+                    "topic_cluster": int(cluster) if isinstance(cluster, (int, np.integer)) else cluster,
+                    "section": self._extract_primary_section(article_data),
+                    "explanation_details": {
+                        "schema_version": "v2",
+                        "reason_codes": sorted(contributions.keys(), key=lambda key: contributions[key], reverse=True),
+                        "feature_values": {k: round(v, 4) for k, v in features.items()},
+                        "feature_contributions": {k: round(v, 4) for k, v in contributions.items()},
+                        "constraints": {
+                            "hard_max_age_days": config.hard_max_age_days,
+                            "min_freshness": config.min_freshness,
+                            "max_per_source": config.max_per_source,
+                            "max_per_topic": config.max_per_topic,
+                            "max_per_section": config.max_per_section,
+                            "dedup_by_title": config.dedup_by_title,
+                            "dedup_by_url": config.dedup_by_url,
+                        },
+                    },
                     "explanation": self._compose_explanation(contributions, source),
                 }
             )
 
         recommendations.sort(key=lambda x: x["score"], reverse=True)
-        return recommendations[:top_n]
+        source_counts: Dict[str, int] = {}
+        topic_counts: Dict[str, int] = {}
+        section_counts: Dict[str, int] = {}
+        seen_titles: set = set()
+        seen_urls: set = set()
+        selected: List[Dict[str, float]] = []
+        for rec in recommendations:
+            source = str(rec.get("source", "unknown"))
+            topic = str(rec.get("topic_cluster", "unknown"))
+            section = str(rec.get("section", "unknown"))
+            title_key = self._normalize_title_key(rec.get("title", ""))
+            url_key = str(rec.get("url", "")).strip().lower()
+
+            if config.dedup_by_title and title_key and title_key in seen_titles:
+                excluded.append({"article_id": rec.get("article_id"), "reason_code": "dedup_title", "title_key": title_key})
+                continue
+            if config.dedup_by_url and url_key and url_key in seen_urls:
+                excluded.append({"article_id": rec.get("article_id"), "reason_code": "dedup_url", "url": url_key})
+                continue
+            if config.max_per_source is not None and source_counts.get(source, 0) >= config.max_per_source:
+                excluded.append({"article_id": rec.get("article_id"), "reason_code": "cap_source", "source": source})
+                continue
+            if config.max_per_topic is not None and topic_counts.get(topic, 0) >= config.max_per_topic:
+                excluded.append({"article_id": rec.get("article_id"), "reason_code": "cap_topic", "topic": topic})
+                continue
+            if config.max_per_section is not None and section_counts.get(section, 0) >= config.max_per_section:
+                excluded.append({"article_id": rec.get("article_id"), "reason_code": "cap_section", "section": section})
+                continue
+
+            source_counts[source] = source_counts.get(source, 0) + 1
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+            section_counts[section] = section_counts.get(section, 0) + 1
+            if title_key:
+                seen_titles.add(title_key)
+            if url_key:
+                seen_urls.add(url_key)
+            selected.append(rec)
+            if len(selected) >= top_n:
+                break
+
+        if diagnostics is not None:
+            diagnostics["selected"] = [
+                {
+                    "article_id": item.get("article_id"),
+                    "score": item.get("score"),
+                    "source": item.get("source"),
+                    "topic_cluster": item.get("topic_cluster"),
+                    "section": item.get("section"),
+                }
+                for item in selected
+            ]
+            diagnostics["excluded"] = excluded[:500]
+            diagnostics["counts"] = {
+                "candidate_scored": len(recommendations),
+                "selected": len(selected),
+                "excluded": len(excluded),
+            }
+
+        return selected[:top_n]
 
 
 class RecommenderFactory:

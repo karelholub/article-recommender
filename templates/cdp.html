@@ -40,6 +40,39 @@
                         <input id="cdp-request-retries" class="form-control form-control-sm mb-2" type="number" min="0" max="5" step="1" placeholder="2">
                     </div>
                 </div>
+                <div class="row g-2">
+                    <div class="col-sm-4">
+                        <label class="form-label small mb-1" for="cdp-personalization-mode">Personalization Mode</label>
+                        <select id="cdp-personalization-mode" class="form-select form-select-sm mb-2">
+                            <option value="active">active</option>
+                            <option value="observe">observe</option>
+                            <option value="off">off</option>
+                        </select>
+                    </div>
+                    <div class="col-sm-4">
+                        <label class="form-label small mb-1" for="cdp-fallback-mode">Fallback Mode</label>
+                        <select id="cdp-fallback-mode" class="form-select form-select-sm mb-2">
+                            <option value="source_defaults">source_defaults</option>
+                            <option value="profile_traits">profile_traits</option>
+                            <option value="none">none</option>
+                        </select>
+                    </div>
+                    <div class="col-sm-4">
+                        <label class="form-label small mb-1" for="cdp-freshness-sla-hours">Profile Freshness SLA (hours)</label>
+                        <input id="cdp-freshness-sla-hours" class="form-control form-control-sm mb-2" type="number" min="1" max="720" step="1" placeholder="24">
+                    </div>
+                </div>
+                <div class="row g-2">
+                    <div class="col-sm-8">
+                        <label class="form-label small mb-1" for="cdp-mapping-preset">Mapping Preset</label>
+                        <select id="cdp-mapping-preset" class="form-select form-select-sm mb-2">
+                            <option value="">Loading presets...</option>
+                        </select>
+                    </div>
+                    <div class="col-sm-4 d-grid">
+                        <button id="apply-cdp-preset" class="btn btn-sm btn-outline-secondary mt-sm-4">Apply Preset</button>
+                    </div>
+                </div>
                 <button id="save-cdp-config" class="btn btn-sm btn-outline-primary">Save Integration</button>
                 <div id="cdp-config-status" class="small text-muted mt-2">Idle.</div>
             </div>
@@ -121,7 +154,13 @@
                 <textarea id="cdp-config-segment-map" class="form-control form-control-sm mb-2" rows="3" placeholder='{"segment":"config_id"}'></textarea>
                 <label class="form-label small mb-1" for="cdp-segment-priority">Segment Priority (comma separated)</label>
                 <input id="cdp-segment-priority" class="form-control form-control-sm mb-2" placeholder="comma,separated,priority">
-                <button id="save-cdp-mapping" class="btn btn-sm btn-outline-primary">Save Mapping</button>
+                <div class="d-flex gap-2 flex-wrap">
+                    <button id="save-cdp-mapping" class="btn btn-sm btn-outline-primary">Save Mapping</button>
+                    <button id="export-cdp-mapping" class="btn btn-sm btn-outline-secondary">Export Mapping JSON</button>
+                    <button id="import-cdp-mapping" class="btn btn-sm btn-outline-secondary">Import Mapping JSON</button>
+                </div>
+                <label class="form-label small mb-1 mt-2" for="cdp-mapping-json">Mapping JSON (import/export)</label>
+                <textarea id="cdp-mapping-json" class="form-control form-control-sm mb-0" rows="6" placeholder='{"external_id_path":"customer_entity_id"}'></textarea>
             </div>
         </div>
     </div>
@@ -137,6 +176,15 @@
                 <textarea id="cdp-preview-payload" class="form-control form-control-sm mb-2" rows="8" placeholder='{"customer_entity_id":"...","returned_attributes":{}}'></textarea>
                 <label class="form-label small mb-1" for="cdp-preview-fallback-external-id">Fallback External ID (optional)</label>
                 <input id="cdp-preview-fallback-external-id" class="form-control form-control-sm mb-2" placeholder="fallback external ID (optional)">
+                <div class="row g-2 mb-2">
+                    <div class="col-sm-8">
+                        <label class="form-label small mb-1" for="cdp-fallback-preview-external-id">Fallback Preview External ID</label>
+                        <input id="cdp-fallback-preview-external-id" class="form-control form-control-sm" placeholder="external user ID for fallback evaluation">
+                    </div>
+                    <div class="col-sm-4 d-grid">
+                        <button id="preview-cdp-fallback" class="btn btn-sm btn-outline-secondary mt-sm-4">Preview Fallback</button>
+                    </div>
+                </div>
                 <pre id="cdp-mapping-preview-output" class="small mb-0">Paste a sample Meiro payload and run preview.</pre>
             </div>
         </div>
