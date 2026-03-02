@@ -20,6 +20,7 @@ let reportingLastIdentity = null;
 let reportingLastScenarioTraces = null;
 let reportingLastIdentityDiagnostics = null;
 let reportingLastExperiments = null;
+let reportingLastExperimentComparison = null;
 let reportingQualitySnapshots = [];
 let reportingLastQualityCompare = null;
 let recommendationRuns = [];
@@ -1726,6 +1727,72 @@ function renderExperimentMetrics(payload) {
         `).join('');
         table.innerHTML = rows || '<tr><td colspan="7" class="text-muted">No experiment assignments in selected window.</td></tr>';
     }
+    const baseline = document.getElementById('experiment-baseline');
+    const candidate = document.getElementById('experiment-candidate');
+    if (baseline && candidate) {
+        const options = (payload.variants || []).map(item => (
+            `<option value="${item.variant_id}">${item.variant_id} (runs ${item.runs || 0}, CTR ${(Number(item.ctr || 0) * 100).toFixed(2)}%)</option>`
+        )).join('');
+        baseline.innerHTML = options || '<option value="">No variants</option>';
+        candidate.innerHTML = options || '<option value="">No variants</option>';
+        if ((payload.variants || []).length >= 2) {
+            baseline.value = payload.variants[0].variant_id;
+            candidate.value = payload.variants[1].variant_id;
+        } else if ((payload.variants || []).length === 1) {
+            baseline.value = payload.variants[0].variant_id;
+            candidate.value = payload.variants[0].variant_id;
+        }
+    }
+}
+
+function renderExperimentComparison(payload) {
+    reportingLastExperimentComparison = payload;
+    const summary = document.getElementById('reporting-experiment-compare-summary');
+    const table = document.getElementById('reporting-experiment-compare-table');
+    if (summary) {
+        summary.innerHTML = `
+            <strong>Experiment comparison:</strong>
+            baseline ${payload.baseline_variant}, candidate ${payload.candidate_variant},
+            window ${payload.window_days} days
+        `;
+    }
+    if (table) {
+        const rows = (payload.comparison || []).map(item => `
+            <tr>
+                <td>${item.metric}</td>
+                <td>${item.baseline ?? 'n/a'}</td>
+                <td>${item.candidate ?? 'n/a'}</td>
+                <td>${item.delta === null || item.delta === undefined ? 'n/a' : Number(item.delta).toFixed(6)}</td>
+                <td>${item.delta_pct === null || item.delta_pct === undefined ? 'n/a' : `${(Number(item.delta_pct) * 100).toFixed(2)}%`}</td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="5" class="text-muted">No comparison data.</td></tr>';
+    }
+}
+
+async function compareExperimentVariants() {
+    const days = Number(document.getElementById('reporting-days')?.value || 30);
+    const baseline = document.getElementById('experiment-baseline')?.value || '';
+    const candidate = document.getElementById('experiment-candidate')?.value || '';
+    const experimentId = reportingLastExperiments?.experiment_id || '';
+    if (!baseline || !candidate) {
+        throw new Error('Select baseline and candidate variants');
+    }
+    const params = new URLSearchParams({
+        days: String(Number.isFinite(days) ? Math.max(1, Math.min(365, Math.round(days))) : 30),
+        baseline_variant: baseline,
+        candidate_variant: candidate,
+        limit_runs: '5000',
+        limit_events: '100000'
+    });
+    if (experimentId) params.set('experiment_id', experimentId);
+    const response = await fetch(`/api/metrics/experiments/compare?${params.toString()}`);
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to compare variants');
+    }
+    const payload = await response.json();
+    renderExperimentComparison(payload);
 }
 
 function renderScenarioTraceMetrics(payload) {
@@ -1909,6 +1976,16 @@ async function loadReportingWorkspace() {
         renderIdentityMetrics(identityPayload);
         renderIdentityDiagnostics(identityDiagnosticsPayload);
         renderExperimentMetrics(experimentsPayload);
+        if ((experimentsPayload.variants || []).length >= 1) {
+            try {
+                await compareExperimentVariants();
+            } catch (error) {
+                const summary = document.getElementById('reporting-experiment-compare-summary');
+                const table = document.getElementById('reporting-experiment-compare-table');
+                if (summary) summary.textContent = `Experiment comparison unavailable: ${error.message}`;
+                if (table) table.innerHTML = '<tr><td colspan="5" class="text-muted">Select variants to compare.</td></tr>';
+            }
+        }
         renderScenarioTraceMetrics(tracePayload);
     } catch (error) {
         document.getElementById('reporting-summary').textContent = `Reporting unavailable: ${error.message}`;
@@ -1921,6 +1998,8 @@ async function loadReportingWorkspace() {
         const identityDiagTable = document.getElementById('reporting-identity-diagnostics-table');
         const experimentSummary = document.getElementById('reporting-experiment-summary');
         const experimentTable = document.getElementById('reporting-experiment-table');
+        const experimentCompareSummary = document.getElementById('reporting-experiment-compare-summary');
+        const experimentCompareTable = document.getElementById('reporting-experiment-compare-table');
         const traceTable = document.getElementById('reporting-scenario-trace-table');
         if (attributionTable) attributionTable.innerHTML = '<tr><td colspan="9" class="text-danger">Failed to load attribution data.</td></tr>';
         if (sourceTable) sourceTable.innerHTML = '<tr><td colspan="6" class="text-danger">Failed to load attribution data.</td></tr>';
@@ -1930,6 +2009,8 @@ async function loadReportingWorkspace() {
         if (identityDiagTable) identityDiagTable.innerHTML = '<tr><td colspan="3" class="text-danger">Failed to load identity diagnostics.</td></tr>';
         if (experimentSummary) experimentSummary.textContent = `Experiment analytics unavailable: ${error.message}`;
         if (experimentTable) experimentTable.innerHTML = '<tr><td colspan="7" class="text-danger">Failed to load experiment analytics.</td></tr>';
+        if (experimentCompareSummary) experimentCompareSummary.textContent = `Experiment comparison unavailable: ${error.message}`;
+        if (experimentCompareTable) experimentCompareTable.innerHTML = '<tr><td colspan="5" class="text-danger">Failed to load experiment comparison.</td></tr>';
         if (traceTable) traceTable.innerHTML = '<tr><td colspan="6" class="text-danger">Failed to load scenario trace analytics.</td></tr>';
     }
 }
@@ -1964,6 +2045,13 @@ function exportReportingCsv() {
                 item.ctr,
                 item.conversion_rate
             ]);
+        });
+    }
+    if (reportingLastExperimentComparison) {
+        rows.push([]);
+        rows.push(['experiment_metric', 'baseline', 'candidate', 'delta', 'delta_pct']);
+        (reportingLastExperimentComparison.comparison || []).forEach(item => {
+            rows.push([item.metric, item.baseline, item.candidate, item.delta, item.delta_pct]);
         });
     }
     if (reportingLastQualityCompare) {
@@ -2480,6 +2568,13 @@ function setupEventListeners() {
             await compareQualitySnapshots();
         } catch (error) {
             showError(error.message || 'Failed to compare snapshots');
+        }
+    });
+    on('compare-experiment-variants', 'click', async () => {
+        try {
+            await compareExperimentVariants();
+        } catch (error) {
+            showError(error.message || 'Failed to compare experiment variants');
         }
     });
     on('refresh-run-explorer', 'click', loadRecommendationRuns);

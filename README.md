@@ -205,6 +205,7 @@ python embed.py
 - `GET /api/metrics/identity?days=30&limit_events=50000&limit_runs=1000&top_external=25`: External-ID analytics (cross-device coverage, top external users, scenario external-share)
 - `GET /api/metrics/identity/diagnostics?days=30&limit_events=50000&limit_runs=5000`: External-ID data quality diagnostics (orphan events, run mismatches, ID drift)
 - `GET /api/metrics/experiments?days=30&experiment_id=exp-homepage`: A/B experiment analytics by variant (runs, impressions, clicks, conversions, CTR/CVR)
+- `GET /api/metrics/experiments/compare?days=30&experiment_id=exp-homepage&baseline_variant=control&candidate_variant=variant`: Variant-to-variant lift table (runs, impressions, clicks, conversions, CTR/CVR deltas)
 - `GET /api/metrics/scenario-traces?days=30&limit_runs=1000&scenario_ids=homepage&top_rules=25`: Aggregated scenario trace/rule impact diagnostics from persisted recommendation runs
 - `POST /api/metrics/rollups/rebuild`: Rebuild daily event rollups for reporting windows
 - `GET /api/metrics/rollups/daily?days=30&scenario_ids=homepage&source=www.e15.cz`: Inspect persisted daily rollup rows

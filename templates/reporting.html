@@ -96,6 +96,20 @@
                     </table>
                 </div>
                 <div class="d-flex gap-2 align-items-center mb-2">
+                    <select id="experiment-baseline" class="form-select form-select-sm" style="max-width: 320px;"></select>
+                    <select id="experiment-candidate" class="form-select form-select-sm" style="max-width: 320px;"></select>
+                    <button id="compare-experiment-variants" class="btn btn-sm btn-outline-secondary">Compare Variants</button>
+                </div>
+                <div id="reporting-experiment-compare-summary" class="small text-muted mb-2">Select variants to compare.</div>
+                <div class="table-responsive mb-3">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr><th>Metric</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Delta %</th></tr>
+                        </thead>
+                        <tbody id="reporting-experiment-compare-table"><tr><td colspan="5" class="text-muted">No comparison yet.</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="d-flex gap-2 align-items-center mb-2">
                     <button id="capture-quality-snapshot" class="btn btn-sm btn-outline-primary">Capture Quality Snapshot</button>
                     <select id="quality-baseline" class="form-select form-select-sm" style="max-width: 360px;"></select>
                     <select id="quality-candidate" class="form-select form-select-sm" style="max-width: 360px;"></select>

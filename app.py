@@ -2988,6 +2988,79 @@ def metrics_identity_diagnostics():
         return jsonify({"error": str(e)}), 500
 
 
+def _compute_experiment_metrics(days: int, experiment_id: str, limit_runs: int, limit_events: int) -> Dict:
+    if not store:
+        return {
+            "window_days": days,
+            "experiment_id": experiment_id or None,
+            "experiments_seen": [],
+            "variants": [],
+            "runs_with_assignment": 0,
+        }
+
+    runs = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+    run_assignments: Dict[str, Dict] = {}
+    by_variant: Dict[str, Dict] = {}
+    experiment_ids = set()
+    for run in runs:
+        assignment = (run.get("request", {}) or {}).get("experiment_assignment") or {}
+        exp_id = str(assignment.get("experiment_id") or "").strip()
+        variant_id = str(assignment.get("variant_id") or "").strip()
+        if not exp_id or not variant_id:
+            continue
+        if experiment_id and exp_id != experiment_id:
+            continue
+        run_id = run.get("run_id")
+        if not run_id:
+            continue
+        experiment_ids.add(exp_id)
+        run_assignments[run_id] = {"experiment_id": exp_id, "variant_id": variant_id}
+        bucket = by_variant.setdefault(
+            variant_id,
+            {
+                "variant_id": variant_id,
+                "runs": 0,
+                "impressions": 0,
+                "clicks": 0,
+                "conversions": 0,
+            },
+        )
+        bucket["runs"] += 1
+
+    events = store.list_events(limit=limit_events, days=days)
+    for event in events:
+        run_id = event.get("run_id")
+        assignment = run_assignments.get(run_id)
+        if not assignment:
+            continue
+        event_type = event.get("event_type")
+        if event_type not in {"impression", "click", "conversion"}:
+            continue
+        bucket = by_variant[assignment["variant_id"]]
+        bucket[f"{event_type}s"] += 1
+
+    variants = []
+    for bucket in by_variant.values():
+        impressions = bucket["impressions"]
+        clicks = bucket["clicks"]
+        variants.append(
+            {
+                **bucket,
+                "ctr": round((clicks / impressions), 4) if impressions else 0.0,
+                "conversion_rate": round((bucket["conversions"] / clicks), 4) if clicks else 0.0,
+            }
+        )
+    variants.sort(key=lambda item: item["runs"], reverse=True)
+
+    return {
+        "window_days": days,
+        "experiment_id": experiment_id or (next(iter(experiment_ids)) if len(experiment_ids) == 1 else None),
+        "experiments_seen": sorted(experiment_ids),
+        "variants": variants,
+        "runs_with_assignment": len(run_assignments),
+    }
+
+
 @app.route("/api/metrics/experiments", methods=["GET"])
 def metrics_experiments():
     if not store:
@@ -2997,72 +3070,79 @@ def metrics_experiments():
         experiment_id = str(request.args.get("experiment_id", "")).strip()
         limit_runs = max(1, min(20000, int(request.args.get("limit_runs", 5000))))
         limit_events = max(1, min(200000, int(request.args.get("limit_events", 100000))))
-
-        runs = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
-        run_assignments: Dict[str, Dict] = {}
-        by_variant: Dict[str, Dict] = {}
-        experiment_ids = set()
-        for run in runs:
-            assignment = (run.get("request", {}) or {}).get("experiment_assignment") or {}
-            exp_id = str(assignment.get("experiment_id") or "").strip()
-            variant_id = str(assignment.get("variant_id") or "").strip()
-            if not exp_id or not variant_id:
-                continue
-            if experiment_id and exp_id != experiment_id:
-                continue
-            run_id = run.get("run_id")
-            if not run_id:
-                continue
-            experiment_ids.add(exp_id)
-            run_assignments[run_id] = {"experiment_id": exp_id, "variant_id": variant_id}
-            bucket = by_variant.setdefault(
-                variant_id,
-                {
-                    "variant_id": variant_id,
-                    "runs": 0,
-                    "impressions": 0,
-                    "clicks": 0,
-                    "conversions": 0,
-                },
-            )
-            bucket["runs"] += 1
-
-        events = store.list_events(limit=limit_events, days=days)
-        for event in events:
-            run_id = event.get("run_id")
-            assignment = run_assignments.get(run_id)
-            if not assignment:
-                continue
-            event_type = event.get("event_type")
-            if event_type not in {"impression", "click", "conversion"}:
-                continue
-            bucket = by_variant[assignment["variant_id"]]
-            bucket[f"{event_type}s"] += 1
-
-        variants = []
-        for bucket in by_variant.values():
-            impressions = bucket["impressions"]
-            clicks = bucket["clicks"]
-            variants.append(
-                {
-                    **bucket,
-                    "ctr": round((clicks / impressions), 4) if impressions else 0.0,
-                    "conversion_rate": round((bucket["conversions"] / clicks), 4) if clicks else 0.0,
-                }
-            )
-        variants.sort(key=lambda item: item["runs"], reverse=True)
-
         return jsonify(
-            {
-                "window_days": days,
-                "experiment_id": experiment_id or (next(iter(experiment_ids)) if len(experiment_ids) == 1 else None),
-                "experiments_seen": sorted(experiment_ids),
-                "variants": variants,
-                "runs_with_assignment": len(run_assignments),
-            }
+            _compute_experiment_metrics(
+                days=days,
+                experiment_id=experiment_id,
+                limit_runs=limit_runs,
+                limit_events=limit_events,
+            )
         )
     except Exception as e:
         logger.error(f"Error computing experiment metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/experiments/compare", methods=["GET"])
+def metrics_experiments_compare():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        experiment_id = str(request.args.get("experiment_id", "")).strip()
+        baseline_variant = str(request.args.get("baseline_variant", "")).strip()
+        candidate_variant = str(request.args.get("candidate_variant", "")).strip()
+        limit_runs = max(1, min(20000, int(request.args.get("limit_runs", 5000))))
+        limit_events = max(1, min(200000, int(request.args.get("limit_events", 100000))))
+        if not baseline_variant or not candidate_variant:
+            return jsonify({"error": "baseline_variant and candidate_variant are required"}), 400
+
+        metrics = _compute_experiment_metrics(
+            days=days,
+            experiment_id=experiment_id,
+            limit_runs=limit_runs,
+            limit_events=limit_events,
+        )
+        variants = {item["variant_id"]: item for item in metrics.get("variants", [])}
+        baseline = variants.get(baseline_variant)
+        candidate = variants.get(candidate_variant)
+        if not baseline or not candidate:
+            return jsonify({"error": "Requested variants were not found in selected window"}), 404
+
+        compare_rows = []
+        for key in ("runs", "impressions", "clicks", "conversions", "ctr", "conversion_rate"):
+            b_val = baseline.get(key)
+            c_val = candidate.get(key)
+            delta = None
+            delta_pct = None
+            if isinstance(b_val, (int, float)) and isinstance(c_val, (int, float)):
+                delta = round(float(c_val) - float(b_val), 6)
+                delta_pct = round((delta / float(b_val)), 6) if float(b_val) != 0 else None
+            compare_rows.append(
+                {
+                    "metric": key,
+                    "baseline": b_val,
+                    "candidate": c_val,
+                    "delta": delta,
+                    "delta_pct": delta_pct,
+                }
+            )
+
+        return jsonify(
+            {
+                "api_version": "v1",
+                "window_days": days,
+                "experiment_id": metrics.get("experiment_id"),
+                "baseline_variant": baseline_variant,
+                "candidate_variant": candidate_variant,
+                "comparison": compare_rows,
+                "baseline": baseline,
+                "candidate": candidate,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error comparing experiment variants: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 

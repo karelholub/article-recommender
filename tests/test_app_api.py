@@ -911,6 +911,59 @@ def test_rollup_metrics_endpoints():
     assert 'rollups_used' in trends_payload
 
 
+def test_experiment_compare_endpoint():
+    client = app.test_client()
+
+    rec_resp = client.post(
+        '/api/recommendations/query',
+        json={
+            'user_id': 'exp-user-compare',
+            'user_reads': ['demo_article_1'],
+            'top_n': 2,
+            'config_id': 'balanced',
+            'experiment': {
+                'experiment_id': 'exp-compare',
+                'variants': [
+                    {'variant_id': 'control', 'weight': 1.0, 'config_id': 'balanced'},
+                    {'variant_id': 'candidate', 'weight': 0.0, 'config_id': 'balanced'},
+                ],
+            },
+            'track_impressions': True,
+        },
+    )
+    assert rec_resp.status_code == 200
+    rec_payload = rec_resp.get_json()
+    run_id = rec_payload['run_id']
+    recs = rec_payload.get('recommendations') or []
+    if recs:
+        event_resp = client.post(
+            '/api/events',
+            json={
+                'events': [
+                    {
+                        'event_type': 'click',
+                        'run_id': run_id,
+                        'article_id': recs[0]['article_id'],
+                        'scenario_id': rec_payload.get('scenario_id'),
+                        'user_id': 'exp-user-compare',
+                    }
+                ]
+            },
+        )
+        assert event_resp.status_code == 201
+
+    compare_resp = client.get(
+        '/api/metrics/experiments/compare'
+        '?days=3650&experiment_id=exp-compare&baseline_variant=control&candidate_variant=control'
+    )
+    assert compare_resp.status_code == 200
+    compared = compare_resp.get_json()
+    assert compared['api_version'] == 'v1'
+    assert compared['baseline_variant'] == 'control'
+    assert compared['candidate_variant'] == 'control'
+    assert compared['comparison']
+
+
 def test_engine_config_endpoint():
     client = app.test_client()
     response = client.get('/api/engine/config')
