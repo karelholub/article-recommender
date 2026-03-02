@@ -355,8 +355,18 @@ def connector_sync(connector_id):
         if not connector.get("enabled", True):
             return jsonify({"error": "Connector is disabled"}), 400
 
+        run_id = store.start_connector_run(connector_id, trigger="manual")
         ingestion_service = ConnectorIngestionService(recommender.embed_file)
         ingestion_result = ingestion_service.sync_connector(connector)
+        status = "completed" if not ingestion_result.errors else "completed_with_errors"
+        run = store.finish_connector_run(
+            run_id=run_id,
+            status=status,
+            attempted=ingestion_result.attempted,
+            ingested=ingestion_result.ingested,
+            skipped_existing=ingestion_result.skipped_existing,
+            errors=ingestion_result.errors,
+        )
         if ingestion_result.ingested > 0:
             recommender._load_data()
             store.sync_sources([entry["source"] for entry in recommender.get_available_sources()])
@@ -366,13 +376,47 @@ def connector_sync(connector_id):
             {
                 "message": "Connector sync executed.",
                 "connector": updated,
+                "run_id": run_id,
+                "run": run,
                 "ingestion": ingestion_result.to_dict(),
             }
         )
     except Exception as e:
+        if "run_id" in locals():
+            store.finish_connector_run(
+                run_id=run_id,
+                status="failed",
+                errors=[str(e)],
+            )
         logger.error(f"Error syncing connector: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/connectors/<connector_id>/runs", methods=["GET"])
+def connector_runs(connector_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+
+    try:
+        limit = int(request.args.get("limit", 20))
+        runs = store.list_connector_runs(connector_id, limit=limit)
+        return jsonify({"connector_id": connector_id, "runs": runs, "count": len(runs)})
+    except Exception as e:
+        logger.error(f"Error listing connector runs: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/connector-runs/<run_id>", methods=["GET"])
+def connector_run_detail(run_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+
+    run = store.get_connector_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found"}), 404
+    return jsonify(run)
 
 
 @app.route("/api/ranking-configs", methods=["GET", "POST"])

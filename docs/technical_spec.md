@@ -134,6 +134,8 @@ Update default source behavior:
 - `PUT /api/connectors/<connector_id>`
 - `DELETE /api/connectors/<connector_id>`
 - `POST /api/connectors/<connector_id>/sync`
+- `GET /api/connectors/<connector_id>/runs`
+- `GET /api/connector-runs/<run_id>`
 
 Connector types:
 - `section_scraper`
@@ -144,7 +146,8 @@ Sync behavior:
 - Deduplicates by URL against stored article vectors.
 - Generates deterministic embeddings for newly ingested articles.
 - Persists article vectors and refreshes in-process recommender state.
-- Returns ingestion diagnostics (`attempted`, `ingested`, `skipped_existing`, `errors`).
+- Persists connector run records with status and counters.
+- Returns ingestion diagnostics (`attempted`, `ingested`, `skipped_existing`, `errors`) and run metadata.
 
 ### 5.2 `GET /api/ranking-configs`
 

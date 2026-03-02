@@ -145,6 +145,8 @@ python embed.py
 - `PUT /api/connectors/<connector_id>`: Update connector
 - `DELETE /api/connectors/<connector_id>`: Delete connector
 - `POST /api/connectors/<connector_id>/sync`: Execute connector ingestion, update embeddings, and record sync timestamp
+- `GET /api/connectors/<connector_id>/runs?limit=20`: Connector sync run history
+- `GET /api/connector-runs/<run_id>`: Connector sync run detail
 - `GET /api/ranking-configs`: Latest ranking configs + versions
 - `POST /api/ranking-configs`: Create custom ranking config (new version starts at 1)
 - `PUT /api/ranking-configs/<config_id>`: Create a new version for an existing custom config
@@ -184,6 +186,7 @@ Connector config fields:
 - `ingested`
 - `skipped_existing`
 - `errors`
+- `run_id` and `run` (persistent execution trace with status `completed`, `completed_with_errors`, or `failed`)
 
 ## Development
 

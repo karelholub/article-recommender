@@ -285,8 +285,23 @@ def test_connector_crud_and_sync_flow():
     sync_payload = sync.get_json()
     assert 'message' in sync_payload
     assert 'ingestion' in sync_payload
+    assert 'run_id' in sync_payload
+    assert 'run' in sync_payload
     assert sync_payload['ingestion']['connector_id'] == connector_id
+    assert sync_payload['run']['status'] in ('completed', 'completed_with_errors')
     assert sync_payload['connector']['last_run_at'] is not None
+
+    run_detail = client.get(f"/api/connector-runs/{sync_payload['run_id']}")
+    assert run_detail.status_code == 200
+    run_payload = run_detail.get_json()
+    assert run_payload['run_id'] == sync_payload['run_id']
+    assert run_payload['connector_id'] == connector_id
+
+    run_list = client.get(f'/api/connectors/{connector_id}/runs?limit=5')
+    assert run_list.status_code == 200
+    run_list_payload = run_list.get_json()
+    assert run_list_payload['connector_id'] == connector_id
+    assert run_list_payload['count'] >= 1
 
     disabled = client.put(
         f'/api/connectors/{connector_id}',

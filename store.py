@@ -83,6 +83,26 @@ class BaseRecommenderStore:
     def mark_connector_sync(self, connector_id: str) -> Optional[Dict]:
         raise NotImplementedError
 
+    def start_connector_run(self, connector_id: str, trigger: str = "manual") -> str:
+        raise NotImplementedError
+
+    def finish_connector_run(
+        self,
+        run_id: str,
+        status: str,
+        attempted: int = 0,
+        ingested: int = 0,
+        skipped_existing: int = 0,
+        errors: Optional[List[str]] = None,
+    ) -> Optional[Dict]:
+        raise NotImplementedError
+
+    def get_connector_run(self, run_id: str) -> Optional[Dict]:
+        raise NotImplementedError
+
+    def list_connector_runs(self, connector_id: str, limit: int = 20) -> List[Dict]:
+        raise NotImplementedError
+
     def compute_offline_metrics(self, limit_runs: int = 100) -> Dict:
         runs = self.list_runs(limit=limit_runs)
         if not runs:
@@ -200,6 +220,21 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                     last_run_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS connector_sync_runs (
+                    run_id TEXT PRIMARY KEY,
+                    connector_id TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempted INTEGER NOT NULL DEFAULT 0,
+                    ingested INTEGER NOT NULL DEFAULT 0,
+                    skipped_existing INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    errors_json TEXT NOT NULL DEFAULT '[]',
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    created_at TEXT NOT NULL
                 );
                 """
             )
@@ -598,6 +633,110 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                 return None
         return self.get_connector(connector_id)
 
+    def start_connector_run(self, connector_id: str, trigger: str = "manual") -> str:
+        run_id = str(uuid.uuid4())
+        now = self._now()
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO connector_sync_runs
+                (run_id, connector_id, trigger, status, attempted, ingested, skipped_existing, error_count, errors_json, started_at, finished_at, created_at)
+                VALUES (?, ?, ?, ?, 0, 0, 0, 0, '[]', ?, NULL, ?)
+                """,
+                (run_id, connector_id, trigger, "running", now, now),
+            )
+        return run_id
+
+    def finish_connector_run(
+        self,
+        run_id: str,
+        status: str,
+        attempted: int = 0,
+        ingested: int = 0,
+        skipped_existing: int = 0,
+        errors: Optional[List[str]] = None,
+    ) -> Optional[Dict]:
+        errors_list = errors or []
+        now = self._now()
+        with self._managed_connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE connector_sync_runs
+                SET status = ?, attempted = ?, ingested = ?, skipped_existing = ?, error_count = ?, errors_json = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    status,
+                    int(attempted),
+                    int(ingested),
+                    int(skipped_existing),
+                    len(errors_list),
+                    json.dumps(errors_list, ensure_ascii=False),
+                    now,
+                    run_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_connector_run(run_id)
+
+    def get_connector_run(self, run_id: str) -> Optional[Dict]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT run_id, connector_id, trigger, status, attempted, ingested, skipped_existing, error_count, errors_json, started_at, finished_at, created_at
+                FROM connector_sync_runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "connector_id": row["connector_id"],
+            "trigger": row["trigger"],
+            "status": row["status"],
+            "attempted": int(row["attempted"]),
+            "ingested": int(row["ingested"]),
+            "skipped_existing": int(row["skipped_existing"]),
+            "error_count": int(row["error_count"]),
+            "errors": json.loads(row["errors_json"] or "[]"),
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "created_at": row["created_at"],
+        }
+
+    def list_connector_runs(self, connector_id: str, limit: int = 20) -> List[Dict]:
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_id, connector_id, trigger, status, attempted, ingested, skipped_existing, error_count, errors_json, started_at, finished_at, created_at
+                FROM connector_sync_runs
+                WHERE connector_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (connector_id, int(limit)),
+            ).fetchall()
+        return [
+            {
+                "run_id": row["run_id"],
+                "connector_id": row["connector_id"],
+                "trigger": row["trigger"],
+                "status": row["status"],
+                "attempted": int(row["attempted"]),
+                "ingested": int(row["ingested"]),
+                "skipped_existing": int(row["skipped_existing"]),
+                "error_count": int(row["error_count"]),
+                "errors": json.loads(row["errors_json"] or "[]"),
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
 
 class PostgresRecommenderStore(BaseRecommenderStore):
     def __init__(self, database_url: str):
@@ -686,6 +825,24 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                         last_run_at TIMESTAMPTZ,
                         created_at TIMESTAMPTZ NOT NULL,
                         updated_at TIMESTAMPTZ NOT NULL
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS connector_sync_runs (
+                        run_id UUID PRIMARY KEY,
+                        connector_id TEXT NOT NULL,
+                        trigger TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        attempted INTEGER NOT NULL DEFAULT 0,
+                        ingested INTEGER NOT NULL DEFAULT 0,
+                        skipped_existing INTEGER NOT NULL DEFAULT 0,
+                        error_count INTEGER NOT NULL DEFAULT 0,
+                        errors_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        started_at TIMESTAMPTZ NOT NULL,
+                        finished_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL
                     );
                     """
                 )
@@ -1099,6 +1256,122 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 if cur.rowcount == 0:
                     return None
         return self.get_connector(connector_id)
+
+    def start_connector_run(self, connector_id: str, trigger: str = "manual") -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO connector_sync_runs
+                    (run_id, connector_id, trigger, status, attempted, ingested, skipped_existing, error_count, errors_json, started_at, finished_at, created_at)
+                    VALUES (%s::uuid, %s, %s, %s, 0, 0, 0, 0, '[]'::jsonb, %s, NULL, %s)
+                    """,
+                    (run_id, connector_id, trigger, "running", now, now),
+                )
+        return run_id
+
+    def finish_connector_run(
+        self,
+        run_id: str,
+        status: str,
+        attempted: int = 0,
+        ingested: int = 0,
+        skipped_existing: int = 0,
+        errors: Optional[List[str]] = None,
+    ) -> Optional[Dict]:
+        errors_list = errors or []
+        now = datetime.now(UTC)
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE connector_sync_runs
+                    SET status = %s,
+                        attempted = %s,
+                        ingested = %s,
+                        skipped_existing = %s,
+                        error_count = %s,
+                        errors_json = %s::jsonb,
+                        finished_at = %s
+                    WHERE run_id = %s::uuid
+                    """,
+                    (
+                        status,
+                        int(attempted),
+                        int(ingested),
+                        int(skipped_existing),
+                        len(errors_list),
+                        json.dumps(errors_list, ensure_ascii=False),
+                        now,
+                        run_id,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    return None
+        return self.get_connector_run(run_id)
+
+    def get_connector_run(self, run_id: str) -> Optional[Dict]:
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT run_id::text, connector_id, trigger, status, attempted, ingested, skipped_existing, error_count, errors_json::text, started_at, finished_at, created_at
+                    FROM connector_sync_runs
+                    WHERE run_id = %s::uuid
+                    """,
+                    (run_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": row[0],
+            "connector_id": row[1],
+            "trigger": row[2],
+            "status": row[3],
+            "attempted": int(row[4]),
+            "ingested": int(row[5]),
+            "skipped_existing": int(row[6]),
+            "error_count": int(row[7]),
+            "errors": json.loads(row[8] or "[]"),
+            "started_at": row[9].strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": row[10].strftime("%Y-%m-%d %H:%M:%S") if row[10] else None,
+            "created_at": row[11].strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def list_connector_runs(self, connector_id: str, limit: int = 20) -> List[Dict]:
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT run_id::text, connector_id, trigger, status, attempted, ingested, skipped_existing, error_count, errors_json::text, started_at, finished_at, created_at
+                    FROM connector_sync_runs
+                    WHERE connector_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (connector_id, int(limit)),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "run_id": row[0],
+                "connector_id": row[1],
+                "trigger": row[2],
+                "status": row[3],
+                "attempted": int(row[4]),
+                "ingested": int(row[5]),
+                "skipped_existing": int(row[6]),
+                "error_count": int(row[7]),
+                "errors": json.loads(row[8] or "[]"),
+                "started_at": row[9].strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": row[10].strftime("%Y-%m-%d %H:%M:%S") if row[10] else None,
+                "created_at": row[11].strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            for row in rows
+        ]
 
 
 class RecommenderStore(BaseRecommenderStore):
