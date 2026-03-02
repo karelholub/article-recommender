@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Engine Snapshot</strong>
+                <button id="refresh-engine-snapshot" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body"><pre id="engine-config-snapshot" class="small mb-0">Loading...</pre></div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Audit Logs</strong>
+                <button id="refresh-audit-logs" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="row g-2 mb-2">
+                    <div class="col-6"><input id="audit-actor-filter" class="form-control form-control-sm" placeholder="actor_id"></div>
+                    <div class="col-6"><input id="audit-resource-filter" class="form-control form-control-sm" placeholder="resource_type"></div>
+                </div>
+                <div id="audit-logs-list" class="small text-muted">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header"><strong>Source Connectors</strong></div>
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <button id="sync-due-connectors" class="btn btn-sm btn-outline-success">Sync Due Now</button>
+                    <span id="connector-sync-summary" class="small text-muted">No sync queued.</span>
+                </div>
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <button id="run-scheduler-now" class="btn btn-sm btn-outline-dark">Scheduler Run Now</button>
+                    <span id="scheduler-status" class="small text-muted">Scheduler status unknown.</span>
+                </div>
+                <div id="connector-metrics" class="small text-muted mb-2">Loading connector metrics...</div>
+                <div class="row g-2 mb-2">
+                    <div class="col-md-4"><input id="connector-search" class="form-control form-control-sm" placeholder="Search connector name..."></div>
+                    <div class="col-md-4">
+                        <select id="connector-status-filter" class="form-select form-select-sm">
+                            <option value="all">All statuses</option>
+                            <option value="failed">Failed</option>
+                            <option value="completed_with_errors">Completed with errors</option>
+                            <option value="completed">Completed</option>
+                            <option value="running">Running</option>
+                            <option value="none">No runs</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="mb-2">
+                    <input id="connector-name" class="form-control form-control-sm mb-2" placeholder="Connector name">
+                    <select id="connector-type" class="form-select form-select-sm mb-2">
+                        <option value="section_scraper">section_scraper</option>
+                        <option value="rss">rss</option>
+                    </select>
+                    <input id="connector-url" class="form-control form-control-sm mb-2" placeholder="Base URL / Feed URL">
+                    <div class="row g-2 mb-2">
+                        <div class="col-4"><input id="connector-max-articles" class="form-control form-control-sm" type="number" min="1" max="50" value="10"></div>
+                        <div class="col-4"><input id="connector-sync-interval" class="form-control form-control-sm" type="number" min="1" value="60"></div>
+                        <div class="col-4 d-flex align-items-center">
+                            <div class="form-check mb-0"><input id="connector-auto-sync" class="form-check-input" type="checkbox"><label class="form-check-label small">Auto</label></div>
+                        </div>
+                    </div>
+                    <button id="create-connector" class="btn btn-sm btn-outline-primary">Create Connector</button>
+                    <div id="connector-form-error" class="small text-danger mt-1" style="display:none;"></div>
+                </div>
+                <div id="connector-list" class="small text-muted">Loading connectors...</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header"><strong>Operator Controls</strong></div>
+            <div class="card-body">
+                <label for="operator-id" class="form-label">Operator ID</label>
+                <input id="operator-id" class="form-control form-control-sm mb-2" placeholder="ops-user">
+                <div class="form-check mb-2">
+                    <input id="persist-incidents-on-sli" class="form-check-input" type="checkbox">
+                    <label class="form-check-label small">Persist incidents on SLI refresh</label>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>SLI & Alerts</strong>
+                <button id="refresh-sli" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div id="sli-overview" class="small text-muted mb-2">Loading...</div>
+                <input id="threshold-p95-ms" class="form-control form-control-sm mb-2" type="number" min="1" step="1" placeholder="P95 ms">
+                <input id="threshold-failure-rate" class="form-control form-control-sm mb-2" type="number" min="0" max="1" step="0.01" placeholder="failure max">
+                <input id="threshold-min-ctr" class="form-control form-control-sm mb-2" type="number" min="0" max="1" step="0.001" placeholder="min ctr">
+                <div class="d-flex gap-2 mb-2">
+                    <button id="save-alert-thresholds" class="btn btn-sm btn-outline-primary">Save Thresholds</button>
+                    <button id="evaluate-alert-incidents" class="btn btn-sm btn-outline-warning">Evaluate Incidents</button>
+                </div>
+                <div id="alert-thresholds-status" class="small text-muted">Thresholds idle.</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Alert Incidents</strong>
+                <button id="refresh-alert-incidents" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="d-flex gap-2 mb-2">
+                    <select id="incident-status-filter" class="form-select form-select-sm">
+                        <option value="">All statuses</option>
+                        <option value="open">Open</option>
+                        <option value="resolved">Resolved</option>
+                    </select>
+                    <input id="incident-metric-filter" class="form-control form-control-sm" placeholder="metric">
+                </div>
+                <div id="alert-incidents" class="small text-muted">Loading...</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Maintenance</strong>
+                <button id="refresh-cleanup-status" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div id="cleanup-status" class="small text-muted mb-2">Loading cleanup status...</div>
+                <button id="run-cleanup-now" class="btn btn-sm btn-outline-danger">Run Cleanup</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

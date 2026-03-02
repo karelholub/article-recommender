@@ -903,7 +903,27 @@ def after_request(response):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("recommendations.html", active_page="recommendations", title="Recommendations")
+
+
+@app.route("/recommendations")
+def recommendations_page():
+    return render_template("recommendations.html", active_page="recommendations", title="Recommendations")
+
+
+@app.route("/reporting")
+def reporting_page():
+    return render_template("reporting.html", active_page="reporting", title="Reporting")
+
+
+@app.route("/operations")
+def operations_page():
+    return render_template("operations.html", active_page="operations", title="Operations")
+
+
+@app.route("/runs")
+def runs_page():
+    return render_template("runs.html", active_page="runs", title="Run Explorer")
 
 
 @app.route("/healthz")

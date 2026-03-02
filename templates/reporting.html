@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <div class="card mb-4">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h3 class="mb-0">Reporting Workspace</h3>
+                <div class="d-flex gap-2">
+                    <button id="refresh-reporting-workspace" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    <button id="export-reporting-csv" class="btn btn-sm btn-outline-primary">Export CSV</button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="row g-2 mb-2">
+                    <div class="col-md-3">
+                        <label class="form-label small mb-1" for="reporting-days">Window (days)</label>
+                        <input id="reporting-days" class="form-control form-control-sm" type="number" min="1" max="365" value="30">
+                    </div>
+                    <div class="col-md-5">
+                        <label class="form-label small mb-1" for="reporting-scenario-filter">Scenarios (multi-select)</label>
+                        <select id="reporting-scenario-filter" class="form-select form-select-sm" multiple size="3"></select>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small mb-1" for="reporting-source-filter">Source</label>
+                        <input id="reporting-source-filter" class="form-control form-control-sm" placeholder="e.g., www.e15.cz">
+                    </div>
+                </div>
+                <div id="reporting-summary" class="small text-muted mb-2">Loading reporting metrics...</div>
+                <div class="row g-3">
+                    <div class="col-md-6"><div style="height:240px"><canvas id="reporting-volume-chart"></canvas></div></div>
+                    <div class="col-md-6"><div style="height:240px"><canvas id="reporting-ctr-chart"></canvas></div></div>
+                    <div class="col-md-6"><div style="height:240px"><canvas id="reporting-scenario-overlay-chart"></canvas></div></div>
+                    <div class="col-md-6"><div style="height:240px"><canvas id="reporting-funnel-chart"></canvas></div></div>
+                </div>
+                <div class="table-responsive mt-3">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>Scenario</th><th>Impressions</th><th>Clicks</th><th>Conversions</th><th>CTR</th></tr></thead>
+                        <tbody id="reporting-scenario-table"><tr><td colspan="5" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="row g-3">
+            <div class="col-lg-6">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <strong>Scenario Metrics</strong>
+                        <button id="refresh-scenario-metrics" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body"><div id="scenario-metrics" class="small text-muted">Loading...</div></div>
+                </div>
+            </div>
+            <div class="col-lg-6">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <strong>Scenario Source KPIs</strong>
+                        <button id="refresh-scenario-source-metrics" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    </div>
+                    <div class="card-body"><div id="scenario-source-metrics" class="small text-muted">Loading...</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row">
+    <div class="col-xl-8">
+        <div class="card mb-4">
+            <div class="card-body">
+                <h3 class="card-title">Recommendation Workspace</h3>
+                <p class="text-muted mb-0">Explore article similarity, source filters, ranking config, and scenario logic.</p>
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header"><strong>Current Article</strong></div>
+            <div class="card-body">
+                <h5 id="article-title"></h5>
+                <p id="article-content" class="mb-3"></p>
+                <div class="d-flex gap-2">
+                    <a id="article-url" href="#" target="_blank" class="btn btn-primary btn-sm">Read Full Article</a>
+                    <button id="show-similar" class="btn btn-outline-primary btn-sm">Find Similar Articles</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="similar-articles" class="card mb-4" style="display:none;">
+            <div class="card-header"><strong>Similar Articles</strong></div>
+            <div class="card-body"><div id="similar-list"></div></div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header d-flex justify-content-between">
+                <strong>Decision Context</strong>
+                <button id="refresh-decision-context" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body"><pre id="decision-context" class="small mb-0">Loading...</pre></div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header"><strong>Article Statistics</strong></div>
+            <div class="card-body"><div id="article-stats">Loading...</div></div>
+        </div>
+    </div>
+
+    <div class="col-xl-4">
+        <div class="card mb-4">
+            <div class="card-header"><strong>Recommendation Controls</strong></div>
+            <div class="card-body">
+                <label class="form-label">Ranking Configuration</label>
+                <select id="ranking-config" class="form-select mb-2"></select>
+                <label class="form-label">Scenario</label>
+                <select id="scenario-select" class="form-select mb-2"><option value="">No scenario</option></select>
+                <label class="form-label">External User ID</label>
+                <input id="external-user-id" class="form-control mb-2" placeholder="customer-123">
+                <label class="form-label">Sources</label>
+                <div id="source-filters" class="small text-muted mb-2">Loading sources...</div>
+                <button id="save-source-settings" class="btn btn-sm btn-outline-secondary">Save Source Defaults</button>
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header"><strong>Ranking Config Editor</strong></div>
+            <div class="card-body">
+                <input id="ranking-config-id" class="form-control form-control-sm mb-2" placeholder="config_id">
+                <div class="row g-2 mb-2">
+                    <div class="col-6"><input id="weight-semantic" class="form-control form-control-sm" type="number" step="0.01" placeholder="semantic"></div>
+                    <div class="col-6"><input id="weight-freshness" class="form-control form-control-sm" type="number" step="0.01" placeholder="freshness"></div>
+                    <div class="col-6"><input id="weight-topic" class="form-control form-control-sm" type="number" step="0.01" placeholder="topic"></div>
+                    <div class="col-6"><input id="weight-source" class="form-control form-control-sm" type="number" step="0.01" placeholder="source"></div>
+                </div>
+                <input id="ranking-time-decay-days" class="form-control form-control-sm mb-2" type="number" min="1" placeholder="time_decay_days">
+                <textarea id="ranking-source-weights-json" class="form-control form-control-sm mb-2" rows="3" placeholder='{"www.e15.cz":1.1}'></textarea>
+                <div class="d-flex gap-2">
+                    <button id="save-ranking-config" class="btn btn-sm btn-outline-primary">Save</button>
+                    <button id="delete-ranking-config" class="btn btn-sm btn-outline-danger">Delete</button>
+                </div>
+                <div id="ranking-config-status" class="small text-muted mt-2">Ready.</div>
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header"><strong>Scenario Config</strong></div>
+            <div class="card-body">
+                <input id="scenario-id" class="form-control form-control-sm mb-2" placeholder="scenario_id">
+                <input id="scenario-name" class="form-control form-control-sm mb-2" placeholder="name">
+                <input id="scenario-description" class="form-control form-control-sm mb-2" placeholder="description">
+                <div class="form-check mb-2">
+                    <input id="scenario-enabled" class="form-check-input" type="checkbox" checked>
+                    <label class="form-check-label small" for="scenario-enabled">Enabled</label>
+                </div>
+                <input id="rule-include-sources" class="form-control form-control-sm mb-2" placeholder="include_sources">
+                <input id="rule-exclude-sources" class="form-control form-control-sm mb-2" placeholder="exclude_sources">
+                <input id="rule-include-sections" class="form-control form-control-sm mb-2" placeholder="include_sections">
+                <input id="rule-exclude-sections" class="form-control form-control-sm mb-2" placeholder="exclude_sections">
+                <input id="rule-include-keywords" class="form-control form-control-sm mb-2" placeholder="include_keywords">
+                <input id="rule-exclude-keywords" class="form-control form-control-sm mb-2" placeholder="exclude_keywords">
+                <input id="rule-exclude-article-ids" class="form-control form-control-sm mb-2" placeholder="exclude_article_ids">
+                <div class="row g-2 mb-2">
+                    <div class="col-6"><input id="rule-max-age-days" class="form-control form-control-sm" type="number" min="0" placeholder="max_age_days"></div>
+                    <div class="col-6"><input id="rule-min-score" class="form-control form-control-sm" type="number" min="0" step="0.0001" placeholder="min_score"></div>
+                </div>
+                <select id="rule-ranking-config-id" class="form-select form-select-sm mb-2"><option value="">None</option></select>
+                <textarea id="rule-source-boosts-json" class="form-control form-control-sm mb-2" rows="2" placeholder='{"www.e15.cz":1.2}'></textarea>
+                <div class="d-flex gap-2 mb-2">
+                    <button id="apply-rule-builder" class="btn btn-sm btn-outline-secondary">Apply to JSON</button>
+                    <button id="load-rule-builder" class="btn btn-sm btn-outline-secondary">Load from JSON</button>
+                </div>
+                <textarea id="scenario-rule-set" class="form-control form-control-sm mb-2" rows="5"></textarea>
+                <div class="d-flex gap-2 mb-2">
+                    <button id="save-scenario" class="btn btn-sm btn-outline-primary">Save</button>
+                    <button id="delete-scenario" class="btn btn-sm btn-outline-danger">Delete</button>
+                    <button id="refresh-scenarios" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                </div>
+                <div class="d-flex gap-2 mb-2">
+                    <button id="simulate-scenario" class="btn btn-sm btn-outline-info">Simulate</button>
+                </div>
+                <div id="rule-builder-status" class="small text-muted">Builder ready.</div>
+                <div id="scenario-simulation" class="small text-muted mt-1">Simulation output appears here.</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><strong>Available Articles</strong></div>
+            <div class="card-body"><div id="article-list" class="list-group"></div></div>
+        </div>
+    </div>
+</div>
+{% endblock %}

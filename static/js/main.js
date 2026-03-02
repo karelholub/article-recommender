@@ -17,30 +17,38 @@ let reportingFunnelChart = null;
 let reportingLastPayload = null;
 let recommendationRuns = [];
 
+function hasElement(id) {
+    return Boolean(document.getElementById(id));
+}
+
 // Initialize the application
 document.addEventListener('DOMContentLoaded', () => {
-    loadArticles();
-    loadStats();
-    loadSources();
-    loadRankingConfigs();
-    loadScenarios();
-    loadOfflineMetrics();
-    loadScenarioMetrics();
-    loadScenarioSourceMetrics();
-    loadAlertThresholds();
-    loadSliOverview();
-    loadAlertIncidents();
-    loadCleanupStatus();
-    loadEngineConfigSnapshot();
-    loadAuditLogs();
-    loadRecommendationRuns();
-    loadConnectors();
-    loadConnectorMetrics();
-    loadSchedulerStatus();
-    loadDecisionContext();
-    loadReportingWorkspace();
+    if (hasElement('article-list')) loadArticles();
+    if (hasElement('article-stats')) loadStats();
+    if (hasElement('source-filters')) loadSources();
+    if (hasElement('ranking-config')) loadRankingConfigs();
+    if (hasElement('scenario-select') || hasElement('reporting-scenario-filter') || hasElement('scenario-id')) loadScenarios();
+    if (hasElement('offline-metrics')) loadOfflineMetrics();
+    if (hasElement('scenario-metrics')) loadScenarioMetrics();
+    if (hasElement('scenario-source-metrics')) loadScenarioSourceMetrics();
+    if (hasElement('threshold-p95-ms')) loadAlertThresholds();
+    if (hasElement('sli-overview')) loadSliOverview();
+    if (hasElement('alert-incidents')) loadAlertIncidents();
+    if (hasElement('cleanup-status')) loadCleanupStatus();
+    if (hasElement('engine-config-snapshot')) loadEngineConfigSnapshot();
+    if (hasElement('audit-logs-list')) loadAuditLogs();
+    if (hasElement('run-list')) loadRecommendationRuns();
+    if (hasElement('connector-list')) {
+        loadConnectors();
+        loadConnectorMetrics();
+    }
+    if (hasElement('scheduler-status')) {
+        loadSchedulerStatus();
+        setInterval(loadSchedulerStatus, 15000);
+    }
+    if (hasElement('decision-context')) loadDecisionContext();
+    if (hasElement('reporting-summary')) loadReportingWorkspace();
     setupEventListeners();
-    setInterval(loadSchedulerStatus, 15000);
 });
 
 async function loadArticles() {
@@ -811,12 +819,19 @@ function setRankingConfigStatus(message, isError = false) {
 }
 
 function applyScenarioToEditor(scenario) {
-    document.getElementById('scenario-id').value = scenario?.scenario_id || '';
-    document.getElementById('scenario-name').value = scenario?.name || '';
-    document.getElementById('scenario-description').value = scenario?.description || '';
-    document.getElementById('scenario-enabled').checked = Boolean(scenario?.enabled ?? true);
-    document.getElementById('scenario-rule-set').value = JSON.stringify(scenario?.rule_set || {}, null, 2);
-    populateRuleBuilderFromRuleSet(scenario?.rule_set || {});
+    const scenarioId = document.getElementById('scenario-id');
+    const scenarioName = document.getElementById('scenario-name');
+    const scenarioDescription = document.getElementById('scenario-description');
+    const scenarioEnabled = document.getElementById('scenario-enabled');
+    const scenarioRuleSet = document.getElementById('scenario-rule-set');
+    if (scenarioId) scenarioId.value = scenario?.scenario_id || '';
+    if (scenarioName) scenarioName.value = scenario?.name || '';
+    if (scenarioDescription) scenarioDescription.value = scenario?.description || '';
+    if (scenarioEnabled) scenarioEnabled.checked = Boolean(scenario?.enabled ?? true);
+    if (scenarioRuleSet) scenarioRuleSet.value = JSON.stringify(scenario?.rule_set || {}, null, 2);
+    if (hasElement('rule-include-sources')) {
+        populateRuleBuilderFromRuleSet(scenario?.rule_set || {});
+    }
 }
 
 async function loadScenarios() {
@@ -829,15 +844,17 @@ async function loadScenarios() {
         const data = await response.json();
         scenarios = data.scenarios || [];
         const select = document.getElementById('scenario-select');
-        const current = select.value;
-        select.innerHTML = '<option value="">No scenario</option>' + scenarios
-            .map(item => `<option value="${item.scenario_id}">${item.name} (${item.scenario_id})${item.enabled ? '' : ' [disabled]'}</option>`)
-            .join('');
-        if (current && scenarios.some(item => item.scenario_id === current)) {
-            select.value = current;
+        if (select) {
+            const current = select.value;
+            select.innerHTML = '<option value="">No scenario</option>' + scenarios
+                .map(item => `<option value="${item.scenario_id}">${item.name} (${item.scenario_id})${item.enabled ? '' : ' [disabled]'}</option>`)
+                .join('');
+            if (current && scenarios.some(item => item.scenario_id === current)) {
+                select.value = current;
+            }
+            const selected = scenarios.find(item => item.scenario_id === select.value);
+            applyScenarioToEditor(selected || null);
         }
-        const selected = scenarios.find(item => item.scenario_id === select.value);
-        applyScenarioToEditor(selected || null);
         renderReportingScenarioOptions();
         loadDecisionContext();
         loadScenarioSourceMetrics();
@@ -1010,7 +1027,10 @@ async function simulateSelectedScenario() {
 async function loadScenarioSourceMetrics() {
     const container = document.getElementById('scenario-source-metrics');
     if (!container) return;
-    const scenarioId = getSelectedScenarioId() || (document.getElementById('scenario-id').value || '').trim();
+    const reportingSelection = getSelectedReportingScenarioIds();
+    const scenarioId = getSelectedScenarioId()
+        || (document.getElementById('scenario-id')?.value || '').trim()
+        || (reportingSelection[0] || '');
     if (!scenarioId) {
         container.textContent = 'Select a scenario to view source KPI breakdown.';
         return;
@@ -1895,31 +1915,36 @@ function displayStats(stats) {
 }
 
 function setupEventListeners() {
-    document.getElementById('article-list').addEventListener('click', (e) => {
-        e.preventDefault();
-        const articleItem = e.target.closest('.list-group-item');
-        if (articleItem) {
+    const on = (id, event, handler) => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener(event, handler);
+    };
+    const articleList = document.getElementById('article-list');
+    if (articleList) {
+        articleList.addEventListener('click', (e) => {
+            e.preventDefault();
+            const articleItem = e.target.closest('.list-group-item');
+            if (!articleItem) return;
             const articleId = articleItem.dataset.id;
             const article = articles.find(a => a.article_id === articleId);
-            if (article) {
-                document.querySelectorAll('.list-group-item').forEach(item => item.classList.remove('active'));
-                articleItem.classList.add('active');
-                displayArticle(article);
-            }
-        }
-    });
+            if (!article) return;
+            document.querySelectorAll('.list-group-item').forEach(item => item.classList.remove('active'));
+            articleItem.classList.add('active');
+            displayArticle(article);
+        });
+    }
 
-    document.getElementById('show-similar').addEventListener('click', showSimilarArticles);
-    document.getElementById('refresh-decision-context').addEventListener('click', loadDecisionContext);
-    document.getElementById('refresh-engine-snapshot').addEventListener('click', loadEngineConfigSnapshot);
-    document.getElementById('refresh-reporting-workspace').addEventListener('click', loadReportingWorkspace);
-    document.getElementById('export-reporting-csv').addEventListener('click', exportReportingCsv);
-    document.getElementById('reporting-days').addEventListener('change', loadReportingWorkspace);
-    document.getElementById('reporting-scenario-filter').addEventListener('change', loadReportingWorkspace);
-    document.getElementById('reporting-source-filter').addEventListener('change', loadReportingWorkspace);
-    document.getElementById('refresh-run-explorer').addEventListener('click', loadRecommendationRuns);
-    document.getElementById('run-limit').addEventListener('change', loadRecommendationRuns);
-    document.getElementById('run-list').addEventListener('click', async (event) => {
+    on('show-similar', 'click', showSimilarArticles);
+    on('refresh-decision-context', 'click', loadDecisionContext);
+    on('refresh-engine-snapshot', 'click', loadEngineConfigSnapshot);
+    on('refresh-reporting-workspace', 'click', loadReportingWorkspace);
+    on('export-reporting-csv', 'click', exportReportingCsv);
+    on('reporting-days', 'change', loadReportingWorkspace);
+    on('reporting-scenario-filter', 'change', loadReportingWorkspace);
+    on('reporting-source-filter', 'change', loadReportingWorkspace);
+    on('refresh-run-explorer', 'click', loadRecommendationRuns);
+    on('run-limit', 'change', loadRecommendationRuns);
+    on('run-list', 'click', async (event) => {
         const button = event.target.closest('.run-item');
         if (!button) return;
         try {
@@ -1928,24 +1953,22 @@ function setupEventListeners() {
             showError(error.message || 'Failed to load run detail');
         }
     });
-    document.getElementById('ranking-config').addEventListener('change', (event) => {
+    on('ranking-config', 'change', (event) => {
         populateRankingConfigEditor(event.target.value);
         loadDecisionContext();
     });
-    document.getElementById('scenario-select').addEventListener('change', (event) => {
+    on('scenario-select', 'change', (event) => {
         const selected = scenarios.find(item => item.scenario_id === event.target.value);
         applyScenarioToEditor(selected || null);
         loadDecisionContext();
         loadScenarioSourceMetrics();
     });
-    document.getElementById('external-user-id').addEventListener('change', loadDecisionContext);
-    document.getElementById('source-filters').addEventListener('change', (event) => {
-        if (event.target.classList.contains('source-filter')) {
-            loadDecisionContext();
-        }
+    on('external-user-id', 'change', loadDecisionContext);
+    on('source-filters', 'change', (event) => {
+        if (event.target.classList.contains('source-filter')) loadDecisionContext();
     });
-    document.getElementById('save-source-settings').addEventListener('click', saveSourceSettings);
-    document.getElementById('save-ranking-config').addEventListener('click', async () => {
+    on('save-source-settings', 'click', saveSourceSettings);
+    on('save-ranking-config', 'click', async () => {
         try {
             await saveRankingConfig();
         } catch (error) {
@@ -1953,7 +1976,7 @@ function setupEventListeners() {
             showError(error.message || 'Failed to save ranking config');
         }
     });
-    document.getElementById('delete-ranking-config').addEventListener('click', async () => {
+    on('delete-ranking-config', 'click', async () => {
         try {
             await deleteRankingConfig();
         } catch (error) {
@@ -1961,25 +1984,25 @@ function setupEventListeners() {
             showError(error.message || 'Failed to delete ranking config');
         }
     });
-    document.getElementById('create-connector').addEventListener('click', async () => {
+    on('create-connector', 'click', async () => {
         try {
             await createConnector();
         } catch (error) {
             showError(error.message || 'Failed to create connector');
         }
     });
-    document.getElementById('connector-search').addEventListener('input', (event) => {
+    on('connector-search', 'input', (event) => {
         connectorSearchTerm = (event.target.value || '').trim().toLowerCase();
         renderConnectors();
     });
-    document.getElementById('connector-status-filter').addEventListener('change', (event) => {
+    on('connector-status-filter', 'change', (event) => {
         connectorStatusFilter = event.target.value || 'all';
         renderConnectors();
     });
-    document.getElementById('sync-due-connectors').addEventListener('click', syncDueConnectors);
-    document.getElementById('run-scheduler-now').addEventListener('click', runSchedulerNow);
-    document.getElementById('connector-list').addEventListener('click', handleConnectorAction);
-    document.getElementById('save-scenario').addEventListener('click', async () => {
+    on('sync-due-connectors', 'click', syncDueConnectors);
+    on('run-scheduler-now', 'click', runSchedulerNow);
+    on('connector-list', 'click', handleConnectorAction);
+    on('save-scenario', 'click', async () => {
         try {
             applyRuleBuilderToJson();
             await saveScenario();
@@ -1989,7 +2012,7 @@ function setupEventListeners() {
             showError(error.message || 'Failed to save scenario');
         }
     });
-    document.getElementById('delete-scenario').addEventListener('click', async () => {
+    on('delete-scenario', 'click', async () => {
         try {
             await deleteScenario();
             await loadScenarioMetrics();
@@ -1998,10 +2021,10 @@ function setupEventListeners() {
             showError(error.message || 'Failed to delete scenario');
         }
     });
-    document.getElementById('refresh-scenarios').addEventListener('click', loadScenarios);
-    document.getElementById('refresh-scenario-metrics').addEventListener('click', loadScenarioMetrics);
-    document.getElementById('refresh-scenario-source-metrics').addEventListener('click', loadScenarioSourceMetrics);
-    document.getElementById('apply-rule-builder').addEventListener('click', () => {
+    on('refresh-scenarios', 'click', loadScenarios);
+    on('refresh-scenario-metrics', 'click', loadScenarioMetrics);
+    on('refresh-scenario-source-metrics', 'click', loadScenarioSourceMetrics);
+    on('apply-rule-builder', 'click', () => {
         try {
             applyRuleBuilderToJson();
         } catch (error) {
@@ -2009,7 +2032,7 @@ function setupEventListeners() {
             showError(error.message || 'Failed to apply rule builder');
         }
     });
-    document.getElementById('load-rule-builder').addEventListener('click', () => {
+    on('load-rule-builder', 'click', () => {
         try {
             loadRuleBuilderFromJson();
         } catch (error) {
@@ -2017,17 +2040,18 @@ function setupEventListeners() {
             showError(error.message || 'Failed to load rule builder');
         }
     });
-    document.getElementById('simulate-scenario').addEventListener('click', async () => {
+    on('simulate-scenario', 'click', async () => {
         try {
             await simulateSelectedScenario();
         } catch (error) {
             showError(error.message || 'Failed to simulate scenario');
-            document.getElementById('scenario-simulation').textContent = error.message || 'Failed to simulate scenario';
+            const simulation = document.getElementById('scenario-simulation');
+            if (simulation) simulation.textContent = error.message || 'Failed to simulate scenario';
         }
     });
-    document.getElementById('refresh-sli').addEventListener('click', loadSliOverview);
-    document.getElementById('persist-incidents-on-sli').addEventListener('change', loadSliOverview);
-    document.getElementById('save-alert-thresholds').addEventListener('click', async () => {
+    on('refresh-sli', 'click', loadSliOverview);
+    on('persist-incidents-on-sli', 'change', loadSliOverview);
+    on('save-alert-thresholds', 'click', async () => {
         try {
             await saveAlertThresholds();
             await loadSliOverview();
@@ -2035,17 +2059,17 @@ function setupEventListeners() {
             showError(error.message || 'Failed to save alert thresholds');
         }
     });
-    document.getElementById('evaluate-alert-incidents').addEventListener('click', async () => {
+    on('evaluate-alert-incidents', 'click', async () => {
         try {
             await evaluateAlertIncidents();
         } catch (error) {
             showError(error.message || 'Failed to evaluate alert incidents');
         }
     });
-    document.getElementById('refresh-alert-incidents').addEventListener('click', loadAlertIncidents);
-    document.getElementById('incident-status-filter').addEventListener('change', loadAlertIncidents);
-    document.getElementById('incident-metric-filter').addEventListener('change', loadAlertIncidents);
-    document.getElementById('alert-incidents').addEventListener('click', async (event) => {
+    on('refresh-alert-incidents', 'click', loadAlertIncidents);
+    on('incident-status-filter', 'change', loadAlertIncidents);
+    on('incident-metric-filter', 'change', loadAlertIncidents);
+    on('alert-incidents', 'click', async (event) => {
         const button = event.target.closest('.resolve-incident');
         if (!button) return;
         try {
@@ -2054,17 +2078,17 @@ function setupEventListeners() {
             showError(error.message || 'Failed to resolve incident');
         }
     });
-    document.getElementById('refresh-cleanup-status').addEventListener('click', loadCleanupStatus);
-    document.getElementById('run-cleanup-now').addEventListener('click', async () => {
+    on('refresh-cleanup-status', 'click', loadCleanupStatus);
+    on('run-cleanup-now', 'click', async () => {
         try {
             await runCleanupNow();
         } catch (error) {
             showError(error.message || 'Failed to run cleanup');
         }
     });
-    document.getElementById('refresh-audit-logs').addEventListener('click', loadAuditLogs);
-    document.getElementById('audit-actor-filter').addEventListener('change', loadAuditLogs);
-    document.getElementById('audit-resource-filter').addEventListener('change', loadAuditLogs);
+    on('refresh-audit-logs', 'click', loadAuditLogs);
+    on('audit-actor-filter', 'change', loadAuditLogs);
+    on('audit-resource-filter', 'change', loadAuditLogs);
 }
 
 function formatDate(dateString) {

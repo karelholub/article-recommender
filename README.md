@@ -149,6 +149,10 @@ python embed.py
 ## API Endpoints
 
 - `GET /`: Main page
+- `GET /recommendations`: Recommendation workspace UI
+- `GET /reporting`: Reporting workspace UI
+- `GET /operations`: Operations/observability UI
+- `GET /runs`: Recommendation run explorer UI
 - `GET /api/articles`: All available articles
 - `GET /api/sources`: Available source domains and article counts
 - `GET /api/source-settings`: Source defaults (`enabled`, `default_weight`)
