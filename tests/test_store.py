@@ -275,3 +275,19 @@ def test_cdp_integration_and_profiles_sqlite(tmp_path):
     assert profile['segments'] == ['vip']
     listed = store.list_cdp_profiles(provider='meiro', limit=10, offset=0)
     assert listed
+
+
+def test_cdp_sync_run_lifecycle_sqlite(tmp_path):
+    store = SQLiteRecommenderStore(db_path=str(tmp_path / 'recommender.db'))
+    run_id = store.start_cdp_sync_run(provider='meiro', trigger='manual', requested_ids=['ext-1'])
+    finished = store.finish_cdp_sync_run(
+        run_id=run_id,
+        status='completed_with_errors',
+        attempted=1,
+        synced=0,
+        errors=[{'external_user_id': 'ext-1', 'error': 'boom'}],
+    )
+    assert finished is not None
+    assert finished['status'] == 'completed_with_errors'
+    rows = store.list_cdp_sync_runs(provider='meiro', limit=10)
+    assert rows

@@ -40,6 +40,9 @@ _rate_limit_counters: Dict[str, Dict] = {}
 _cleanup_state_lock = threading.Lock()
 _cleanup_thread: Optional[threading.Thread] = None
 _cleanup_stop_event = threading.Event()
+_cdp_state_lock = threading.Lock()
+_cdp_thread: Optional[threading.Thread] = None
+_cdp_stop_event = threading.Event()
 _scheduler_state = {
     "enabled": False,
     "running": False,
@@ -59,6 +62,18 @@ _cleanup_state = {
     "runs_total": 0,
     "errors_total": 0,
     "last_run_at": None,
+    "last_result": None,
+    "last_error": None,
+}
+
+_cdp_state = {
+    "enabled": False,
+    "running": False,
+    "interval_seconds": int(os.getenv("CDP_SYNC_INTERVAL_SECONDS", "900")),
+    "runs_total": 0,
+    "errors_total": 0,
+    "last_run_at": None,
+    "last_duration_ms": None,
     "last_result": None,
     "last_error": None,
 }
@@ -635,6 +650,137 @@ def _start_cleanup_scheduler_if_enabled() -> None:
     _cleanup_thread.start()
     with _cleanup_state_lock:
         _cleanup_state["running"] = True
+
+
+def _collect_recent_external_user_ids(days: int = 30, limit_events: int = 20000, limit_runs: int = 5000) -> List[str]:
+    if not store:
+        return []
+    external_ids = set()
+    for event in store.list_events(limit=limit_events, days=max(1, days)):
+        external = str(event.get("external_user_id") or "").strip()
+        if external:
+            external_ids.add(external)
+    for run in store.list_runs_with_request(limit=limit_runs, offset=0, days=max(1, days)):
+        external = str((run.get("request") or {}).get("external_user_id") or "").strip()
+        if external:
+            external_ids.add(external)
+    return sorted(external_ids)
+
+
+def _execute_cdp_sync_run(trigger: str = "manual", external_user_ids: Optional[List[str]] = None) -> Dict:
+    if not store:
+        raise ValueError("Store unavailable")
+    integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+    if not integration.get("enabled"):
+        return {
+            "provider": _MEIRO_PROVIDER,
+            "trigger": trigger,
+            "status": "skipped_disabled",
+            "attempted": 0,
+            "synced": 0,
+            "errors": [{"error": "Meiro integration is disabled"}],
+        }
+
+    requested_ids = [str(item).strip() for item in (external_user_ids or []) if str(item).strip()]
+    if not requested_ids:
+        requested_ids = _collect_recent_external_user_ids(
+            days=max(1, int(os.getenv("CDP_SYNC_LOOKBACK_DAYS", "30"))),
+            limit_events=max(100, int(os.getenv("CDP_SYNC_LOOKBACK_EVENTS_LIMIT", "20000"))),
+            limit_runs=max(100, int(os.getenv("CDP_SYNC_LOOKBACK_RUNS_LIMIT", "5000"))),
+        )
+    max_ids = max(1, int(os.getenv("CDP_SYNC_MAX_IDS_PER_RUN", "200")))
+    requested_ids = requested_ids[:max_ids]
+    run_id = store.start_cdp_sync_run(_MEIRO_PROVIDER, trigger=trigger, requested_ids=requested_ids)
+    if not requested_ids:
+        finished = store.finish_cdp_sync_run(run_id, status="completed", attempted=0, synced=0, errors=[])
+        return {"provider": _MEIRO_PROVIDER, "run_id": run_id, "run": finished, "synced": [], "errors": []}
+
+    adapter = MeiroAdapter(integration.get("config") or {})
+    mapping = _normalize_meiro_mapping(integration.get("mapping"))
+    synced = []
+    errors = []
+    for external_user_id in requested_ids:
+        try:
+            raw_payload = adapter.fetch_profile_payload(external_user_id)
+            profile = adapter.normalize_profile(
+                raw_payload,
+                mapping=mapping,
+                fallback_external_user_id=external_user_id,
+            )
+            stored_profile = store.upsert_cdp_profile(
+                provider=_MEIRO_PROVIDER,
+                external_user_id=profile.external_user_id,
+                traits=profile.traits,
+                segments=profile.segments,
+                raw_payload=profile.raw,
+            )
+            synced.append(stored_profile)
+        except Exception as exc:
+            errors.append({"external_user_id": external_user_id, "error": str(exc)})
+    status = "completed" if not errors else "completed_with_errors"
+    finished = store.finish_cdp_sync_run(
+        run_id,
+        status=status,
+        attempted=len(requested_ids),
+        synced=len(synced),
+        errors=errors,
+    )
+    return {
+        "provider": _MEIRO_PROVIDER,
+        "run_id": run_id,
+        "run": finished,
+        "requested_ids": requested_ids,
+        "synced": synced,
+        "errors": errors,
+        "attempted": len(requested_ids),
+        "synced_count": len(synced),
+        "error_count": len(errors),
+    }
+
+
+def _cdp_sync_loop() -> None:
+    while not _cdp_stop_event.is_set():
+        started_at = datetime.now()
+        try:
+            result = _execute_cdp_sync_run(trigger="scheduled", external_user_ids=None)
+            duration_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+            with _cdp_state_lock:
+                _cdp_state["runs_total"] += 1
+                _cdp_state["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _cdp_state["last_duration_ms"] = duration_ms
+                _cdp_state["last_result"] = {
+                    "status": result.get("run", {}).get("status", result.get("status")),
+                    "attempted": result.get("attempted", 0),
+                    "synced_count": result.get("synced_count", 0),
+                    "error_count": result.get("error_count", 0),
+                }
+                _cdp_state["last_error"] = None
+        except Exception as exc:
+            with _cdp_state_lock:
+                _cdp_state["runs_total"] += 1
+                _cdp_state["errors_total"] += 1
+                _cdp_state["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _cdp_state["last_error"] = str(exc)
+            logger.error(f"CDP sync cycle failed: {str(exc)}")
+            logger.error(traceback.format_exc())
+        _cdp_stop_event.wait(_cdp_state["interval_seconds"])
+
+
+def _start_cdp_scheduler_if_enabled() -> None:
+    global _cdp_thread
+    enabled = os.getenv("CDP_SYNC_SCHEDULER_ENABLED", "false").strip().lower() == "true"
+    with _cdp_state_lock:
+        _cdp_state["enabled"] = enabled
+    if not enabled:
+        return
+    if not store:
+        return
+    if _cdp_thread and _cdp_thread.is_alive():
+        return
+    _cdp_thread = threading.Thread(target=_cdp_sync_loop, name="cdp-sync-scheduler", daemon=True)
+    _cdp_thread.start()
+    with _cdp_state_lock:
+        _cdp_state["running"] = True
 
 
 def _record_audit(
@@ -1546,52 +1692,171 @@ def cdp_meiro_sync_profiles():
     try:
         payload = request.get_json() or {}
         external_user_ids = [str(item).strip() for item in (payload.get("external_user_ids") or []) if str(item).strip()]
-        if not external_user_ids:
-            return jsonify({"error": "external_user_ids is required"}), 400
-
-        integration = store.get_cdp_integration(_MEIRO_PROVIDER)
-        if not integration.get("enabled"):
-            return jsonify({"error": "Meiro integration is disabled"}), 400
-        adapter = MeiroAdapter(integration.get("config") or {})
-        mapping = _normalize_meiro_mapping(integration.get("mapping"))
-        synced = []
-        errors = []
-        for external_user_id in external_user_ids:
-            try:
-                raw_payload = adapter.fetch_profile_payload(external_user_id)
-                profile = adapter.normalize_profile(
-                    raw_payload,
-                    mapping=mapping,
-                    fallback_external_user_id=external_user_id,
-                )
-                stored = store.upsert_cdp_profile(
-                    provider=_MEIRO_PROVIDER,
-                    external_user_id=profile.external_user_id,
-                    traits=profile.traits,
-                    segments=profile.segments,
-                    raw_payload=profile.raw,
-                )
-                synced.append(stored)
-            except Exception as exc:
-                errors.append({"external_user_id": external_user_id, "error": str(exc)})
+        if not external_user_ids and payload.get("use_recent_external_ids") is not True:
+            return jsonify({"error": "external_user_ids is required (or set use_recent_external_ids=true)"}), 400
+        result = _execute_cdp_sync_run(
+            trigger="manual",
+            external_user_ids=(external_user_ids if external_user_ids else None),
+        )
         _record_audit(
             action="sync",
             resource_type="cdp_profile",
             resource_id=_MEIRO_PROVIDER,
             payload=payload,
-            extra={"synced": len(synced), "errors": len(errors)},
+            extra={
+                "run_id": result.get("run_id"),
+                "attempted": result.get("attempted", 0),
+                "synced": result.get("synced_count", 0),
+                "errors": result.get("error_count", 0),
+            },
         )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error syncing CDP profiles: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro/sync-runs", methods=["GET"])
+def cdp_meiro_sync_runs():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        limit = max(1, min(100, int(request.args.get("limit", 20))))
+        rows = store.list_cdp_sync_runs(_MEIRO_PROVIDER, limit=limit)
+        return jsonify({"provider": _MEIRO_PROVIDER, "runs": rows, "count": len(rows)})
+    except Exception as e:
+        logger.error(f"Error listing CDP sync runs: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro/sync-runs/<run_id>", methods=["GET"])
+def cdp_meiro_sync_run_detail(run_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    run = store.get_cdp_sync_run(run_id)
+    if not run:
+        return jsonify({"error": "Sync run not found"}), 404
+    return jsonify(run)
+
+
+@app.route("/api/cdp/meiro/scheduler/status", methods=["GET"])
+def cdp_meiro_scheduler_status():
+    with _cdp_state_lock:
+        snapshot = dict(_cdp_state)
+    snapshot["provider"] = _MEIRO_PROVIDER
+    return jsonify(snapshot)
+
+
+@app.route("/api/cdp/meiro/scheduler/run-now", methods=["POST"])
+def cdp_meiro_scheduler_run_now():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json(silent=True) or {}
+        requested_ids = [str(item).strip() for item in (payload.get("external_user_ids") or []) if str(item).strip()]
+        result = _execute_cdp_sync_run(
+            trigger="run_now",
+            external_user_ids=(requested_ids if requested_ids else None),
+        )
+        with _cdp_state_lock:
+            _cdp_state["runs_total"] += 1
+            _cdp_state["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _cdp_state["last_result"] = {
+                "status": result.get("run", {}).get("status", result.get("status")),
+                "attempted": result.get("attempted", 0),
+                "synced_count": result.get("synced_count", 0),
+                "error_count": result.get("error_count", 0),
+            }
+            if result.get("error_count", 0) > 0:
+                _cdp_state["errors_total"] += 1
+                _cdp_state["last_error"] = f"{result.get('error_count')} errors"
+            else:
+                _cdp_state["last_error"] = None
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error executing CDP run-now: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/cdp/meiro/diagnostics", methods=["GET"])
+def cdp_meiro_diagnostics():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        freshness_hours = max(1, min(24 * 30, int(request.args.get("freshness_hours", 24))))
+        profile_limit = max(1, min(10000, int(request.args.get("profile_limit", 2000))))
+        run_limit = max(1, min(10000, int(request.args.get("run_limit", 2000))))
+        sync_run_limit = max(1, min(200, int(request.args.get("sync_run_limit", 50))))
+
+        integration = store.get_cdp_integration(_MEIRO_PROVIDER)
+        profiles = store.list_cdp_profiles(_MEIRO_PROVIDER, limit=profile_limit, offset=0)
+        now = datetime.now()
+        stale_cutoff = now - timedelta(hours=freshness_hours)
+        freshness = {"fresh": 0, "stale": 0, "unknown": 0}
+        for item in profiles:
+            synced_at = _safe_parse_timestamp(str(item.get("synced_at", "")))
+            if synced_at is None:
+                freshness["unknown"] += 1
+            elif synced_at >= stale_cutoff:
+                freshness["fresh"] += 1
+            else:
+                freshness["stale"] += 1
+
+        recent_runs = store.list_runs_with_request(limit=run_limit, offset=0, days=30)
+        runs_with_external = 0
+        cdp_profile_found = 0
+        cdp_applied = 0
+        for run in recent_runs:
+            req = run.get("request") or {}
+            external = str(req.get("external_user_id") or "").strip()
+            if not external:
+                continue
+            runs_with_external += 1
+            cdp_ctx = req.get("cdp_context") or {}
+            if cdp_ctx.get("profile_found"):
+                cdp_profile_found += 1
+            if cdp_ctx.get("applied"):
+                cdp_applied += 1
+
+        sync_runs = store.list_cdp_sync_runs(_MEIRO_PROVIDER, limit=sync_run_limit)
+        sync_attempted = sum(int(item.get("attempted") or 0) for item in sync_runs)
+        sync_synced = sum(int(item.get("synced") or 0) for item in sync_runs)
+        sync_errors = sum(int(item.get("error_count") or 0) for item in sync_runs)
+
         return jsonify(
             {
                 "provider": _MEIRO_PROVIDER,
-                "synced": synced,
-                "errors": errors,
-                "synced_count": len(synced),
-                "error_count": len(errors),
+                "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "integration_enabled": bool(integration.get("enabled")),
+                "profiles": {
+                    "count": len(profiles),
+                    "freshness_hours": freshness_hours,
+                    "freshness": freshness,
+                    "fresh_ratio": round((freshness["fresh"] / len(profiles)), 4) if profiles else 0.0,
+                    "stale_ratio": round((freshness["stale"] / len(profiles)), 4) if profiles else 0.0,
+                },
+                "mapping_coverage": {
+                    "runs_with_external_id": runs_with_external,
+                    "runs_with_cdp_profile_found": cdp_profile_found,
+                    "runs_with_cdp_applied": cdp_applied,
+                    "profile_found_ratio": round((cdp_profile_found / runs_with_external), 4) if runs_with_external else 0.0,
+                    "applied_ratio": round((cdp_applied / runs_with_external), 4) if runs_with_external else 0.0,
+                },
+                "sync_runs": {
+                    "count": len(sync_runs),
+                    "attempted_total": sync_attempted,
+                    "synced_total": sync_synced,
+                    "errors_total": sync_errors,
+                    "success_ratio": round((sync_synced / sync_attempted), 4) if sync_attempted else 0.0,
+                    "recent": sync_runs[:10],
+                },
             }
         )
     except Exception as e:
-        logger.error(f"Error syncing CDP profiles: {str(e)}")
+        logger.error(f"Error building CDP diagnostics: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
 
@@ -1961,6 +2226,7 @@ def _enqueue_due_connector_syncs(trigger_label: str = "scheduled") -> Dict:
 
 _start_connector_scheduler_if_enabled()
 _start_cleanup_scheduler_if_enabled()
+_start_cdp_scheduler_if_enabled()
 
 
 @app.route("/api/ranking-configs", methods=["GET", "POST"])
@@ -4008,6 +4274,7 @@ def engine_config():
                     "config": cdp_safe_config,
                     "mapping": _normalize_meiro_mapping(cdp.get("mapping")),
                 },
+                "cdp_scheduler": dict(_cdp_state),
                 "scheduler": dict(_scheduler_state),
                 "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }

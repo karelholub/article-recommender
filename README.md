@@ -166,6 +166,11 @@ python embed.py
 - `POST /api/cdp/meiro/profiles/upsert`: Upsert CDP profile payload (webhook/manual ingest)
 - `POST /api/cdp/meiro/sync`: Pull profile(s) from Meiro API by external IDs
   - supports either `request_url_template` (e.g. `.../wbs?segment=107&attribute=stitching_meiro_id&value={external_user_id}`) or `base_url + profile_endpoint_template`
+- `GET /api/cdp/meiro/sync-runs?limit=20`: CDP sync run history
+- `GET /api/cdp/meiro/sync-runs/<run_id>`: CDP sync run detail
+- `GET /api/cdp/meiro/scheduler/status`: CDP scheduler runtime state
+- `POST /api/cdp/meiro/scheduler/run-now`: Trigger one CDP sync cycle immediately
+- `GET /api/cdp/meiro/diagnostics`: CDP profile freshness, mapping hit-rate, sync reliability diagnostics
 - `GET /api/connectors`: List connector definitions
 - `POST /api/connectors`: Create connector (`section_scraper` or `rss`)
 - `PUT /api/connectors/<connector_id>`: Update connector
@@ -248,6 +253,12 @@ Retention cleanup job:
 - `CLEANUP_SCHEDULER_INTERVAL_SECONDS=3600`
 - `IDEMPOTENCY_RETENTION_HOURS=72`
 - `AUDIT_RETENTION_DAYS=90`
+
+CDP sync scheduler:
+- `CDP_SYNC_SCHEDULER_ENABLED=false`
+- `CDP_SYNC_INTERVAL_SECONDS=900`
+- `CDP_SYNC_LOOKBACK_DAYS=30`
+- `CDP_SYNC_MAX_IDS_PER_RUN=200`
 
 Alert/SLO thresholds are persisted and currently support:
 - `recommendation_p95_ms`

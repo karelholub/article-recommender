@@ -326,6 +326,27 @@ def test_cdp_meiro_endpoints_and_context():
     assert scenario_id == context['scenario_id']
     assert source in context['selected_sources']
 
+    diagnostics = client.get('/api/cdp/meiro/diagnostics?freshness_hours=24')
+    assert diagnostics.status_code == 200
+    diagnostics_payload = diagnostics.get_json()
+    assert diagnostics_payload['provider'] == 'meiro'
+    assert 'mapping_coverage' in diagnostics_payload
+
+    status = client.get('/api/cdp/meiro/scheduler/status')
+    assert status.status_code == 200
+    status_payload = status.get_json()
+    assert status_payload['provider'] == 'meiro'
+
+    run_now = client.post('/api/cdp/meiro/scheduler/run-now', json={})
+    assert run_now.status_code == 200
+    run_payload = run_now.get_json()
+    assert run_payload['provider'] == 'meiro'
+
+    runs = client.get('/api/cdp/meiro/sync-runs?limit=20')
+    assert runs.status_code == 200
+    runs_payload = runs.get_json()
+    assert 'runs' in runs_payload
+
 
 def test_disabled_source_not_used_by_default_query():
     client = app.test_client()

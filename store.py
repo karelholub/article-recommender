@@ -96,6 +96,25 @@ class BaseRecommenderStore:
     def list_cdp_profiles(self, provider: str, limit: int = 50, offset: int = 0) -> List[Dict]:
         raise NotImplementedError
 
+    def start_cdp_sync_run(self, provider: str, trigger: str = "manual", requested_ids: Optional[List[str]] = None) -> str:
+        raise NotImplementedError
+
+    def finish_cdp_sync_run(
+        self,
+        run_id: str,
+        status: str,
+        attempted: int = 0,
+        synced: int = 0,
+        errors: Optional[List[Dict]] = None,
+    ) -> Optional[Dict]:
+        raise NotImplementedError
+
+    def get_cdp_sync_run(self, run_id: str) -> Optional[Dict]:
+        raise NotImplementedError
+
+    def list_cdp_sync_runs(self, provider: str, limit: int = 20) -> List[Dict]:
+        raise NotImplementedError
+
     def list_connectors(self) -> List[Dict]:
         raise NotImplementedError
 
@@ -412,6 +431,21 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                     PRIMARY KEY (provider, external_user_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS cdp_sync_runs (
+                    run_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    requested_ids_json TEXT NOT NULL DEFAULT '[]',
+                    attempted INTEGER NOT NULL DEFAULT 0,
+                    synced INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    errors_json TEXT NOT NULL DEFAULT '[]',
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS source_connectors (
                     connector_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -545,6 +579,9 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
 
                 CREATE INDEX IF NOT EXISTS idx_cdp_profiles_synced_at
                     ON cdp_profiles(provider, synced_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_cdp_sync_runs_provider_started
+                    ON cdp_sync_runs(provider, started_at DESC);
 
                 CREATE INDEX IF NOT EXISTS idx_event_rollups_day
                     ON event_rollups_daily(day);
@@ -1404,6 +1441,116 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
                 "synced_at": row["synced_at"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def start_cdp_sync_run(self, provider: str, trigger: str = "manual", requested_ids: Optional[List[str]] = None) -> str:
+        run_id = str(uuid.uuid4())
+        now = self._now()
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO cdp_sync_runs
+                (run_id, provider, trigger, status, requested_ids_json, attempted, synced, error_count, errors_json, started_at, finished_at, created_at)
+                VALUES (?, ?, ?, 'running', ?, 0, 0, 0, '[]', ?, NULL, ?)
+                """,
+                (
+                    run_id,
+                    str(provider or "meiro").strip() or "meiro",
+                    str(trigger or "manual"),
+                    json.dumps(requested_ids or [], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return run_id
+
+    def finish_cdp_sync_run(
+        self,
+        run_id: str,
+        status: str,
+        attempted: int = 0,
+        synced: int = 0,
+        errors: Optional[List[Dict]] = None,
+    ) -> Optional[Dict]:
+        now = self._now()
+        errors_payload = errors or []
+        with self._managed_connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE cdp_sync_runs
+                SET status = ?, attempted = ?, synced = ?, error_count = ?, errors_json = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    str(status or "completed"),
+                    int(attempted),
+                    int(synced),
+                    len(errors_payload),
+                    json.dumps(errors_payload, ensure_ascii=False),
+                    now,
+                    run_id,
+                ),
+            )
+            if (cur.rowcount or 0) == 0:
+                return None
+        return self.get_cdp_sync_run(run_id)
+
+    def get_cdp_sync_run(self, run_id: str) -> Optional[Dict]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT run_id, provider, trigger, status, requested_ids_json, attempted, synced, error_count, errors_json, started_at, finished_at, created_at
+                FROM cdp_sync_runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "provider": row["provider"],
+            "trigger": row["trigger"],
+            "status": row["status"],
+            "requested_ids": json.loads(row["requested_ids_json"] or "[]"),
+            "attempted": int(row["attempted"] or 0),
+            "synced": int(row["synced"] or 0),
+            "error_count": int(row["error_count"] or 0),
+            "errors": json.loads(row["errors_json"] or "[]"),
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "created_at": row["created_at"],
+        }
+
+    def list_cdp_sync_runs(self, provider: str, limit: int = 20) -> List[Dict]:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_id, provider, trigger, status, requested_ids_json, attempted, synced, error_count, errors_json, started_at, finished_at, created_at
+                FROM cdp_sync_runs
+                WHERE provider = ?
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (provider_value, int(limit)),
+            ).fetchall()
+        return [
+            {
+                "run_id": row["run_id"],
+                "provider": row["provider"],
+                "trigger": row["trigger"],
+                "status": row["status"],
+                "requested_ids": json.loads(row["requested_ids_json"] or "[]"),
+                "attempted": int(row["attempted"] or 0),
+                "synced": int(row["synced"] or 0),
+                "error_count": int(row["error_count"] or 0),
+                "errors": json.loads(row["errors_json"] or "[]"),
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "created_at": row["created_at"],
             }
             for row in rows
         ]
@@ -2303,6 +2450,24 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 )
                 cur.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS cdp_sync_runs (
+                        run_id UUID PRIMARY KEY,
+                        provider TEXT NOT NULL,
+                        trigger TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        requested_ids_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        attempted INTEGER NOT NULL DEFAULT 0,
+                        synced INTEGER NOT NULL DEFAULT 0,
+                        error_count INTEGER NOT NULL DEFAULT 0,
+                        errors_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        started_at TIMESTAMPTZ NOT NULL,
+                        finished_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL
+                    );
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS source_connectors (
                         connector_id TEXT PRIMARY KEY,
                         name TEXT NOT NULL,
@@ -2484,6 +2649,12 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                     """
                     CREATE INDEX IF NOT EXISTS idx_cdp_profiles_synced_at
                     ON cdp_profiles(provider, synced_at DESC);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_cdp_sync_runs_provider_started
+                    ON cdp_sync_runs(provider, started_at DESC);
                     """
                 )
                 cur.execute(
@@ -3032,6 +3203,122 @@ class PostgresRecommenderStore(BaseRecommenderStore):
                 "synced_at": row[5].strftime("%Y-%m-%d %H:%M:%S"),
                 "created_at": row[6].strftime("%Y-%m-%d %H:%M:%S"),
                 "updated_at": row[7].strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            for row in rows
+        ]
+
+    def start_cdp_sync_run(self, provider: str, trigger: str = "manual", requested_ids: Optional[List[str]] = None) -> str:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO cdp_sync_runs
+                    (run_id, provider, trigger, status, requested_ids_json, attempted, synced, error_count, errors_json, started_at, finished_at, created_at)
+                    VALUES (%s::uuid, %s, %s, 'running', %s::jsonb, 0, 0, 0, '[]'::jsonb, %s, NULL, %s)
+                    """,
+                    (
+                        run_id,
+                        str(provider or "meiro").strip() or "meiro",
+                        str(trigger or "manual"),
+                        json.dumps(requested_ids or [], ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+        return run_id
+
+    def finish_cdp_sync_run(
+        self,
+        run_id: str,
+        status: str,
+        attempted: int = 0,
+        synced: int = 0,
+        errors: Optional[List[Dict]] = None,
+    ) -> Optional[Dict]:
+        now = datetime.now(UTC)
+        errors_payload = errors or []
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE cdp_sync_runs
+                    SET status = %s, attempted = %s, synced = %s, error_count = %s, errors_json = %s::jsonb, finished_at = %s
+                    WHERE run_id = %s::uuid
+                    """,
+                    (
+                        str(status or "completed"),
+                        int(attempted),
+                        int(synced),
+                        len(errors_payload),
+                        json.dumps(errors_payload, ensure_ascii=False),
+                        now,
+                        run_id,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    return None
+        return self.get_cdp_sync_run(run_id)
+
+    def get_cdp_sync_run(self, run_id: str) -> Optional[Dict]:
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT run_id::text, provider, trigger, status, requested_ids_json::text, attempted, synced, error_count, errors_json::text, started_at, finished_at, created_at
+                    FROM cdp_sync_runs
+                    WHERE run_id = %s::uuid
+                    """,
+                    (run_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": row[0],
+            "provider": row[1],
+            "trigger": row[2],
+            "status": row[3],
+            "requested_ids": json.loads(row[4] or "[]"),
+            "attempted": int(row[5] or 0),
+            "synced": int(row[6] or 0),
+            "error_count": int(row[7] or 0),
+            "errors": json.loads(row[8] or "[]"),
+            "started_at": row[9].strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": row[10].strftime("%Y-%m-%d %H:%M:%S") if row[10] else None,
+            "created_at": row[11].strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def list_cdp_sync_runs(self, provider: str, limit: int = 20) -> List[Dict]:
+        provider_value = str(provider or "meiro").strip() or "meiro"
+        with self._managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT run_id::text, provider, trigger, status, requested_ids_json::text, attempted, synced, error_count, errors_json::text, started_at, finished_at, created_at
+                    FROM cdp_sync_runs
+                    WHERE provider = %s
+                    ORDER BY started_at DESC
+                    LIMIT %s
+                    """,
+                    (provider_value, int(limit)),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "run_id": row[0],
+                "provider": row[1],
+                "trigger": row[2],
+                "status": row[3],
+                "requested_ids": json.loads(row[4] or "[]"),
+                "attempted": int(row[5] or 0),
+                "synced": int(row[6] or 0),
+                "error_count": int(row[7] or 0),
+                "errors": json.loads(row[8] or "[]"),
+                "started_at": row[9].strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": row[10].strftime("%Y-%m-%d %H:%M:%S") if row[10] else None,
+                "created_at": row[11].strftime("%Y-%m-%d %H:%M:%S"),
             }
             for row in rows
         ]

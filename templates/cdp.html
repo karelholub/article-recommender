@@ -69,5 +69,34 @@
             </div>
         </div>
     </div>
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>CDP Scheduler</strong>
+                <button id="refresh-cdp-scheduler" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div id="cdp-scheduler-status" class="small text-muted mb-2">Loading...</div>
+                <button id="run-cdp-scheduler-now" class="btn btn-sm btn-outline-dark">Run Now</button>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>CDP Diagnostics</strong>
+                <button id="refresh-cdp-diagnostics" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div id="cdp-diagnostics-summary" class="small text-muted mb-2">Loading...</div>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>Run</th><th>Status</th><th>Attempted</th><th>Synced</th><th>Errors</th></tr></thead>
+                        <tbody id="cdp-sync-runs-table"><tr><td colspan="5" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}

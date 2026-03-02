@@ -59,6 +59,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('cdp-base-url')) {
         loadCdpConfig();
         loadCdpProfiles();
+        loadCdpSchedulerStatus();
+        loadCdpDiagnostics();
     }
     if (hasElement('decision-context')) loadDecisionContext();
     if (hasElement('reporting-summary')) {
@@ -1460,6 +1462,83 @@ async function syncCdpProfiles() {
     const payload = await response.json();
     if (statusEl) statusEl.textContent = `Sync finished. Synced: ${payload.synced_count || 0}, errors: ${payload.error_count || 0}.`;
     await loadCdpProfiles();
+    await loadCdpDiagnostics();
+}
+
+async function loadCdpSchedulerStatus() {
+    const container = document.getElementById('cdp-scheduler-status');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/cdp/meiro/scheduler/status');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load scheduler status');
+        }
+        const payload = await response.json();
+        container.innerHTML = `
+            <div><strong>Enabled:</strong> ${payload.enabled ? 'yes' : 'no'}</div>
+            <div><strong>Running:</strong> ${payload.running ? 'yes' : 'no'}</div>
+            <div><strong>Runs total:</strong> ${payload.runs_total || 0}</div>
+            <div><strong>Errors total:</strong> ${payload.errors_total || 0}</div>
+            <div><strong>Last run:</strong> ${payload.last_run_at || 'n/a'}</div>
+            <div><strong>Last result:</strong> ${payload.last_result ? JSON.stringify(payload.last_result) : 'n/a'}</div>
+        `;
+    } catch (error) {
+        container.textContent = `Scheduler status unavailable: ${error.message}`;
+    }
+}
+
+async function runCdpSchedulerNow() {
+    const statusEl = document.getElementById('cdp-scheduler-status');
+    if (statusEl) statusEl.textContent = 'Running CDP sync now...';
+    const response = await fetch('/api/cdp/meiro/scheduler/run-now', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ actor_id: getOperatorId() || undefined })
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to run scheduler now');
+    }
+    await loadCdpSchedulerStatus();
+    await loadCdpDiagnostics();
+    await loadCdpProfiles();
+}
+
+async function loadCdpDiagnostics() {
+    const summary = document.getElementById('cdp-diagnostics-summary');
+    const table = document.getElementById('cdp-sync-runs-table');
+    if (!summary || !table) return;
+    try {
+        const response = await fetch('/api/cdp/meiro/diagnostics?freshness_hours=24');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load diagnostics');
+        }
+        const payload = await response.json();
+        const p = payload.profiles || {};
+        const m = payload.mapping_coverage || {};
+        const s = payload.sync_runs || {};
+        summary.innerHTML = `
+            <strong>Profiles:</strong> ${p.count || 0} (fresh ${(Number(p.fresh_ratio || 0) * 100).toFixed(1)}%, stale ${(Number(p.stale_ratio || 0) * 100).toFixed(1)}%)
+            | <strong>Mapping hit:</strong> ${(Number(m.profile_found_ratio || 0) * 100).toFixed(1)}%
+            | <strong>Applied:</strong> ${(Number(m.applied_ratio || 0) * 100).toFixed(1)}%
+            | <strong>Sync success:</strong> ${(Number(s.success_ratio || 0) * 100).toFixed(1)}%
+        `;
+        const rows = (s.recent || []).map(item => `
+            <tr>
+                <td><code>${(item.run_id || '').slice(0, 8)}</code></td>
+                <td>${item.status || 'n/a'}</td>
+                <td>${item.attempted || 0}</td>
+                <td>${item.synced || 0}</td>
+                <td>${item.error_count || 0}</td>
+            </tr>
+        `).join('');
+        table.innerHTML = rows || '<tr><td colspan="5" class="text-muted">No sync runs yet.</td></tr>';
+    } catch (error) {
+        summary.textContent = `CDP diagnostics unavailable: ${error.message}`;
+        table.innerHTML = '<tr><td colspan="5" class="text-danger">Failed to load diagnostics.</td></tr>';
+    }
 }
 
 async function runCleanupNow() {
@@ -2889,6 +2968,15 @@ function setupEventListeners() {
             showError(error.message || 'Failed to sync CDP profiles');
         }
     });
+    on('refresh-cdp-scheduler', 'click', loadCdpSchedulerStatus);
+    on('run-cdp-scheduler-now', 'click', async () => {
+        try {
+            await runCdpSchedulerNow();
+        } catch (error) {
+            showError(error.message || 'Failed to run CDP scheduler now');
+        }
+    });
+    on('refresh-cdp-diagnostics', 'click', loadCdpDiagnostics);
     on('refresh-audit-logs', 'click', loadAuditLogs);
     on('audit-actor-filter', 'change', loadAuditLogs);
     on('audit-resource-filter', 'change', loadAuditLogs);
