@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
 EMBED_FILE = Path("embeddings/article_vectors.json")
 PROFILE_FILE = Path("profiles/user_profiles.json")
+MAX_ARTIFACT_EMBEDDINGS = 5
+ARTIFACT_RE = re.compile(r"(^|[_-])(demo|test|sample|mock)([_-]|$)", re.IGNORECASE)
 
 
 def _has_valid_embeddings(data: object) -> bool:
@@ -59,6 +62,39 @@ def _demo_embeddings() -> Dict[str, Dict]:
     }
 
 
+def _looks_like_artifact(article_id: str, item: object) -> bool:
+    if ARTIFACT_RE.search(article_id or ""):
+        return True
+    if not isinstance(item, dict):
+        return False
+    metadata = item.get("metadata") or {}
+    title = str(metadata.get("title", ""))
+    url = str(metadata.get("url", ""))
+    if ARTIFACT_RE.search(title):
+        return True
+    # Keep this conservative: test artifacts often use synthetic domains.
+    if "example.com" in url.lower():
+        return True
+    return False
+
+
+def _safe_scraped_at(item: object) -> str:
+    if not isinstance(item, dict):
+        return ""
+    metadata = item.get("metadata") or {}
+    return str(metadata.get("scraped_at", "") or "")
+
+
+def _trim_artifact_embeddings(embeddings: Dict[str, Dict]) -> Dict[str, Dict]:
+    artifact_ids = [article_id for article_id, item in embeddings.items() if _looks_like_artifact(article_id, item)]
+    if len(artifact_ids) <= MAX_ARTIFACT_EMBEDDINGS:
+        return embeddings
+
+    artifact_ids.sort(key=lambda aid: _safe_scraped_at(embeddings.get(aid)), reverse=True)
+    keep = set(artifact_ids[:MAX_ARTIFACT_EMBEDDINGS])
+    return {aid: item for aid, item in embeddings.items() if (aid not in artifact_ids) or (aid in keep)}
+
+
 def ensure_data_files() -> None:
     EMBED_FILE.parent.mkdir(parents=True, exist_ok=True)
     PROFILE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -72,9 +108,12 @@ def ensure_data_files() -> None:
 
     if not _has_valid_embeddings(embeddings):
         embeddings = _demo_embeddings()
-        EMBED_FILE.write_text(
-            json.dumps(embeddings, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+    else:
+        embeddings = _trim_artifact_embeddings(embeddings)
+
+    EMBED_FILE.write_text(
+        json.dumps(embeddings, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
     profiles = None
     if PROFILE_FILE.exists():
@@ -86,10 +125,21 @@ def ensure_data_files() -> None:
     if not isinstance(profiles, dict) or not profiles:
         article_ids = list(embeddings.keys()) if isinstance(embeddings, dict) else []
         demo_reads = article_ids[:2] if len(article_ids) >= 2 else article_ids
-        PROFILE_FILE.write_text(
-            json.dumps({"demo_user": demo_reads}, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        profiles = {"demo_user": demo_reads}
+    else:
+        valid_article_ids = set(embeddings.keys()) if isinstance(embeddings, dict) else set()
+        normalized_profiles = {}
+        for user_id, reads in profiles.items():
+            if not isinstance(reads, list):
+                continue
+            filtered_reads = [article_id for article_id in reads if article_id in valid_article_ids]
+            normalized_profiles[user_id] = filtered_reads
+        profiles = normalized_profiles or {"demo_user": []}
+
+    PROFILE_FILE.write_text(
+        json.dumps(profiles, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

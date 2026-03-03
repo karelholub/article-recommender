@@ -32,12 +32,20 @@
             </div>
             <div class="card-body">
                 <div class="section-hint">Shows the effective configuration after applying defaults, scenario overrides, and runtime selections.</div>
-                <pre id="decision-context" class="small mb-0">Loading...</pre>
+                <div id="decision-context-summary" class="small text-muted mb-2">Loading decision context summary...</div>
+                <details class="mb-2">
+                    <summary class="small">Show effective settings details</summary>
+                    <div id="decision-context-details" class="small text-muted mt-2">Loading...</div>
+                </details>
+                <details>
+                    <summary class="small">Show raw decision context JSON</summary>
+                    <pre id="decision-context" class="small mb-0 mt-2" style="max-height: 220px; overflow:auto;">Loading...</pre>
+                </details>
             </div>
         </div>
 
         <div class="card mb-4">
-            <div class="card-header"><strong>Article Statistics</strong></div>
+            <div class="card-header"><strong>Content Health & Actions</strong></div>
             <div class="card-body"><div id="article-stats">Loading...</div></div>
         </div>
 

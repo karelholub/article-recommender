@@ -2124,7 +2124,7 @@ async function loadEventsQueueStatus() {
 
 async function enqueueEventsSample() {
     const countRaw = Number(document.getElementById('events-queue-sample-size')?.value || 5);
-    const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(100, Math.round(countRaw))) : 5;
+    const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(5, Math.round(countRaw))) : 5;
     const now = Date.now();
     const runSuffix = String(now % 1000000000000).padStart(12, '0');
     const runId = `00000000-0000-0000-0000-${runSuffix}`;
@@ -2219,6 +2219,8 @@ async function rebuildRollups() {
 
 async function loadDecisionContext() {
     const container = document.getElementById('decision-context');
+    const summary = document.getElementById('decision-context-summary');
+    const details = document.getElementById('decision-context-details');
     if (!container) return;
     try {
         const configId = document.getElementById('ranking-config')?.value || 'balanced';
@@ -2239,7 +2241,65 @@ async function loadDecisionContext() {
         }
         const context = await response.json();
         container.textContent = JSON.stringify(context, null, 2);
+        const effectiveConfig = context.effective_config || {};
+        const sourceWeights = effectiveConfig.source_weights || {};
+        const sourceWeightEntries = Object.entries(sourceWeights);
+        const scenario = context.scenario || {};
+        const scenarioRuleSet = scenario.rule_set || {};
+        const includeSources = scenarioRuleSet.include_sources || [];
+        const excludeSources = scenarioRuleSet.exclude_sources || [];
+        const includeSections = scenarioRuleSet.include_sections || [];
+        const excludeSections = scenarioRuleSet.exclude_sections || [];
+        const includeKeywords = scenarioRuleSet.include_keywords || [];
+        const excludeKeywords = scenarioRuleSet.exclude_keywords || [];
+        const scenarioEnabled = scenario && (scenario.enabled === true);
+        const effectiveSources = context.effective_sources || selectedSources || [];
+        const appliedConfigId = context.config_id || configId;
+        if (summary) {
+            summary.innerHTML = `
+                Config <strong>${appliedConfigId}</strong>
+                | Scenario <strong>${scenarioId || 'none'}</strong> (${scenarioEnabled ? 'enabled' : 'disabled/none'})
+                | Sources <strong>${effectiveSources.length}</strong>
+                | Source weights <strong>${sourceWeightEntries.length}</strong>
+                | Max age <strong>${effectiveConfig.hard_max_age_days ?? 'n/a'}</strong> days
+                | Min freshness <strong>${effectiveConfig.min_freshness ?? 'n/a'}</strong>
+            `;
+        }
+        if (details) {
+            const sourceBadges = effectiveSources.slice(0, 12).map(source => `<span class="badge text-bg-light border me-1 mb-1">${source}</span>`).join('');
+            const weightsBadges = sourceWeightEntries
+                .sort((a, b) => Number(b[1]) - Number(a[1]))
+                .slice(0, 12)
+                .map(([source, weight]) => `<span class="badge text-bg-light border me-1 mb-1">${source}: ${Number(weight).toFixed(2)}</span>`)
+                .join('');
+            details.innerHTML = `
+                <div class="row g-2 mb-2">
+                    <div class="col-md-6"><strong>Time decay (days):</strong> ${effectiveConfig.time_decay_days ?? 'n/a'}</div>
+                    <div class="col-md-6"><strong>Recent boost:</strong> ${effectiveConfig.recent_boost_factor ?? 'n/a'} (${effectiveConfig.recent_boost_days ?? 'n/a'}d)</div>
+                    <div class="col-md-6"><strong>Dedup title/URL:</strong> ${(effectiveConfig.dedup_by_title ? 'yes' : 'no')} / ${(effectiveConfig.dedup_by_url ? 'yes' : 'no')}</div>
+                    <div class="col-md-6"><strong>Caps (source/topic/section):</strong> ${effectiveConfig.max_per_source ?? '-'} / ${effectiveConfig.max_per_topic ?? '-'} / ${effectiveConfig.max_per_section ?? '-'}</div>
+                </div>
+                <details class="mb-2">
+                    <summary class="small">Effective sources</summary>
+                    <div class="mt-1">${sourceBadges || '<span class="text-muted">No effective sources.</span>'}</div>
+                </details>
+                <details class="mb-2">
+                    <summary class="small">Top source weights</summary>
+                    <div class="mt-1">${weightsBadges || '<span class="text-muted">No source weights.</span>'}</div>
+                </details>
+                <details>
+                    <summary class="small">Scenario rule summary</summary>
+                    <div class="mt-1">
+                        include sources ${includeSources.length}, exclude sources ${excludeSources.length},
+                        include sections ${includeSections.length}, exclude sections ${excludeSections.length},
+                        include keywords ${includeKeywords.length}, exclude keywords ${excludeKeywords.length}
+                    </div>
+                </details>
+            `;
+        }
     } catch (error) {
+        if (summary) summary.textContent = `Failed to load decision context summary: ${error.message}`;
+        if (details) details.textContent = `Failed to load decision context details: ${error.message}`;
         container.textContent = `Failed to load decision context: ${error.message}`;
     }
 }
@@ -4017,14 +4077,21 @@ async function loadRecommendationRunDetail(runId) {
 
 async function loadStats() {
     try {
-        const response = await fetch('/api/stats');
-        if (!response.ok) {
-            const error = await response.json();
+        const [statsResponse, articlesResponse] = await Promise.all([
+            fetch('/api/stats'),
+            fetch('/api/articles')
+        ]);
+        if (!statsResponse.ok) {
+            const error = await statsResponse.json();
             throw new Error(error.error || 'Failed to load statistics');
         }
-
-        const stats = await response.json();
-        displayStats(stats);
+        const stats = await statsResponse.json();
+        let articleItems = [];
+        if (articlesResponse.ok) {
+            const payload = await articlesResponse.json();
+            articleItems = Array.isArray(payload) ? payload : [];
+        }
+        displayStats(stats, articleItems);
     } catch (error) {
         console.error('Error loading statistics:', error);
         showError('Failed to load statistics: ' + error.message);
@@ -4395,74 +4462,168 @@ function formatContribution(value) {
     return value.toFixed(3);
 }
 
-function displayStats(stats) {
+function displayStats(stats, articleItems = []) {
     const statsContainer = document.getElementById('article-stats');
+    if (!statsContainer) return;
 
-    const freshnessData = {
-        labels: ['Today', 'This Week', 'This Month', 'Older'],
-        datasets: [{
-            data: [
-                stats.freshness_distribution.today,
-                stats.freshness_distribution.this_week,
-                stats.freshness_distribution.this_month,
-                stats.freshness_distribution.older
-            ],
-            backgroundColor: ['#28a745', '#17a2b8', '#ffc107', '#6c757d']
-        }]
-    };
-
-    const clusterData = {
-        labels: Object.keys(stats.cluster_distribution).map(cluster => `Cluster ${cluster}`),
-        datasets: [{
-            data: Object.values(stats.cluster_distribution),
-            backgroundColor: ['#007bff', '#6610f2', '#6f42c1', '#e83e8c', '#fd7e14']
-        }]
-    };
-
-    const clusterTopics = stats.cluster_topics || {};
-    const topicRows = Object.entries(clusterTopics).map(([cluster, titles]) => `
-        <tr>
-            <td>${cluster}</td>
-            <td>${Array.isArray(titles) && titles.length ? titles.join(' | ') : 'n/a'}</td>
-        </tr>
-    `).join('');
+    const totalArticles = Number(stats.total_articles || articleItems.length || 0);
+    const freshness = stats.freshness_distribution || {};
+    const today = Number(freshness.today || 0);
+    const thisWeek = Number(freshness.this_week || 0);
+    const thisMonth = Number(freshness.this_month || 0);
+    const older = Number(freshness.older || 0);
+    const fresh7d = today + thisWeek;
+    const staleRatio = totalArticles ? older / totalArticles : 0;
+    const freshRatio = totalArticles ? fresh7d / totalArticles : 0;
     const quality = stats.cluster_quality || {};
 
+    const sourceCounts = {};
+    const sectionCounts = {};
+    let missingUrlCount = 0;
+    let shortContentCount = 0;
+    articleItems.forEach((item) => {
+        const source = item.source || 'unknown';
+        const section = item.section || item.metadata?.section || 'unknown';
+        sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+        sectionCounts[section] = (sectionCounts[section] || 0) + 1;
+        if (!item.metadata?.url) missingUrlCount += 1;
+        if (!item.content || item.content.trim().length < 120) shortContentCount += 1;
+    });
+    const sourceRows = Object.entries(sourceCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6);
+    const sectionRows = Object.entries(sectionCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6);
+    const topSourceShare = sourceRows.length && totalArticles ? sourceRows[0][1] / totalArticles : 0;
+    const unknownSectionShare = totalArticles ? Number(sectionCounts.unknown || 0) / totalArticles : 0;
+    const shortContentShare = totalArticles ? shortContentCount / totalArticles : 0;
+    const missingUrlShare = totalArticles ? missingUrlCount / totalArticles : 0;
+    const unclusteredShare = totalArticles ? Number(quality.unclustered_count || 0) / totalArticles : 0;
+
+    const actions = [];
+    if (!totalArticles) {
+        actions.push({
+            level: 'danger',
+            title: 'No indexed content',
+            message: 'Ingestion is empty. Add or sync source connectors in Operations before testing recommendations.',
+            target: '/operations'
+        });
+    }
+    if (staleRatio > 0.45) {
+        actions.push({
+            level: 'warning',
+            title: 'Catalog is stale',
+            message: `${(staleRatio * 100).toFixed(1)}% of content is older than 30 days. Increase connector sync cadence and validate source freshness.`,
+            target: '/operations'
+        });
+    }
+    if (topSourceShare > 0.6) {
+        actions.push({
+            level: 'warning',
+            title: 'Source concentration risk',
+            message: `Top source contributes ${(topSourceShare * 100).toFixed(1)}% of inventory. Add more sources or reduce source weight bias.`,
+            target: '/recommendations'
+        });
+    }
+    if (unclusteredShare > 0.35) {
+        actions.push({
+            level: 'warning',
+            title: 'Topic clustering quality is low',
+            message: `${(unclusteredShare * 100).toFixed(1)}% of articles are unclustered. Run full embedding refresh and check extraction quality.`,
+            target: '/embeddings'
+        });
+    }
+    if (unknownSectionShare > 0.2 || missingUrlShare > 0.15 || shortContentShare > 0.25) {
+        actions.push({
+            level: 'info',
+            title: 'Metadata quality needs cleanup',
+            message: `Unknown sections ${(unknownSectionShare * 100).toFixed(1)}%, missing URLs ${(missingUrlShare * 100).toFixed(1)}%, short content ${(shortContentShare * 100).toFixed(1)}%. Improve scraper selectors and normalization.`,
+            target: '/operations'
+        });
+    }
+    if (!actions.length) {
+        actions.push({
+            level: 'success',
+            title: 'Content inventory looks healthy',
+            message: 'Freshness, source spread, and metadata quality are within normal operational thresholds.',
+            target: ''
+        });
+    }
+
+    const sourceTableRows = sourceRows.map(([name, count]) => `
+        <tr>
+            <td>${name}</td>
+            <td>${count}</td>
+            <td>${totalArticles ? `${((count / totalArticles) * 100).toFixed(1)}%` : '0.0%'}</td>
+        </tr>
+    `).join('');
+    const sectionTableRows = sectionRows.map(([name, count]) => `
+        <tr>
+            <td>${name}</td>
+            <td>${count}</td>
+            <td>${totalArticles ? `${((count / totalArticles) * 100).toFixed(1)}%` : '0.0%'}</td>
+        </tr>
+    `).join('');
+    const actionRows = actions.map((item) => `
+        <div class="border rounded p-2 mb-2">
+            <div class="d-flex justify-content-between align-items-center">
+                <strong>${item.title}</strong>
+                <span class="badge text-bg-${item.level}">${item.level}</span>
+            </div>
+            <div class="small text-muted mt-1">${item.message}</div>
+            ${item.target ? `<div class="small mt-1">Suggested workspace: <a href="${item.target}">${item.target}</a></div>` : ''}
+        </div>
+    `).join('');
+
     statsContainer.innerHTML = `
-        <div class="row">
-            <div class="col-md-6">
-                <h5 class="mb-3">Content Freshness</h5>
-                <canvas id="freshnessChart"></canvas>
+        <div class="d-flex flex-wrap gap-2 mb-2">
+            <span class="badge text-bg-light border">Total ${totalArticles}</span>
+            <span class="badge ${freshRatio >= 0.45 ? 'text-bg-success' : 'text-bg-warning'}">Fresh 7d ${(freshRatio * 100).toFixed(1)}%</span>
+            <span class="badge ${staleRatio <= 0.35 ? 'text-bg-success' : 'text-bg-warning'}">Older than 30d ${(staleRatio * 100).toFixed(1)}%</span>
+            <span class="badge ${topSourceShare <= 0.5 ? 'text-bg-success' : 'text-bg-warning'}">Top source share ${(topSourceShare * 100).toFixed(1)}%</span>
+            <span class="badge ${unclusteredShare <= 0.25 ? 'text-bg-success' : 'text-bg-warning'}">Unclustered ${(unclusteredShare * 100).toFixed(1)}%</span>
+        </div>
+        <div class="row g-2 mb-2 small">
+            <div class="col-md-3"><strong>Today:</strong> ${today}</div>
+            <div class="col-md-3"><strong>7 days:</strong> ${thisWeek}</div>
+            <div class="col-md-3"><strong>30 days:</strong> ${thisMonth}</div>
+            <div class="col-md-3"><strong>Older:</strong> ${older}</div>
+        </div>
+        <div class="row g-3">
+            <div class="col-lg-6">
+                <h6 class="mb-2">Source mix (top 6)</h6>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>Source</th><th>Articles</th><th>Share</th></tr></thead>
+                        <tbody>${sourceTableRows || '<tr><td colspan="3" class="text-muted">No source data.</td></tr>'}</tbody>
+                    </table>
+                </div>
             </div>
-            <div class="col-md-6">
-                <h5 class="mb-3">Topic Clusters</h5>
-                <canvas id="clusterChart"></canvas>
+            <div class="col-lg-6">
+                <h6 class="mb-2">Section coverage (top 6)</h6>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>Section</th><th>Articles</th><th>Share</th></tr></thead>
+                        <tbody>${sectionTableRows || '<tr><td colspan="3" class="text-muted">No section data.</td></tr>'}</tbody>
+                    </table>
+                </div>
             </div>
         </div>
-        <div class="mt-3 small text-muted">
-            <strong>Cluster coverage:</strong> ${(Number(quality.coverage_ratio || 0) * 100).toFixed(1)}%
-            | <strong>Largest cluster share:</strong> ${(Number(quality.largest_cluster_share || 0) * 100).toFixed(1)}%
-            | <strong>Cluster count:</strong> ${quality.cluster_count ?? 0}
-        </div>
-        <div class="table-responsive mt-2">
-            <table class="table table-sm mb-0">
-                <thead><tr><th>Cluster</th><th>Top sample titles</th></tr></thead>
-                <tbody>${topicRows || '<tr><td colspan="2" class="text-muted">No cluster topic data.</td></tr>'}</tbody>
-            </table>
+        <details class="mt-2">
+            <summary class="small">Data quality indicators</summary>
+            <div class="small text-muted mt-1">
+                Missing URL: ${(missingUrlShare * 100).toFixed(1)}% (${missingUrlCount}) |
+                Short content (&lt;120 chars): ${(shortContentShare * 100).toFixed(1)}% (${shortContentCount}) |
+                Unknown section: ${(unknownSectionShare * 100).toFixed(1)}% (${sectionCounts.unknown || 0}) |
+                Cluster coverage: ${(Number(quality.coverage_ratio || 0) * 100).toFixed(1)}%
+            </div>
+        </details>
+        <div class="mt-3">
+            <h6 class="mb-2">Actionable recommendations</h6>
+            ${actionRows}
         </div>
     `;
-
-    new Chart(document.getElementById('freshnessChart'), {
-        type: 'pie',
-        data: freshnessData,
-        options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
-    });
-
-    new Chart(document.getElementById('clusterChart'), {
-        type: 'pie',
-        data: clusterData,
-        options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
-    });
 }
 
 function setupEventListeners() {
