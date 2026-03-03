@@ -7,8 +7,10 @@ import json
 import logging
 import math
 import os
+from queue import Empty, Queue
 import threading
 import traceback
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -72,6 +74,25 @@ _cdp_thread: Optional[threading.Thread] = None
 _cdp_stop_event = threading.Event()
 _embedding_state_lock = threading.Lock()
 _embedding_thread: Optional[threading.Thread] = None
+_recommendation_cache_lock = threading.Lock()
+_recommendation_cache: Dict[str, Dict[str, Any]] = {}
+_events_queue_lock = threading.Lock()
+_events_queue: "Queue[Dict[str, Any]]" = Queue(maxsize=max(100, int(os.getenv("EVENTS_INGEST_QUEUE_MAXSIZE", "10000"))))
+_events_queue_state = {
+    "enabled": os.getenv("EVENTS_INGEST_ASYNC_ENABLED", "true").strip().lower() == "true",
+    "running": False,
+    "enqueued_total": 0,
+    "processed_total": 0,
+    "failed_total": 0,
+    "last_error": None,
+    "last_processed_at": None,
+}
+_events_worker_stop_event = threading.Event()
+_events_worker_thread: Optional[threading.Thread] = None
+_events_queue_jobs: Dict[str, Dict[str, Any]] = {}
+_rollup_jobs_lock = threading.Lock()
+_rollup_jobs: Dict[str, Dict[str, Any]] = {}
+_rollup_executor = ThreadPoolExecutor(max_workers=1)
 _scheduler_state = {
     "enabled": False,
     "running": False,
@@ -403,6 +424,228 @@ def _read_idempotency_key(payload: Optional[Dict]) -> Optional[str]:
         if body_key:
             return body_key
     return None
+
+
+def _validation_error(message: str, code: str = "validation_error", details: Optional[Dict[str, Any]] = None):
+    payload: Dict[str, Any] = {
+        "error": message,
+        "message": message,
+        "error_code": code,
+        "status": 400,
+    }
+    if details is not None:
+        payload["details"] = details
+    return jsonify(payload), 400
+
+
+def _recommendation_cache_ttl_seconds() -> int:
+    return max(0, int(os.getenv("RECOMMENDATION_CACHE_TTL_SECONDS", "60")))
+
+
+def _build_recommendation_cache_key(namespace: str, payload: Dict[str, Any]) -> str:
+    key_payload = {
+        "namespace": namespace,
+        "user_id": payload.get("user_id"),
+        "external_user_id": payload.get("external_user_id"),
+        "user_reads": payload.get("user_reads") or [],
+        "top_n": int(payload.get("top_n", payload.get("limit", 5))),
+        "sources": payload.get("sources") or [],
+        "config_id": payload.get("config_id"),
+        "scenario_id": payload.get("scenario_id"),
+        "ranking_config": payload.get("ranking_config") or {},
+        "experiment": payload.get("experiment") or {},
+    }
+    body = json.dumps(key_payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _get_cached_recommendations(cache_key: str) -> Optional[List[Dict[str, Any]]]:
+    ttl_seconds = _recommendation_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        return None
+    now_ts = datetime.now().timestamp()
+    with _recommendation_cache_lock:
+        item = _recommendation_cache.get(cache_key)
+        if not item:
+            return None
+        if (now_ts - float(item.get("created_at_ts", 0.0))) > ttl_seconds:
+            _recommendation_cache.pop(cache_key, None)
+            return None
+        recs = item.get("recommendations") or []
+        return [dict(entry) for entry in recs]
+
+
+def _set_cached_recommendations(cache_key: str, recommendations: List[Dict[str, Any]]) -> None:
+    ttl_seconds = _recommendation_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        return
+    now_ts = datetime.now().timestamp()
+    with _recommendation_cache_lock:
+        _recommendation_cache[cache_key] = {
+            "created_at_ts": now_ts,
+            "recommendations": [dict(entry) for entry in (recommendations or [])],
+        }
+        if len(_recommendation_cache) > 5000:
+            expired_keys = [
+                key
+                for key, item in _recommendation_cache.items()
+                if (now_ts - float(item.get("created_at_ts", 0.0))) > ttl_seconds
+            ]
+            for key in expired_keys[:2000]:
+                _recommendation_cache.pop(key, None)
+
+
+def _enqueue_event_batch(validated_events: List[Dict[str, Any]], actor_id: str = "system") -> Dict[str, Any]:
+    if not _events_queue_state.get("enabled", True):
+        raise ValueError("Async events ingestion is disabled")
+    if not validated_events:
+        raise ValueError("No events to enqueue")
+    job_id = str(uuid.uuid4())
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "events_count": len(validated_events),
+        "inserted": 0,
+        "created_at": now_str,
+        "updated_at": now_str,
+        "actor_id": actor_id or "system",
+        "error": None,
+    }
+    with _events_queue_lock:
+        _events_queue_jobs[job_id] = job
+        _events_queue_state["enqueued_total"] += 1
+    _events_queue.put({"job_id": job_id, "events": validated_events})
+    return job
+
+
+def _events_worker_loop() -> None:
+    while not _events_worker_stop_event.is_set():
+        try:
+            payload = _events_queue.get(timeout=0.5)
+        except Empty:
+            continue
+        job_id = str(payload.get("job_id") or "")
+        events = payload.get("events") or []
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            if store is None:
+                raise ValueError("Store unavailable")
+            with _events_queue_lock:
+                if job_id in _events_queue_jobs:
+                    _events_queue_jobs[job_id]["status"] = "processing"
+                    _events_queue_jobs[job_id]["updated_at"] = now_str
+            inserted = int(store.record_events(events))
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with _events_queue_lock:
+                _events_queue_state["processed_total"] += 1
+                _events_queue_state["last_processed_at"] = now_str
+                if job_id in _events_queue_jobs:
+                    _events_queue_jobs[job_id]["status"] = "completed"
+                    _events_queue_jobs[job_id]["inserted"] = inserted
+                    _events_queue_jobs[job_id]["updated_at"] = now_str
+        except Exception as exc:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with _events_queue_lock:
+                _events_queue_state["failed_total"] += 1
+                _events_queue_state["last_error"] = str(exc)
+                if job_id in _events_queue_jobs:
+                    _events_queue_jobs[job_id]["status"] = "failed"
+                    _events_queue_jobs[job_id]["error"] = str(exc)
+                    _events_queue_jobs[job_id]["updated_at"] = now_str
+            logger.error(f"Async events ingestion failed: {str(exc)}")
+            logger.error(traceback.format_exc())
+        finally:
+            _events_queue.task_done()
+
+
+def _start_events_worker_if_enabled() -> None:
+    global _events_worker_thread
+    if not _events_queue_state.get("enabled", True):
+        return
+    if _events_worker_thread and _events_worker_thread.is_alive():
+        return
+    _events_worker_thread = threading.Thread(target=_events_worker_loop, name="events-ingest-worker", daemon=True)
+    _events_worker_thread.start()
+    with _events_queue_lock:
+        _events_queue_state["running"] = True
+
+
+def _get_events_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with _events_queue_lock:
+        row = _events_queue_jobs.get(job_id)
+        return dict(row) if row else None
+
+
+def _events_queue_snapshot() -> Dict[str, Any]:
+    with _events_queue_lock:
+        snapshot = dict(_events_queue_state)
+    snapshot["queue_size"] = int(_events_queue.qsize())
+    snapshot["jobs_tracked"] = int(len(_events_queue_jobs))
+    return snapshot
+
+
+def _run_rollup_rebuild_job(job_id: str, days: int, actor_id: str) -> None:
+    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _rollup_jobs_lock:
+        if job_id in _rollup_jobs:
+            _rollup_jobs[job_id]["status"] = "processing"
+            _rollup_jobs[job_id]["started_at"] = started_at
+            _rollup_jobs[job_id]["updated_at"] = started_at
+    try:
+        if store is None:
+            raise ValueError("Store unavailable")
+        result = store.rebuild_event_rollups(days=days)
+        with _rollup_jobs_lock:
+            if job_id in _rollup_jobs:
+                _rollup_jobs[job_id]["status"] = "completed"
+                _rollup_jobs[job_id]["result"] = result
+                _rollup_jobs[job_id]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with app.test_request_context("/api/metrics/rollups/rebuild-async", method="POST"):
+                _record_audit(
+                    action="rebuild_async",
+                    resource_type="event_rollups",
+                    resource_id=f"daily:{days}",
+                    payload={"actor_id": actor_id},
+                    extra={"job_id": job_id, **result},
+                )
+        except Exception:
+            logger.exception("Failed to write async rollup audit")
+    except Exception as exc:
+        with _rollup_jobs_lock:
+            if job_id in _rollup_jobs:
+                _rollup_jobs[job_id]["status"] = "failed"
+                _rollup_jobs[job_id]["error"] = str(exc)
+                _rollup_jobs[job_id]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.error(f"Async rollup rebuild failed: {str(exc)}")
+        logger.error(traceback.format_exc())
+
+
+def _enqueue_rollup_rebuild(days: int, actor_id: str = "system") -> Dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "days": int(days),
+        "created_at": now_str,
+        "updated_at": now_str,
+        "started_at": None,
+        "result": None,
+        "error": None,
+        "actor_id": actor_id,
+    }
+    with _rollup_jobs_lock:
+        _rollup_jobs[job_id] = job
+    _rollup_executor.submit(_run_rollup_rebuild_job, job_id, int(days), actor_id)
+    return job
+
+
+def _get_rollup_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with _rollup_jobs_lock:
+        row = _rollup_jobs.get(job_id)
+        return dict(row) if row else None
 
 
 def _request_actor_id(payload: Optional[Dict] = None) -> str:
@@ -864,6 +1107,14 @@ def _compute_observability_snapshot(days: int) -> Dict:
             }
         )
     surface_items.sort(key=lambda item: item["runs"], reverse=True)
+    online_kpi = _compute_online_kpi_snapshot(
+        days=days,
+        baseline_config_id="balanced",
+        baseline_scenario_id="default",
+        limit_runs=1000,
+        limit_events=100000,
+        stale_freshness_floor=0.2,
+    )
 
     return {
         "api_version": "v1",
@@ -897,6 +1148,7 @@ def _compute_observability_snapshot(days: int) -> Dict:
             "lag_hours": rollup_lag_hours,
         },
         "slo_targets": thresholds,
+        "online_kpi_summary": online_kpi.get("summary") or {},
     }
 
 
@@ -907,6 +1159,10 @@ def _build_sli_checks(snapshot: Dict) -> list:
     blocker_rate = snapshot.get("connectors", {}).get("blocker_rate", 0.0)
     rollup_lag_hours = snapshot.get("rollups", {}).get("lag_hours")
     ctr = snapshot.get("events", {}).get("ctr", 0.0)
+    online_kpi_summary = snapshot.get("online_kpi_summary") or {}
+    source_top_share = float(online_kpi_summary.get("top_source_share", 0.0) or 0.0)
+    stale_ratio = float(online_kpi_summary.get("stale_ratio", 0.0) or 0.0)
+    ctr_lift_vs_baseline = online_kpi_summary.get("ctr_lift_vs_baseline")
     return [
         {
             "metric": "recommendation_p95_ms",
@@ -944,6 +1200,31 @@ def _build_sli_checks(snapshot: Dict) -> list:
             "value": ctr,
             "target_min": float(thresholds.get("min_ctr", 0.01)),
             "status": "pass" if ctr >= float(thresholds.get("min_ctr", 0.01)) else "warn",
+        },
+        {
+            "metric": "source_starvation_top_share",
+            "value": source_top_share,
+            "target_max": float(thresholds.get("max_source_top_share", 0.85)),
+            "status": "pass" if source_top_share <= float(thresholds.get("max_source_top_share", 0.85)) else "warn",
+        },
+        {
+            "metric": "stale_ratio",
+            "value": stale_ratio,
+            "target_max": float(thresholds.get("max_stale_ratio", 0.4)),
+            "status": "pass" if stale_ratio <= float(thresholds.get("max_stale_ratio", 0.4)) else "warn",
+        },
+        {
+            "metric": "ctr_lift_vs_baseline",
+            "value": float(ctr_lift_vs_baseline) if isinstance(ctr_lift_vs_baseline, (int, float)) else None,
+            "target_min": float(thresholds.get("min_ctr_lift_vs_baseline", -0.05)),
+            "status": (
+                "pass"
+                if (
+                    isinstance(ctr_lift_vs_baseline, (int, float))
+                    and float(ctr_lift_vs_baseline) >= float(thresholds.get("min_ctr_lift_vs_baseline", -0.05))
+                )
+                else "warn"
+            ),
         },
     ]
 
@@ -1327,6 +1608,13 @@ app.config["APP_HELPERS"] = {
     "safe_parse_timestamp": _safe_parse_timestamp,
     "execute_cdp_sync_run": _execute_cdp_sync_run,
     "record_audit": _record_audit,
+    "validation_error": _validation_error,
+    "enqueue_event_batch": _enqueue_event_batch,
+    "get_events_job": _get_events_job,
+    "events_queue_state": _events_queue_snapshot,
+    "build_recommendation_cache_key": _build_recommendation_cache_key,
+    "get_cached_recommendations": _get_cached_recommendations,
+    "set_cached_recommendations": _set_cached_recommendations,
 }
 
 
@@ -1360,9 +1648,97 @@ def runs_page():
     return render_template("runs.html", active_page="runs", title="Run Explorer")
 
 
+@app.route("/api-docs")
+def api_docs_page():
+    return render_template("api_docs.html", active_page="api_docs", title="API Docs")
+
+
 @app.route("/cdp")
 def cdp_page():
     return render_template("cdp.html", active_page="cdp", title="CDP Integration")
+
+
+@app.route("/api/openapi.json", methods=["GET"])
+@app.route("/api/v1/openapi.json", methods=["GET"])
+def openapi_spec():
+    host = request.host_url.rstrip("/")
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Article Recommender API", "version": "1.0.0"},
+        "servers": [{"url": host}],
+        "paths": {
+            "/api/recommendations/query": {
+                "post": {
+                    "summary": "Compute recommendations",
+                    "requestBody": {"required": True},
+                    "responses": {"200": {"description": "Recommendations"}, "400": {"description": "Validation error"}},
+                }
+            },
+            "/api/recommendations/cms": {
+                "post": {
+                    "summary": "CMS recommendation surface",
+                    "parameters": [{"in": "header", "name": "Idempotency-Key", "schema": {"type": "string"}}],
+                    "requestBody": {"required": True},
+                    "responses": {"200": {"description": "Recommendations"}, "400": {"description": "Validation error"}},
+                }
+            },
+            "/api/events": {
+                "post": {
+                    "summary": "Ingest events (sync)",
+                    "parameters": [{"in": "header", "name": "Idempotency-Key", "schema": {"type": "string"}}],
+                    "requestBody": {"required": True},
+                    "responses": {"201": {"description": "Inserted"}, "400": {"description": "Validation error"}},
+                }
+            },
+            "/api/events/ingest-async": {
+                "post": {
+                    "summary": "Ingest events (async queue)",
+                    "requestBody": {"required": True},
+                    "responses": {"202": {"description": "Queued"}, "400": {"description": "Validation error"}},
+                }
+            },
+            "/api/events/ingest-status/{job_id}": {
+                "get": {
+                    "summary": "Get async event ingestion status",
+                    "parameters": [{"in": "path", "name": "job_id", "required": True, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "Job status"}, "404": {"description": "Not found"}},
+                }
+            },
+            "/api/events/ingest-queue-status": {"get": {"summary": "Get async events queue status"}},
+            "/api/metrics/online-kpis": {
+                "get": {
+                    "summary": "Online KPI monitor with lift and confidence",
+                    "responses": {"200": {"description": "KPI payload"}},
+                }
+            },
+            "/api/metrics/rollups/rebuild-async": {"post": {"summary": "Queue rollup rebuild"}},
+            "/api/metrics/rollups/rebuild-async/{job_id}": {
+                "get": {
+                    "summary": "Get rollup rebuild job status",
+                    "parameters": [{"in": "path", "name": "job_id", "required": True, "schema": {"type": "string"}}],
+                }
+            },
+            "/api/ranking-configs/promote": {"post": {"summary": "Promote config", "responses": {"200": {"description": "Promoted"}}}},
+            "/api/ranking-configs/rollback": {"post": {"summary": "Rollback promoted config", "responses": {"200": {"description": "Rolled back"}}}},
+            "/api/alerts/thresholds": {"get": {"summary": "Get thresholds"}, "put": {"summary": "Update thresholds"}},
+        },
+        "components": {
+            "schemas": {
+                "ErrorEnvelope": {
+                    "type": "object",
+                    "properties": {
+                        "error": {"type": "string"},
+                        "message": {"type": "string"},
+                        "error_code": {"type": "string"},
+                        "status": {"type": "integer"},
+                        "details": {"type": "object"},
+                    },
+                    "required": ["error"],
+                }
+            }
+        },
+    }
+    return jsonify(spec)
 
 
 @app.route("/embeddings")
@@ -1919,6 +2295,7 @@ def _enqueue_due_connector_syncs(trigger_label: str = "scheduled") -> Dict:
 _start_connector_scheduler_if_enabled()
 _start_cleanup_scheduler_if_enabled()
 _start_cdp_scheduler_if_enabled()
+_start_events_worker_if_enabled()
 
 
 def _build_ranking_config_payload(config_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2047,6 +2424,9 @@ def ranking_config_promote():
         source = store.get_config(source_config_id)
         if not source:
             return jsonify({"error": f"Unknown source config: {source_config_id}"}), 404
+        previous = store.get_config(target_config_id)
+        previous_config_id = previous[0].get("config_id", target_config_id) if previous else None
+        previous_version = previous[1] if previous else None
         source_config, source_version, _is_system = source
         promoted_payload = dict(source_config)
         promoted_payload["config_id"] = target_config_id
@@ -2057,7 +2437,13 @@ def ranking_config_promote():
             resource_type="ranking_config",
             resource_id=target_config_id,
             payload=payload,
-            extra={"source_config_id": source_config_id, "source_version": source_version, "version": version},
+            extra={
+                "source_config_id": source_config_id,
+                "source_version": source_version,
+                "version": version,
+                "previous_config_id": previous_config_id,
+                "previous_version": previous_version,
+            },
         )
         return jsonify(
             {
@@ -2065,6 +2451,8 @@ def ranking_config_promote():
                 "target_version": version,
                 "source_config_id": source_config_id,
                 "source_version": source_version,
+                "previous_config_id": previous_config_id,
+                "previous_version": previous_version,
             }
         )
     except Exception as e:
@@ -2107,6 +2495,9 @@ def ranking_config_promote_with_guard():
         source = store.get_config(candidate_config_id)
         if not source:
             return jsonify({"error": f"Unknown candidate config: {candidate_config_id}"}), 404
+        previous = store.get_config(target_config_id)
+        previous_config_id = previous[0].get("config_id", target_config_id) if previous else None
+        previous_version = previous[1] if previous else None
         source_config, source_version, _is_system = source
         promoted_payload = dict(source_config)
         promoted_payload["config_id"] = target_config_id
@@ -2122,6 +2513,8 @@ def ranking_config_promote_with_guard():
                 "source_version": source_version,
                 "version": version,
                 "guard": guard_eval.get("guard"),
+                "previous_config_id": previous_config_id,
+                "previous_version": previous_version,
             },
         )
         return jsonify(
@@ -2132,12 +2525,80 @@ def ranking_config_promote_with_guard():
                 "source_version": source_version,
                 "guard_evaluation": guard_eval,
                 "comparison": compare,
+                "previous_config_id": previous_config_id,
+                "previous_version": previous_version,
             }
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
         logger.error(f"Error promoting ranking config with guard: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/ranking-configs/rollback", methods=["POST"])
+def ranking_config_rollback():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json(silent=True) or {}
+        target_config_id = str(payload.get("target_config_id", "balanced")).strip() or "balanced"
+        limit = max(20, min(500, int(payload.get("limit_audit", 120))))
+        logs = store.list_audit_events(limit=limit, offset=0, resource_type="ranking_config")
+        rollback_source = None
+        rollback_metadata = None
+        for event in logs:
+            if str(event.get("resource_id") or "") != target_config_id:
+                continue
+            metadata = event.get("metadata") or {}
+            previous_id = str(metadata.get("previous_config_id") or "").strip()
+            source_id = str(metadata.get("source_config_id") or "").strip()
+            if previous_id:
+                rollback_source = previous_id
+                rollback_metadata = metadata
+                break
+            if source_id and str(event.get("action") or "").startswith("promote"):
+                rollback_source = source_id
+                rollback_metadata = metadata
+                break
+        if not rollback_source:
+            return jsonify({"error": f"No promotable history found for {target_config_id}"}), 404
+        source = store.get_config(rollback_source)
+        if not source:
+            return jsonify({"error": f"Rollback source config not found: {rollback_source}"}), 404
+        previous = store.get_config(target_config_id)
+        previous_version = previous[1] if previous else None
+        source_config, source_version, _is_system = source
+        promoted_payload = dict(source_config)
+        promoted_payload["config_id"] = target_config_id
+        recommender._resolve_config(config_id=target_config_id, ranking_config=promoted_payload)
+        target_version = store.create_or_update_config(target_config_id, promoted_payload, is_system=False)
+        _record_audit(
+            action="rollback",
+            resource_type="ranking_config",
+            resource_id=target_config_id,
+            payload=payload,
+            extra={
+                "source_config_id": rollback_source,
+                "source_version": source_version,
+                "version": target_version,
+                "previous_version": previous_version,
+                "rollback_origin": rollback_metadata,
+            },
+        )
+        return jsonify(
+            {
+                "api_version": "v1",
+                "target_config_id": target_config_id,
+                "target_version": target_version,
+                "source_config_id": rollback_source,
+                "source_version": source_version,
+                "previous_version": previous_version,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error rolling back ranking config: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
 
@@ -2465,7 +2926,25 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
         if excluded_sources:
             selected_sources = [source for source in selected_sources if source not in excluded_sources]
 
-    if selected_sources:
+    cache_key = _build_recommendation_cache_key(
+        namespace=f"query:{api_surface}",
+        payload={
+            "user_id": user_id,
+            "external_user_id": external_user_id,
+            "user_reads": user_reads,
+            "top_n": top_n,
+            "sources": selected_sources,
+            "config_id": effective_config_id,
+            "scenario_id": scenario_id,
+            "ranking_config": effective_ranking_config,
+            "experiment": experiment_assignment or {},
+        },
+    )
+    cached_recs = _get_cached_recommendations(cache_key)
+    cache_hit = cached_recs is not None
+    if cached_recs is not None:
+        recs = cached_recs
+    elif selected_sources:
         recs = recommender.recommend_for_user(
             effective_user_id,
             recommender.article_vectors,
@@ -2475,6 +2954,7 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
             config_id=effective_config_id,
             ranking_config=effective_ranking_config,
         )
+        _set_cached_recommendations(cache_key, recs)
     else:
         recs = []
     recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
@@ -2536,22 +3016,9 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
         "experiment_assignment": experiment_assignment,
         "cdp_context": cdp_context,
         "explainability_schema_version": "v2",
+        "cache_hit": cache_hit,
         "recommendations": recs,
     }
-
-
-@app.route("/api/recommendations/query", methods=["POST"])
-def query_recommendations():
-    if not recommender or not store:
-        return jsonify({"error": "Recommender not initialized"}), 500
-
-    try:
-        payload = request.get_json() or {}
-        return jsonify(_execute_recommendation_query(payload, api_surface="query"))
-    except Exception as e:
-        logger.error(f"Error querying recommendations: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 400
 
 
 def _execute_recommendation_diagnostics(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2628,413 +3095,27 @@ def _execute_recommendation_diagnostics(payload: Dict[str, Any]) -> Dict[str, An
     }
 
 
-@app.route("/api/recommendations/why-not", methods=["POST"])
-def why_not_recommendation():
-    if not recommender or not store:
-        return jsonify({"error": "Recommender not initialized"}), 500
-    try:
-        payload = request.get_json() or {}
-        target_article_id = str(payload.get("article_id", "")).strip() or None
-        response = _execute_recommendation_diagnostics(payload)
-        selected = {str(item.get("article_id")): idx + 1 for idx, item in enumerate(response.get("recommendations") or [])}
-        pre_excluded = response.get("diagnostics", {}).get("excluded") or []
-        scenario_decisions = (response.get("scenario_trace") or {}).get("decisions") or []
-
-        reason_index: Dict[str, Dict[str, Any]] = {}
-        for item in pre_excluded:
-            aid = str(item.get("article_id") or "").strip()
-            if aid and aid not in reason_index:
-                reason_index[aid] = {"stage": "ranking", **item}
-        for item in scenario_decisions:
-            aid = str(item.get("article_id") or "").strip()
-            if aid and item.get("status") == "filtered":
-                reason_index[aid] = {
-                    "stage": "scenario",
-                    "reason_code": item.get("reason"),
-                    "score_before": item.get("score_before"),
-                }
-
-        if target_article_id:
-            shown_rank = selected.get(target_article_id)
-            return jsonify(
-                {
-                    "api_version": "v1",
-                    "article_id": target_article_id,
-                    "shown": bool(shown_rank),
-                    "rank": shown_rank,
-                    "reason": (None if shown_rank else reason_index.get(target_article_id, {"reason_code": "not_in_candidate_pool"})),
-                    "context": {
-                        "config_id": response.get("config_id"),
-                        "scenario_id": response.get("scenario_id"),
-                        "selected_sources": response.get("selected_sources"),
-                    },
-                }
-            )
-
-        reason_counts: Dict[str, int] = {}
-        for item in reason_index.values():
-            reason = str(item.get("reason_code") or "unknown")
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        return jsonify(
-            {
-                "api_version": "v1",
-                "explainability_schema_version": "v2",
-                "reason_counts": reason_counts,
-                "excluded_samples": [{"article_id": aid, **info} for aid, info in list(reason_index.items())[:50]],
-                "selected_count": len(selected),
-                "context": {
-                    "config_id": response.get("config_id"),
-                    "scenario_id": response.get("scenario_id"),
-                    "selected_sources": response.get("selected_sources"),
-                },
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error computing why-not recommendation: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 400
+app.config["APP_HELPERS"].update(
+    {
+        "execute_recommendation_query": _execute_recommendation_query,
+        "execute_recommendation_diagnostics": _execute_recommendation_diagnostics,
+        "build_run_decision_flow": _build_run_decision_flow,
+        "read_idempotency_key": _read_idempotency_key,
+        "resolve_effective_user_id": _resolve_effective_user_id,
+        "parse_sources_param": _parse_sources_param,
+        "build_decision_context": _build_decision_context,
+        "apply_scenario_rules": _apply_scenario_rules,
+    }
+)
 
 
-@app.route("/api/explainability/schema", methods=["GET"])
-def explainability_schema():
-    return jsonify(
-        {
-            "api_version": "v1",
-            "schema_version": "v2",
-            "ranking_reason_codes": [
-                "hard_max_age_days",
-                "min_freshness",
-                "dedup_title",
-                "dedup_url",
-                "cap_source",
-                "cap_topic",
-                "cap_section",
-            ],
-            "scenario_reason_codes": [
-                "source_not_included",
-                "source_excluded",
-                "section_not_included",
-                "section_excluded",
-                "article_excluded",
-                "keyword_not_included",
-                "keyword_excluded",
-                "too_old",
-                "below_min_freshness",
-                "below_min_score",
-                "dedup_title",
-                "dedup_url",
-                "cap_source",
-                "cap_topic",
-                "cap_section",
-            ],
-            "recommendation_fields": [
-                "features",
-                "feature_contributions",
-                "explanation",
-                "explanation_details",
-                "scenario_boost",
-            ],
-        }
-    )
+from routes.recommendations import recommendations_blueprint
 
+app.register_blueprint(recommendations_blueprint)
 
-@app.route("/api/recommendations/batch", methods=["POST"])
-def query_recommendations_batch():
-    if not recommender or not store:
-        return jsonify({"error": "Recommender not initialized"}), 500
-    try:
-        started_at = datetime.now()
-        payload = request.get_json() or {}
-        requests_payload = payload.get("requests") or []
-        if not isinstance(requests_payload, list) or not requests_payload:
-            return jsonify({"error": "requests must be a non-empty array"}), 400
-        if len(requests_payload) > 100:
-            return jsonify({"error": "Maximum batch size is 100"}), 400
-        continue_on_error = bool(payload.get("continue_on_error", True))
+from routes.events import events_blueprint
 
-        results = []
-        success_count = 0
-        for index, item in enumerate(requests_payload):
-            if not isinstance(item, dict):
-                error_payload = {
-                    "index": index,
-                    "request_id": None,
-                    "status": "error",
-                    "error": "Each request item must be an object",
-                }
-                results.append(error_payload)
-                if not continue_on_error:
-                    return jsonify(
-                        {
-                            "api_version": "v1",
-                            "count": len(requests_payload),
-                            "success_count": success_count,
-                            "error_count": len(results) - success_count,
-                            "results": results,
-                        }
-                    ), 400
-                continue
-
-            request_id = str(item.get("request_id", "")).strip() or None
-            try:
-                result = _execute_recommendation_query(item, api_surface="batch")
-                results.append(
-                    {
-                        "index": index,
-                        "request_id": request_id,
-                        "status": "ok",
-                        "result": result,
-                    }
-                )
-                success_count += 1
-            except Exception as exc:
-                results.append(
-                    {
-                        "index": index,
-                        "request_id": request_id,
-                        "status": "error",
-                        "error": str(exc),
-                    }
-                )
-                if not continue_on_error:
-                    return jsonify(
-                        {
-                            "api_version": "v1",
-                            "count": len(requests_payload),
-                            "success_count": success_count,
-                            "error_count": len(results) - success_count,
-                            "results": results,
-                        }
-                    ), 400
-
-        return jsonify(
-            {
-                "api_version": "v1",
-                "count": len(requests_payload),
-                "success_count": success_count,
-                "error_count": len(results) - success_count,
-                "duration_ms": int((datetime.now() - started_at).total_seconds() * 1000),
-                "results": results,
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error running batch recommendations: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/api/recommendation-runs")
-def list_recommendation_runs():
-    if not store:
-        return jsonify({"error": "Store unavailable"}), 500
-
-    try:
-        limit = max(1, min(200, int(request.args.get("limit", 20))))
-        offset = max(0, int(request.args.get("offset", 0)))
-        rows = store.list_runs(limit=limit + 1, offset=offset)
-        has_more = len(rows) > limit
-        runs = rows[:limit]
-        return jsonify(
-            {
-                "runs": runs,
-                "count": len(runs),
-                "limit": limit,
-                "offset": offset,
-                "has_more": has_more,
-                "next_offset": (offset + limit) if has_more else None,
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error listing runs: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/recommendation-runs/<run_id>")
-def get_recommendation_run(run_id):
-    if not store:
-        return jsonify({"error": "Store unavailable"}), 500
-
-    run = store.get_run(run_id)
-    if not run:
-        return jsonify({"error": "Run not found"}), 404
-    return jsonify(run)
-
-
-@app.route("/api/recommendation-runs/<run_id>/decision-flow")
-def get_recommendation_run_decision_flow(run_id):
-    if not store:
-        return jsonify({"error": "Store unavailable"}), 500
-
-    run = store.get_run(run_id)
-    if not run:
-        return jsonify({"error": "Run not found"}), 404
-    return jsonify(_build_run_decision_flow(run))
-
-
-@app.route("/api/recommendations/cms", methods=["POST"])
-@app.route("/api/v1/recommendations/cms", methods=["POST"])
-def recommendations_cms():
-    """CMS-oriented recommendation endpoint with external ID + compact response payload."""
-    if not recommender or not store:
-        return jsonify({"error": "Recommender not initialized"}), 500
-
-    try:
-        started_at = datetime.now()
-        payload = request.get_json() or {}
-        idempotency_key = _read_idempotency_key(payload)
-        if idempotency_key:
-            cached = store.get_idempotency_record("recommendations_cms", idempotency_key)
-            if cached:
-                response = jsonify(cached["response"])
-                response.headers["X-Idempotent-Replay"] = "true"
-                return response, int(cached["status_code"])
-        data = payload.get("request") if isinstance(payload.get("request"), dict) else payload
-        user_id = str(data.get("user_id", "anonymous")).strip() or "anonymous"
-        external_user_id = str(data.get("external_user_id", "")).strip() or None
-        effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
-        top_n = max(1, min(20, int(data.get("limit", data.get("top_n", 5)))))
-        user_reads = data.get("user_reads") or recommender.user_profiles.get(effective_user_id, [])
-        if not user_reads:
-            user_reads = recommender.user_profiles.get(user_id, [])
-        requested_sources = data.get("sources") or []
-        config_explicit = bool(str(data.get("config_id", "")).strip())
-        config_id = str(data.get("config_id", "balanced")).strip() or "balanced"
-        experiment = data.get("experiment")
-        scenario_id = str(data.get("scenario_id", "")).strip() or None
-        scenario_explicit = bool(scenario_id)
-        cdp_context = _resolve_cdp_personalization(
-            external_user_id=external_user_id,
-            requested_sources=requested_sources,
-            scenario_id=scenario_id,
-            config_id=config_id,
-            scenario_explicit=scenario_explicit,
-            config_explicit=config_explicit,
-        )
-        requested_sources = cdp_context.get("requested_sources") or requested_sources
-        if not scenario_explicit and cdp_context.get("selected_scenario_id"):
-            scenario_id = cdp_context.get("selected_scenario_id")
-        if not config_explicit and cdp_context.get("selected_config_id"):
-            config_id = cdp_context.get("selected_config_id")
-        scenario = store.get_scenario(scenario_id) if scenario_id else None
-        if scenario and scenario.get("rule_set", {}).get("include_sources") and not requested_sources:
-            requested_sources = scenario["rule_set"]["include_sources"]
-        if scenario and scenario.get("rule_set", {}).get("ranking_config_id"):
-            config_id = scenario["rule_set"]["ranking_config_id"]
-
-        experiment_assignment = _resolve_experiment_assignment(experiment, effective_user_id)
-        if experiment_assignment:
-            if experiment_assignment.get("selected_scenario_id"):
-                scenario_id = experiment_assignment["selected_scenario_id"]
-                scenario = store.get_scenario(scenario_id) if scenario_id else None
-            if experiment_assignment.get("selected_config_id"):
-                config_id = experiment_assignment["selected_config_id"]
-            if experiment_assignment.get("selected_sources"):
-                requested_sources = experiment_assignment["selected_sources"]
-
-        decision_context = _build_decision_context(requested_sources, config_id, None)
-        selected_sources = decision_context["selected_sources"]
-        effective_ranking_config = decision_context["effective_ranking_config"]
-        cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
-        if cdp_source_overrides:
-            source_weights = dict(effective_ranking_config.get("source_weights") or {})
-            for source, weight in cdp_source_overrides.items():
-                if source in selected_sources and weight > 0:
-                    source_weights[source] = float(weight)
-            effective_ranking_config["source_weights"] = source_weights
-        recs = recommender.recommend_for_user(
-            effective_user_id,
-            recommender.article_vectors,
-            user_reads,
-            top_n=top_n,
-            sources=selected_sources,
-            config_id=decision_context["effective_config_id"],
-            ranking_config=effective_ranking_config,
-        ) if selected_sources else []
-        recs, scenario_trace = _apply_scenario_rules(recs, scenario, include_decisions=True)
-        recs = recs[:top_n]
-
-        run_id = store.persist_recommendation_run(
-            user_id=effective_user_id,
-            config_id=decision_context["effective_config_id"],
-            config_version=decision_context["config_version"],
-            request_payload={
-                "user_id": user_id,
-                "external_user_id": external_user_id,
-                "effective_user_id": effective_user_id,
-                "scenario_id": scenario_id,
-                "sources": selected_sources,
-                "top_n": top_n,
-                "api_surface": "cms",
-                "scenario_trace": scenario_trace,
-                "experiment_assignment": experiment_assignment,
-                "cdp_context": cdp_context,
-            },
-            recommendations=recs,
-            request_duration_ms=int((datetime.now() - started_at).total_seconds() * 1000),
-        )
-
-        store.record_events(
-            [
-                {
-                    "event_type": "impression",
-                    "run_id": run_id,
-                    "article_id": rec.get("article_id"),
-                    "scenario_id": scenario_id,
-                    "user_id": effective_user_id,
-                    "external_user_id": external_user_id,
-                    "rank_position": idx,
-                    "metadata": {"surface": "cms", "placement": data.get("placement")},
-                }
-                for idx, rec in enumerate(recs, start=1)
-            ]
-        )
-
-        response_payload = {
-            "api_version": "v1",
-            "request_id": run_id,
-            "user": {
-                "user_id": user_id,
-                "external_user_id": external_user_id,
-                "effective_user_id": effective_user_id,
-            },
-            "placement": data.get("placement"),
-            "scenario_id": scenario_id,
-            "config_id": decision_context["effective_config_id"],
-            "config_version": decision_context["config_version"],
-            "items": [
-                {
-                    "rank": idx,
-                    "article_id": rec.get("article_id"),
-                    "title": rec.get("title"),
-                    "url": rec.get("url"),
-                    "source": rec.get("source"),
-                    "score": rec.get("score"),
-                    "explanation": rec.get("explanation"),
-                    "feature_contributions": rec.get("feature_contributions"),
-                }
-                for idx, rec in enumerate(recs, start=1)
-            ],
-            "trace": {
-                "selected_sources": selected_sources,
-                "source_defaults_applied": decision_context["source_defaults_applied"],
-                "scenario_trace": scenario_trace,
-                "experiment_assignment": experiment_assignment,
-                "cdp_context": cdp_context,
-            },
-        }
-        if idempotency_key:
-            store.save_idempotency_record(
-                endpoint="recommendations_cms",
-                key=idempotency_key,
-                status_code=200,
-                response_payload=response_payload,
-            )
-        return jsonify(response_payload)
-    except Exception as e:
-        logger.error(f"Error in CMS recommendations endpoint: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 400
+app.register_blueprint(events_blueprint)
 
 
 @app.route("/api/scenarios/<scenario_id>/simulate", methods=["POST"])
@@ -3776,186 +3857,6 @@ def compare_offline_quality_snapshots():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/similar/<article_id>")
-def get_similar_articles(article_id):
-    if not recommender:
-        return jsonify({"error": "Recommender not initialized"}), 500
-
-    try:
-        top_n = int(request.args.get("top_n", 5))
-        config_id = request.args.get("config_id", "balanced")
-        requested_sources = _parse_sources_param(request.args.get("sources", ""))
-        decision_context = _build_decision_context(requested_sources, config_id, None)
-        effective_config_id = decision_context["effective_config_id"]
-        selected_sources = decision_context["selected_sources"]
-        effective_ranking_config = decision_context["effective_ranking_config"]
-
-        if selected_sources:
-            similar_articles = recommender.recommend_for_user(
-                "demo_user",
-                recommender.article_vectors,
-                [article_id],
-                top_n=top_n,
-                sources=selected_sources,
-                config_id=effective_config_id,
-                ranking_config=effective_ranking_config,
-            )
-        else:
-            similar_articles = []
-
-        for article in similar_articles:
-            similar_id = article["article_id"]
-            if similar_id in recommender.article_vectors:
-                article["content"] = recommender.article_vectors[similar_id]["metadata"].get("content", "")
-
-        return jsonify(similar_articles)
-    except Exception as e:
-        logger.error(f"Error getting similar articles: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/api/recommendation-context", methods=["POST"])
-def recommendation_context():
-    if not recommender or not store:
-        return jsonify({"error": "Recommender not initialized"}), 500
-
-    try:
-        payload = request.get_json() or {}
-        requested_sources = payload.get("sources") or []
-        config_explicit = bool(str(payload.get("config_id", "")).strip())
-        config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
-        ranking_config = payload.get("ranking_config")
-        external_user_id = str(payload.get("external_user_id", "")).strip() or None
-        scenario_id = (payload.get("scenario_id") or "").strip() or None
-        scenario_explicit = bool(scenario_id)
-        cdp_context = _resolve_cdp_personalization(
-            external_user_id=external_user_id,
-            requested_sources=requested_sources,
-            scenario_id=scenario_id,
-            config_id=config_id,
-            scenario_explicit=scenario_explicit,
-            config_explicit=config_explicit,
-        )
-        requested_sources = cdp_context.get("requested_sources") or requested_sources
-        if not scenario_explicit and cdp_context.get("selected_scenario_id"):
-            scenario_id = cdp_context.get("selected_scenario_id")
-        if not config_explicit and cdp_context.get("selected_config_id"):
-            config_id = cdp_context.get("selected_config_id")
-        scenario = store.get_scenario(scenario_id) if scenario_id else None
-        if scenario and scenario.get("rule_set", {}).get("include_sources") and not requested_sources:
-            requested_sources = scenario["rule_set"]["include_sources"]
-        if scenario and scenario.get("rule_set", {}).get("ranking_config_id") and not ranking_config:
-            config_id = scenario["rule_set"]["ranking_config_id"]
-        context = _build_decision_context(requested_sources, config_id, ranking_config)
-        cdp_source_overrides = cdp_context.get("source_weight_overrides") or {}
-        if cdp_source_overrides:
-            source_weights = dict(context["effective_ranking_config"].get("source_weights") or {})
-            for source, weight in cdp_source_overrides.items():
-                if source in context["selected_sources"] and weight > 0:
-                    source_weights[source] = float(weight)
-            context["effective_ranking_config"]["source_weights"] = source_weights
-        context["scenario_id"] = scenario_id
-        context["scenario"] = scenario
-        context["cdp_context"] = cdp_context
-        if scenario:
-            context["scenario_rule_set"] = scenario.get("rule_set", {})
-        return jsonify(context)
-    except Exception as e:
-        logger.error(f"Error building recommendation context: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/api/events", methods=["GET", "POST"])
-@app.route("/api/v1/events", methods=["GET", "POST"])
-def recommendation_events():
-    if not store:
-        return jsonify({"error": "Store unavailable"}), 500
-
-    if request.method == "GET":
-        try:
-            limit = max(1, min(1000, int(request.args.get("limit", 100))))
-            offset = max(0, int(request.args.get("offset", 0)))
-            scenario_id = request.args.get("scenario_id")
-            event_type = request.args.get("event_type")
-            days = int(request.args.get("days")) if request.args.get("days") else None
-            rows = store.list_events(
-                limit=limit + 1,
-                offset=offset,
-                scenario_id=scenario_id,
-                event_type=event_type,
-                days=days,
-            )
-            has_more = len(rows) > limit
-            events = rows[:limit]
-            return jsonify(
-                {
-                    "api_version": "v1",
-                    "events": events,
-                    "count": len(events),
-                    "limit": limit,
-                    "offset": offset,
-                    "has_more": has_more,
-                    "next_offset": (offset + limit) if has_more else None,
-                }
-            )
-        except Exception as e:
-            logger.error(f"Error listing events: {str(e)}")
-            logger.error(traceback.format_exc())
-            return jsonify({"error": str(e)}), 500
-
-    try:
-        payload = request.get_json() or {}
-        idempotency_key = _read_idempotency_key(payload)
-        if idempotency_key:
-            cached = store.get_idempotency_record("events_ingest", idempotency_key)
-            if cached:
-                response = jsonify(cached["response"])
-                response.headers["X-Idempotent-Replay"] = "true"
-                return response, int(cached["status_code"])
-        raw_events = payload.get("events")
-        if raw_events is None:
-            raw_events = [payload]
-
-        validated = []
-        for event in raw_events:
-            event_type = str(event.get("event_type", "")).strip()
-            if event_type not in {"impression", "click", "conversion"}:
-                raise ValueError("event_type must be one of: impression, click, conversion")
-            user_id = str(event.get("user_id", "anonymous")).strip() or "anonymous"
-            external_user_id = str(event.get("external_user_id", "")).strip() or None
-            effective_user_id = _resolve_effective_user_id(user_id, external_user_id)
-            validated.append(
-                {
-                    "event_type": event_type,
-                    "run_id": event.get("run_id"),
-                    "article_id": event.get("article_id"),
-                    "scenario_id": event.get("scenario_id"),
-                    "user_id": effective_user_id,
-                    "external_user_id": external_user_id,
-                    "rank_position": event.get("rank_position"),
-                    "event_value": float(event.get("event_value", 1.0)),
-                    "metadata": event.get("metadata") or {},
-                }
-            )
-
-        inserted = store.record_events(validated)
-        response_payload = {"api_version": "v1", "inserted": inserted}
-        if idempotency_key:
-            store.save_idempotency_record(
-                endpoint="events_ingest",
-                key=idempotency_key,
-                status_code=201,
-                response_payload=response_payload,
-            )
-        return jsonify(response_payload), 201
-    except Exception as e:
-        logger.error(f"Error recording events: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 400
-
-
 @app.route("/api/metrics/scenarios", methods=["GET"])
 def scenario_metrics():
     if not store:
@@ -4592,6 +4493,282 @@ def _compute_experiment_metrics(days: int, experiment_id: str, limit_runs: int, 
     }
 
 
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(float(value) / math.sqrt(2.0)))
+
+
+def _proportion_lift_confidence(
+    baseline_success: int,
+    baseline_total: int,
+    candidate_success: int,
+    candidate_total: int,
+) -> Dict[str, Optional[float]]:
+    if baseline_total <= 0 or candidate_total <= 0:
+        return {"baseline": None, "candidate": None, "lift": None, "p_value": None, "confidence": None}
+    baseline_rate = float(baseline_success) / float(baseline_total)
+    candidate_rate = float(candidate_success) / float(candidate_total)
+    lift = candidate_rate - baseline_rate
+    pooled_total = baseline_total + candidate_total
+    pooled = (baseline_success + candidate_success) / pooled_total if pooled_total else 0.0
+    se = math.sqrt(max(0.0, pooled * (1.0 - pooled) * ((1.0 / baseline_total) + (1.0 / candidate_total))))
+    if se <= 0:
+        p_value = 1.0
+    else:
+        z_score = lift / se
+        p_value = max(0.0, min(1.0, 2.0 * (1.0 - _normal_cdf(abs(z_score)))))
+    confidence = 1.0 - p_value
+    return {
+        "baseline": round(baseline_rate, 6),
+        "candidate": round(candidate_rate, 6),
+        "lift": round(lift, 6),
+        "p_value": round(p_value, 6),
+        "confidence": round(confidence, 6),
+    }
+
+
+def _compute_online_kpi_snapshot(
+    days: int = 30,
+    baseline_config_id: str = "balanced",
+    baseline_scenario_id: str = "default",
+    limit_runs: int = 1000,
+    limit_events: int = 100000,
+    stale_freshness_floor: float = 0.2,
+) -> Dict[str, Any]:
+    if not store:
+        return {
+            "window_days": days,
+            "summary": {},
+            "by_config": [],
+            "by_scenario": [],
+            "alerts": [],
+        }
+    days = max(1, min(365, int(days)))
+    limit_runs = max(10, min(20000, int(limit_runs)))
+    limit_events = max(1000, min(200000, int(limit_events)))
+    stale_freshness_floor = max(0.0, min(1.0, float(stale_freshness_floor)))
+
+    runs = store.list_runs_with_request(limit=limit_runs, offset=0, days=days)
+    run_map: Dict[str, Dict[str, Any]] = {}
+    for row in runs:
+        run_id = str(row.get("run_id") or "").strip()
+        if not run_id:
+            continue
+        req = row.get("request") or {}
+        run_map[run_id] = {
+            "config_id": str(row.get("config_id") or req.get("config_id") or "unknown").strip() or "unknown",
+            "scenario_id": str(req.get("scenario_id") or "default").strip() or "default",
+            "created_at": row.get("created_at"),
+        }
+
+    events = store.list_events(limit=limit_events, days=days)
+    overall = {
+        "runs": len(run_map),
+        "impressions": 0,
+        "clicks": 0,
+        "conversions": 0,
+        "sources": {},
+        "run_ids": set(),
+    }
+    by_config: Dict[str, Dict[str, Any]] = {}
+    by_scenario: Dict[str, Dict[str, Any]] = {}
+
+    def _bucket_for(container: Dict[str, Dict[str, Any]], key: str) -> Dict[str, Any]:
+        return container.setdefault(
+            key,
+            {
+                "key": key,
+                "runs": set(),
+                "impressions": 0,
+                "clicks": 0,
+                "conversions": 0,
+                "sources": {},
+                "run_ids": set(),
+            },
+        )
+
+    for event in events:
+        event_type = str(event.get("event_type") or "").strip()
+        if event_type not in {"impression", "click", "conversion"}:
+            continue
+        run_id = str(event.get("run_id") or "").strip()
+        if not run_id or run_id not in run_map:
+            continue
+        run_meta = run_map[run_id]
+        config_id = run_meta["config_id"]
+        scenario_id = run_meta["scenario_id"]
+        source = _resolve_event_source(event) or "unknown"
+
+        overall["run_ids"].add(run_id)
+        if event_type == "impression":
+            overall["impressions"] += 1
+            overall["sources"][source] = overall["sources"].get(source, 0) + 1
+        elif event_type == "click":
+            overall["clicks"] += 1
+        elif event_type == "conversion":
+            overall["conversions"] += 1
+
+        cfg_bucket = _bucket_for(by_config, config_id)
+        scn_bucket = _bucket_for(by_scenario, scenario_id)
+        for bucket in (cfg_bucket, scn_bucket):
+            bucket["runs"].add(run_id)
+            bucket["run_ids"].add(run_id)
+            if event_type == "impression":
+                bucket["impressions"] += 1
+                bucket["sources"][source] = bucket["sources"].get(source, 0) + 1
+            elif event_type == "click":
+                bucket["clicks"] += 1
+            elif event_type == "conversion":
+                bucket["conversions"] += 1
+
+    def _compute_stale_ratio(run_ids: set) -> float:
+        if not run_ids:
+            return 0.0
+        total_items = 0
+        stale_items = 0
+        for run_id in list(run_ids)[:500]:
+            run_detail = store.get_run(run_id)
+            if not run_detail:
+                continue
+            for item in run_detail.get("items") or []:
+                freshness = (item.get("features") or {}).get("freshness")
+                if not isinstance(freshness, (int, float)):
+                    continue
+                total_items += 1
+                if float(freshness) < stale_freshness_floor:
+                    stale_items += 1
+        return round((stale_items / total_items), 6) if total_items else 0.0
+
+    def _finalize_bucket(bucket: Dict[str, Any]) -> Dict[str, Any]:
+        impressions = int(bucket["impressions"])
+        clicks = int(bucket["clicks"])
+        conversions = int(bucket["conversions"])
+        source_counts = bucket.get("sources") or {}
+        top_source = max(source_counts.items(), key=lambda item: item[1]) if source_counts else None
+        top_source_share = (float(top_source[1]) / impressions) if (top_source and impressions > 0) else 0.0
+        return {
+            "key": bucket["key"],
+            "runs": len(bucket.get("runs") or []),
+            "impressions": impressions,
+            "clicks": clicks,
+            "conversions": conversions,
+            "ctr": round((clicks / impressions), 6) if impressions else 0.0,
+            "conversion_rate": round((conversions / clicks), 6) if clicks else 0.0,
+            "top_source": top_source[0] if top_source else None,
+            "top_source_share": round(top_source_share, 6),
+            "source_count": len(source_counts),
+            "stale_ratio": _compute_stale_ratio(bucket.get("run_ids") or set()),
+        }
+
+    config_rows = [_finalize_bucket(bucket) for bucket in by_config.values()]
+    scenario_rows = [_finalize_bucket(bucket) for bucket in by_scenario.values()]
+    config_rows.sort(key=lambda item: (item["impressions"], item["clicks"]), reverse=True)
+    scenario_rows.sort(key=lambda item: (item["impressions"], item["clicks"]), reverse=True)
+
+    baseline_config = next((row for row in config_rows if row["key"] == baseline_config_id), None)
+    baseline_scenario = next((row for row in scenario_rows if row["key"] == baseline_scenario_id), None)
+    if baseline_config:
+        for row in config_rows:
+            ctr_stats = _proportion_lift_confidence(
+                baseline_success=baseline_config["clicks"],
+                baseline_total=baseline_config["impressions"],
+                candidate_success=row["clicks"],
+                candidate_total=row["impressions"],
+            )
+            cvr_stats = _proportion_lift_confidence(
+                baseline_success=baseline_config["conversions"],
+                baseline_total=max(1, baseline_config["clicks"]),
+                candidate_success=row["conversions"],
+                candidate_total=max(1, row["clicks"]),
+            )
+            row["ctr_lift_vs_baseline"] = ctr_stats["lift"]
+            row["ctr_confidence"] = ctr_stats["confidence"]
+            row["conversion_lift_vs_baseline"] = cvr_stats["lift"]
+            row["conversion_confidence"] = cvr_stats["confidence"]
+    if baseline_scenario:
+        for row in scenario_rows:
+            ctr_stats = _proportion_lift_confidence(
+                baseline_success=baseline_scenario["clicks"],
+                baseline_total=baseline_scenario["impressions"],
+                candidate_success=row["clicks"],
+                candidate_total=row["impressions"],
+            )
+            row["ctr_lift_vs_baseline"] = ctr_stats["lift"]
+            row["ctr_confidence"] = ctr_stats["confidence"]
+
+    overall_top_source = max(overall["sources"].items(), key=lambda item: item[1]) if overall["sources"] else None
+    overall_stale_ratio = _compute_stale_ratio(overall["run_ids"])
+    summary = {
+        "runs": overall["runs"],
+        "runs_with_events": len(overall["run_ids"]),
+        "impressions": overall["impressions"],
+        "clicks": overall["clicks"],
+        "conversions": overall["conversions"],
+        "ctr": round((overall["clicks"] / overall["impressions"]), 6) if overall["impressions"] else 0.0,
+        "conversion_rate": round((overall["conversions"] / overall["clicks"]), 6) if overall["clicks"] else 0.0,
+        "top_source": overall_top_source[0] if overall_top_source else None,
+        "top_source_share": round((overall_top_source[1] / overall["impressions"]), 6) if (overall_top_source and overall["impressions"]) else 0.0,
+        "stale_ratio": overall_stale_ratio,
+        "baseline_config_id": baseline_config_id,
+        "baseline_scenario_id": baseline_scenario_id,
+    }
+    if baseline_config:
+        ctr_stats = _proportion_lift_confidence(
+            baseline_success=baseline_config["clicks"],
+            baseline_total=baseline_config["impressions"],
+            candidate_success=overall["clicks"],
+            candidate_total=overall["impressions"],
+        )
+        summary["ctr_lift_vs_baseline"] = ctr_stats["lift"]
+        summary["ctr_lift_confidence"] = ctr_stats["confidence"]
+    else:
+        summary["ctr_lift_vs_baseline"] = None
+        summary["ctr_lift_confidence"] = None
+
+    thresholds = store.get_alert_thresholds()
+    alerts = []
+    if summary["ctr"] < float(thresholds.get("min_ctr", 0.01)):
+        alerts.append({"metric": "ctr", "status": "warn", "value": summary["ctr"], "threshold": float(thresholds.get("min_ctr", 0.01))})
+    if summary["top_source_share"] > float(thresholds.get("max_source_top_share", 0.85)):
+        alerts.append(
+            {
+                "metric": "source_starvation",
+                "status": "warn",
+                "value": summary["top_source_share"],
+                "threshold": float(thresholds.get("max_source_top_share", 0.85)),
+            }
+        )
+    if summary["stale_ratio"] > float(thresholds.get("max_stale_ratio", 0.4)):
+        alerts.append(
+            {
+                "metric": "stale_ratio",
+                "status": "warn",
+                "value": summary["stale_ratio"],
+                "threshold": float(thresholds.get("max_stale_ratio", 0.4)),
+            }
+        )
+    if summary["ctr_lift_vs_baseline"] is not None and summary["ctr_lift_vs_baseline"] < float(
+        thresholds.get("min_ctr_lift_vs_baseline", -0.05)
+    ):
+        alerts.append(
+            {
+                "metric": "ctr_lift_vs_baseline",
+                "status": "warn",
+                "value": summary["ctr_lift_vs_baseline"],
+                "threshold": float(thresholds.get("min_ctr_lift_vs_baseline", -0.05)),
+            }
+        )
+
+    return {
+        "api_version": "v1",
+        "window_days": days,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "summary": summary,
+        "by_config": config_rows,
+        "by_scenario": scenario_rows,
+        "alerts": alerts,
+    }
+
+
 def _compute_recommendation_quality_metrics(
     recommendations: List[Dict[str, Any]],
     relevant_article_ids: set,
@@ -4767,6 +4944,33 @@ def metrics_experiments_compare():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/metrics/online-kpis", methods=["GET"])
+@app.route("/api/v1/metrics/online-kpis", methods=["GET"])
+def metrics_online_kpis():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        days = max(1, min(365, int(request.args.get("days", 30))))
+        baseline_config_id = str(request.args.get("baseline_config_id", "balanced")).strip() or "balanced"
+        baseline_scenario_id = str(request.args.get("baseline_scenario_id", "default")).strip() or "default"
+        limit_runs = max(10, min(20000, int(request.args.get("limit_runs", 1000))))
+        limit_events = max(1000, min(200000, int(request.args.get("limit_events", 100000))))
+        stale_freshness_floor = max(0.0, min(1.0, float(request.args.get("stale_freshness_floor", 0.2))))
+        payload = _compute_online_kpi_snapshot(
+            days=days,
+            baseline_config_id=baseline_config_id,
+            baseline_scenario_id=baseline_scenario_id,
+            limit_runs=limit_runs,
+            limit_events=limit_events,
+            stale_freshness_floor=stale_freshness_floor,
+        )
+        return jsonify(payload)
+    except Exception as e:
+        logger.error(f"Error computing online KPI metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/metrics/scenario-traces", methods=["GET"])
 def metrics_scenario_traces():
     if not store:
@@ -4908,6 +5112,31 @@ def metrics_rollups_rebuild():
         logger.error(f"Error rebuilding event rollups: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/rollups/rebuild-async", methods=["POST"])
+@app.route("/api/v1/metrics/rollups/rebuild-async", methods=["POST"])
+def metrics_rollups_rebuild_async():
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        payload = request.get_json(silent=True) or {}
+        days = max(1, min(365, int(payload.get("days", 30))))
+        job = _enqueue_rollup_rebuild(days=days, actor_id=_request_actor_id(payload))
+        return jsonify({"api_version": "v1", "queued": True, "job": job}), 202
+    except Exception as e:
+        logger.error(f"Error enqueuing rollup rebuild: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/metrics/rollups/rebuild-async/<job_id>", methods=["GET"])
+@app.route("/api/v1/metrics/rollups/rebuild-async/<job_id>", methods=["GET"])
+def metrics_rollups_rebuild_async_status(job_id: str):
+    row = _get_rollup_job(job_id)
+    if not row:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({"api_version": "v1", "job": row})
 
 
 @app.route("/api/observability/overview", methods=["GET"])
@@ -5066,6 +5295,12 @@ def alerts_thresholds():
             validated["max_rollup_lag_hours"] = float(threshold_values.get("max_rollup_lag_hours"))
         if "connector_blocker_rate" in threshold_values:
             validated["connector_blocker_rate"] = float(threshold_values.get("connector_blocker_rate"))
+        if "max_source_top_share" in threshold_values:
+            validated["max_source_top_share"] = float(threshold_values.get("max_source_top_share"))
+        if "max_stale_ratio" in threshold_values:
+            validated["max_stale_ratio"] = float(threshold_values.get("max_stale_ratio"))
+        if "min_ctr_lift_vs_baseline" in threshold_values:
+            validated["min_ctr_lift_vs_baseline"] = float(threshold_values.get("min_ctr_lift_vs_baseline"))
 
         if float(validated["recommendation_p95_ms"]) <= 0:
             return jsonify({"error": "recommendation_p95_ms must be > 0"}), 400
@@ -5077,6 +5312,12 @@ def alerts_thresholds():
             return jsonify({"error": "max_rollup_lag_hours must be > 0"}), 400
         if not (0 <= float(validated.get("connector_blocker_rate", 0.2)) <= 1):
             return jsonify({"error": "connector_blocker_rate must be in [0, 1]"}), 400
+        if not (0 <= float(validated.get("max_source_top_share", 0.85)) <= 1):
+            return jsonify({"error": "max_source_top_share must be in [0, 1]"}), 400
+        if not (0 <= float(validated.get("max_stale_ratio", 0.4)) <= 1):
+            return jsonify({"error": "max_stale_ratio must be in [0, 1]"}), 400
+        if not (-1 <= float(validated.get("min_ctr_lift_vs_baseline", -0.05)) <= 1):
+            return jsonify({"error": "min_ctr_lift_vs_baseline must be in [-1, 1]"}), 400
 
         stored = store.upsert_alert_thresholds(validated)
         _record_audit(

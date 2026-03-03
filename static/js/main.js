@@ -19,6 +19,8 @@ let reportingLastPayload = null;
 let reportingLastAttribution = null;
 let reportingLastIdentity = null;
 let reportingLastScenarioTraces = null;
+let reportingOnlineKpi = null;
+let reportingOnlineKpiSelectedConfig = '';
 let reportingLastIdentityDiagnostics = null;
 let reportingLastExperiments = null;
 let reportingLastExperimentComparison = null;
@@ -30,6 +32,11 @@ let recommendationRuns = [];
 let rankingLabContexts = [];
 let rankingLabLastComparison = null;
 let rankingLabEvaluationsById = {};
+let articleSearchTerm = '';
+let articleSourceFilter = 'all';
+let articleSortMode = 'newest';
+let articlePageSize = 20;
+let articleCurrentPage = 1;
 const GUARD_PRESET_STORAGE_KEY = 'reporting_guard_preset_v1';
 const RANKING_LAB_BOOKMARKS_STORAGE_KEY = 'ranking_lab_context_sets_v1';
 const GUARD_PRESETS = {
@@ -76,6 +83,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('alert-incidents')) loadAlertIncidents();
     if (hasElement('cleanup-status')) loadCleanupStatus();
     if (hasElement('rollups-status')) loadRollupsStatus();
+    if (hasElement('events-queue-status')) loadEventsQueueStatus();
+    if (hasElement('events-queue-status')) setInterval(loadEventsQueueStatus, 5000);
+    setInterval(() => {
+        if (rollupAsyncJobId) {
+            loadRollupAsyncStatus().catch(() => {});
+        }
+    }, 3000);
     if (hasElement('engine-config-snapshot')) loadEngineConfigSnapshot();
     if (hasElement('audit-logs-list')) loadAuditLogs();
     if (hasElement('run-list')) loadRecommendationRuns();
@@ -103,6 +117,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('reporting-summary')) {
         loadReportingWorkspace();
         loadQualitySnapshotHistory();
+    }
+    if (hasElement('online-kpi-summary')) {
+        loadOnlineKpis();
     }
     if (hasElement('guard-preset')) {
         loadGuardPresetFromStorage();
@@ -138,7 +155,11 @@ async function loadArticles() {
             throw new Error('Invalid response format');
         }
 
+        refreshArticleSourceFilterOptions();
         displayArticles();
+        if (!currentArticle && articles.length) {
+            selectArticleById(articles[0].article_id);
+        }
     } catch (error) {
         console.error('Error loading articles:', error);
         showError('Failed to load articles: ' + error.message);
@@ -729,6 +750,7 @@ async function loadRankingConfigs() {
             populateRankingConfigEditor(select.value);
         }
         renderConfigCompareSelectors();
+        renderOnlineKpiSelectors();
         renderRankingLabConfigSelectors();
         renderRuleBuilderConfigOptions();
         loadDecisionContext();
@@ -739,6 +761,7 @@ async function loadRankingConfigs() {
         rankingConfigs = {};
         renderRuleBuilderConfigOptions();
         renderConfigCompareSelectors();
+        renderOnlineKpiSelectors();
         renderRankingLabConfigSelectors();
         if (select) populateRankingConfigEditor('balanced');
     }
@@ -1009,6 +1032,7 @@ async function loadScenarios() {
             applyScenarioToEditor(selected || null);
         }
         renderReportingScenarioOptions();
+        renderOnlineKpiSelectors();
         loadDecisionContext();
         loadScenarioSourceMetrics();
     } catch (error) {
@@ -1219,10 +1243,46 @@ async function simulateSelectedScenario() {
     }
     const payload = await response.json();
     const trace = payload.scenario_trace || {};
+    const baseRows = (payload.base_top || []).map((item, idx) => `
+        <tr>
+            <td>${idx + 1}</td>
+            <td>${item.article_id || 'n/a'}</td>
+            <td>${item.source || 'n/a'}</td>
+            <td>${Number(item.score || 0).toFixed(4)}</td>
+        </tr>
+    `).join('');
+    const scenarioRows = (payload.scenario_top || []).map((item, idx) => `
+        <tr>
+            <td>${idx + 1}</td>
+            <td>${item.article_id || 'n/a'}</td>
+            <td>${item.source || 'n/a'}</td>
+            <td>${Number(item.score || 0).toFixed(4)}</td>
+        </tr>
+    `).join('');
     output.innerHTML = `
         <div><strong>Base:</strong> ${payload.base_count} | <strong>After scenario:</strong> ${payload.scenario_count}</div>
         <div><strong>Filtered out:</strong> ${trace.filtered_out ?? 0}</div>
         <div><strong>Reasons:</strong> <code>${JSON.stringify(trace.reasons || {})}</code></div>
+        <div class="row g-2 mt-2">
+            <div class="col-md-6">
+                <div class="small fw-semibold mb-1">Before Scenario</div>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>#</th><th>Article</th><th>Source</th><th>Score</th></tr></thead>
+                        <tbody>${baseRows || '<tr><td colspan="4" class="text-muted">No base items.</td></tr>'}</tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="small fw-semibold mb-1">After Scenario</div>
+                <div class="table-responsive">
+                    <table class="table table-sm mb-0">
+                        <thead><tr><th>#</th><th>Article</th><th>Source</th><th>Score</th></tr></thead>
+                        <tbody>${scenarioRows || '<tr><td colspan="4" class="text-muted">No scenario items.</td></tr>'}</tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
     `;
 }
 
@@ -1318,6 +1378,9 @@ async function loadAlertThresholds() {
         document.getElementById('threshold-blocker-rate').value = Number(alertThresholds.connector_blocker_rate ?? 0.2);
         document.getElementById('threshold-rollup-lag-hours').value = Number(alertThresholds.max_rollup_lag_hours ?? 24);
         document.getElementById('threshold-min-ctr').value = Number(alertThresholds.min_ctr ?? 0.01);
+        document.getElementById('threshold-max-source-top-share').value = Number(alertThresholds.max_source_top_share ?? 0.85);
+        document.getElementById('threshold-max-stale-ratio').value = Number(alertThresholds.max_stale_ratio ?? 0.4);
+        document.getElementById('threshold-min-ctr-lift').value = Number(alertThresholds.min_ctr_lift_vs_baseline ?? -0.05);
     } catch (error) {
         console.error('Error loading alert thresholds:', error);
         document.getElementById('alert-thresholds-status').textContent = `Threshold load failed: ${error.message}`;
@@ -1330,6 +1393,9 @@ async function saveAlertThresholds() {
     const connectorBlockerRate = Number(document.getElementById('threshold-blocker-rate').value);
     const maxRollupLagHours = Number(document.getElementById('threshold-rollup-lag-hours').value);
     const minCtr = Number(document.getElementById('threshold-min-ctr').value);
+    const maxSourceTopShare = Number(document.getElementById('threshold-max-source-top-share').value);
+    const maxStaleRatio = Number(document.getElementById('threshold-max-stale-ratio').value);
+    const minCtrLiftVsBaseline = Number(document.getElementById('threshold-min-ctr-lift').value);
     const statusEl = document.getElementById('alert-thresholds-status');
     statusEl.textContent = 'Saving thresholds...';
     const response = await fetch('/api/alerts/thresholds', {
@@ -1341,7 +1407,10 @@ async function saveAlertThresholds() {
                 connector_failure_rate: connectorFailureRate,
                 connector_blocker_rate: connectorBlockerRate,
                 max_rollup_lag_hours: maxRollupLagHours,
-                min_ctr: minCtr
+                min_ctr: minCtr,
+                max_source_top_share: maxSourceTopShare,
+                max_stale_ratio: maxStaleRatio,
+                min_ctr_lift_vs_baseline: minCtrLiftVsBaseline
             }
         })
     });
@@ -2028,6 +2097,101 @@ async function loadRollupsStatus() {
     }
 }
 
+let rollupAsyncJobId = null;
+
+async function loadEventsQueueStatus() {
+    const container = document.getElementById('events-queue-status');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/events/ingest-queue-status');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to load queue status');
+        }
+        const payload = await response.json();
+        const queue = payload.queue || {};
+        container.innerHTML = `
+            <div><strong>Enabled:</strong> ${queue.enabled ? 'yes' : 'no'}</div>
+            <div><strong>Running:</strong> ${queue.running ? 'yes' : 'no'}</div>
+            <div><strong>Queue size:</strong> ${queue.queue_size ?? 0}</div>
+            <div><strong>Enqueued:</strong> ${queue.enqueued_total ?? 0} | <strong>Processed:</strong> ${queue.processed_total ?? 0} | <strong>Failed:</strong> ${queue.failed_total ?? 0}</div>
+            <div><strong>Last processed:</strong> ${queue.last_processed_at || 'n/a'}</div>
+        `;
+    } catch (error) {
+        container.textContent = `Events queue unavailable: ${error.message}`;
+    }
+}
+
+async function enqueueEventsSample() {
+    const countRaw = Number(document.getElementById('events-queue-sample-size')?.value || 5);
+    const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(100, Math.round(countRaw))) : 5;
+    const now = Date.now();
+    const runSuffix = String(now % 1000000000000).padStart(12, '0');
+    const runId = `00000000-0000-0000-0000-${runSuffix}`;
+    const events = Array.from({ length: count }).map((_, idx) => ({
+        event_type: 'impression',
+        run_id: runId,
+        article_id: `sample_article_${idx + 1}`,
+        scenario_id: 'default',
+        user_id: `sample_user_${idx + 1}`,
+        external_user_id: `sample_ext_${idx + 1}`,
+        rank_position: idx + 1,
+        event_value: 1.0,
+        metadata: { source: 'sample.source.local', synthetic: true },
+    }));
+    const response = await fetch('/api/events/ingest-async', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ events, actor_id: getOperatorId() || undefined }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to enqueue sample events');
+    }
+    await loadEventsQueueStatus();
+}
+
+async function rebuildRollupsAsync() {
+    const statusEl = document.getElementById('rollups-async-status');
+    if (statusEl) statusEl.textContent = 'Queueing async rollup rebuild...';
+    const daysRaw = Number(document.getElementById('rollups-days')?.value || 30);
+    const days = Number.isFinite(daysRaw) ? Math.max(1, Math.min(365, Math.round(daysRaw))) : 30;
+    const response = await fetch('/api/metrics/rollups/rebuild-async', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ days, actor_id: getOperatorId() || undefined })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to queue async rebuild');
+    }
+    rollupAsyncJobId = payload.job?.job_id || null;
+    await loadRollupAsyncStatus();
+}
+
+async function loadRollupAsyncStatus() {
+    const statusEl = document.getElementById('rollups-async-status');
+    if (!statusEl || !rollupAsyncJobId) return;
+    const response = await fetch(`/api/metrics/rollups/rebuild-async/${encodeURIComponent(rollupAsyncJobId)}`);
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to load async rollup status');
+    }
+    const job = payload.job || {};
+    statusEl.innerHTML = `
+        <div><strong>Job:</strong> <code>${job.job_id || 'n/a'}</code></div>
+        <div><strong>Status:</strong> ${job.status || 'unknown'} | <strong>Days:</strong> ${job.days ?? 'n/a'}</div>
+        <div><strong>Created:</strong> ${job.created_at || 'n/a'} | <strong>Updated:</strong> ${job.updated_at || 'n/a'}</div>
+        ${job.error ? `<div class="text-danger"><strong>Error:</strong> ${job.error}</div>` : ''}
+    `;
+    if (job.status === 'completed' || job.status === 'failed') {
+        if (job.status === 'completed') {
+            await loadRollupsStatus();
+        }
+        rollupAsyncJobId = null;
+    }
+}
+
 async function rebuildRollups() {
     const container = document.getElementById('rollups-status');
     if (container) container.textContent = 'Rebuilding rollups...';
@@ -2212,7 +2376,10 @@ async function runEmbeddingJob(forceUpdate = false) {
 
 async function loadEngineConfigSnapshot() {
     const container = document.getElementById('engine-config-snapshot');
-    if (!container) return;
+    const summary = document.getElementById('engine-config-summary');
+    const kpis = document.getElementById('engine-config-kpis');
+    const details = document.getElementById('engine-config-details');
+    if (!container || !summary || !kpis || !details) return;
     try {
         const response = await fetch('/api/engine/config');
         if (!response.ok) {
@@ -2221,7 +2388,47 @@ async function loadEngineConfigSnapshot() {
         }
         const payload = await response.json();
         container.textContent = JSON.stringify(payload, null, 2);
+        const rankingConfigs = payload.ranking_configs || {};
+        const configIds = Object.keys(rankingConfigs);
+        const scenarios = payload.scenarios || [];
+        const enabledScenarios = scenarios.filter(item => item && item.enabled).length;
+        const disabledScenarios = Math.max(0, scenarios.length - enabledScenarios);
+        const sources = payload.sources || [];
+        const scheduler = payload.scheduler || {};
+        const cdpScheduler = payload.cdp_scheduler || {};
+        const cdp = payload.cdp || {};
+        const topConfigs = configIds.slice(0, 8).map(id => `<span class="badge text-bg-light border me-1 mb-1">${id}</span>`).join('');
+        const topScenarios = scenarios.slice(0, 8).map(item => (
+            `<span class="badge ${item.enabled ? 'text-bg-success' : 'text-bg-secondary'} me-1 mb-1">${item.scenario_id || 'n/a'}</span>`
+        )).join('');
+        kpis.innerHTML = [
+            `<span class="badge text-bg-light border">Sources ${sources.length}</span>`,
+            `<span class="badge text-bg-light border">Ranking configs ${configIds.length}</span>`,
+            `<span class="badge text-bg-success">Enabled scenarios ${enabledScenarios}</span>`,
+            `<span class="badge text-bg-secondary">Disabled scenarios ${disabledScenarios}</span>`,
+            `<span class="badge ${cdp.enabled ? 'text-bg-primary' : 'text-bg-light border'}">CDP ${cdp.enabled ? 'on' : 'off'}</span>`
+        ].join('');
+        summary.innerHTML = `
+            Updated <strong>${payload.generated_at || 'n/a'}</strong> | API ${payload.api_version || 'n/a'}<br>
+            Connector scheduler: ${scheduler.running ? '<span class="text-success">running</span>' : '<span class="text-muted">idle</span>'}
+            (runs ${scheduler.runs_total ?? 0}, errors ${scheduler.errors_total ?? 0}) |
+            CDP scheduler: ${cdpScheduler.running ? '<span class="text-success">running</span>' : '<span class="text-muted">idle</span>'}
+            (runs ${cdpScheduler.runs_total ?? 0}, errors ${cdpScheduler.errors_total ?? 0})
+        `;
+        details.innerHTML = `
+            <div class="mb-2">
+                <strong>Top ranking configs</strong>
+                <div class="mt-1">${topConfigs || '<span class="text-muted">No configs.</span>'}</div>
+            </div>
+            <div>
+                <strong>Top scenarios</strong>
+                <div class="mt-1">${topScenarios || '<span class="text-muted">No scenarios.</span>'}</div>
+            </div>
+        `;
     } catch (error) {
+        kpis.innerHTML = '';
+        summary.textContent = `Failed to load engine snapshot summary: ${error.message}`;
+        details.textContent = `Failed to load details: ${error.message}`;
         container.textContent = `Failed to load engine snapshot: ${error.message}`;
     }
 }
@@ -2665,6 +2872,30 @@ function renderConfigCompareSelectors() {
     }
 }
 
+function renderOnlineKpiSelectors() {
+    const baselineConfig = document.getElementById('online-kpi-baseline-config');
+    if (baselineConfig) {
+        const configs = Object.values(rankingConfigs || {});
+        const options = configs.map(item => {
+            const configId = item?.config?.config_id || '';
+            const version = item?.version ?? 0;
+            return `<option value="${configId}">${configId} (v${version})</option>`;
+        }).join('');
+        baselineConfig.innerHTML = options || '<option value="balanced">balanced</option>';
+        if (!baselineConfig.value) baselineConfig.value = 'balanced';
+        if (!baselineConfig.value && configs.length) baselineConfig.value = configs[0]?.config?.config_id || 'balanced';
+    }
+
+    const baselineScenario = document.getElementById('online-kpi-baseline-scenario');
+    if (baselineScenario) {
+        const current = baselineScenario.value || 'default';
+        const scenarioOptions = ['<option value="default">default</option>']
+            .concat((scenarios || []).map(item => `<option value="${item.scenario_id}">${item.name} (${item.scenario_id})</option>`));
+        baselineScenario.innerHTML = scenarioOptions.join('');
+        baselineScenario.value = current;
+    }
+}
+
 function renderConfigCompareResult(payload) {
     reportingLastConfigCompare = payload;
     const summary = document.getElementById('reporting-config-compare-summary');
@@ -2800,6 +3031,134 @@ async function promoteCandidateConfig() {
     const summary = document.getElementById('reporting-config-compare-summary');
     if (summary) summary.textContent = `Promoted ${payload.source_config_id} to ${payload.target_config_id} v${payload.target_version}.`;
     await loadRankingConfigs();
+}
+
+async function rollbackDefaultConfig() {
+    const summary = document.getElementById('reporting-config-compare-summary');
+    if (summary) summary.textContent = 'Rolling back default config...';
+    const response = await fetch('/api/ranking-configs/rollback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            target_config_id: 'balanced',
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to rollback config');
+    }
+    if (summary) {
+        summary.textContent = `Rolled back ${payload.target_config_id} to ${payload.source_config_id} (v${payload.target_version}).`;
+    }
+    await loadRankingConfigs();
+    await loadOnlineKpis();
+}
+
+function renderOnlineKpiTables(payload) {
+    reportingOnlineKpi = payload;
+    const summary = document.getElementById('online-kpi-summary');
+    const configTable = document.getElementById('online-kpi-config-table');
+    const scenarioTable = document.getElementById('online-kpi-scenario-table');
+    const alerts = document.getElementById('online-kpi-alerts');
+    if (!summary || !configTable || !scenarioTable || !alerts) return;
+    if (!reportingOnlineKpiSelectedConfig && (payload.by_config || []).length) {
+        reportingOnlineKpiSelectedConfig = payload.by_config[0].key || '';
+    }
+
+    const s = payload.summary || {};
+    summary.innerHTML = `
+        <strong>Window:</strong> ${payload.window_days} days
+        | <strong>Runs:</strong> ${s.runs_with_events ?? 0}/${s.runs ?? 0}
+        | <strong>Impr:</strong> ${s.impressions ?? 0}
+        | <strong>CTR:</strong> ${(Number(s.ctr || 0) * 100).toFixed(2)}%
+        | <strong>CVR:</strong> ${(Number(s.conversion_rate || 0) * 100).toFixed(2)}%
+        | <strong>Top source share:</strong> ${(Number(s.top_source_share || 0) * 100).toFixed(1)}%
+        | <strong>Stale ratio:</strong> ${(Number(s.stale_ratio || 0) * 100).toFixed(1)}%
+    `;
+
+    const configRows = (payload.by_config || []).map(item => `
+        <tr class="${reportingOnlineKpiSelectedConfig === item.key ? 'table-warning' : ''}">
+            <td>
+                <button class="btn btn-sm btn-link p-0 select-online-kpi-config" data-config="${item.key}">${item.key}</button>
+            </td>
+            <td>${item.impressions}</td>
+            <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+            <td>${item.ctr_lift_vs_baseline == null ? 'n/a' : `${(Number(item.ctr_lift_vs_baseline) * 100).toFixed(2)}%`}</td>
+            <td>${item.ctr_confidence == null ? 'n/a' : `${(Number(item.ctr_confidence) * 100).toFixed(1)}%`}</td>
+            <td>${(Number(item.conversion_rate || 0) * 100).toFixed(2)}%</td>
+            <td>${(Number(item.top_source_share || 0) * 100).toFixed(1)}%</td>
+            <td>${(Number(item.stale_ratio || 0) * 100).toFixed(1)}%</td>
+        </tr>
+    `).join('');
+    configTable.innerHTML = configRows || '<tr><td colspan="8" class="text-muted">No config KPI rows.</td></tr>';
+
+    const scenarioRows = (payload.by_scenario || []).map(item => `
+        <tr>
+            <td>${item.key}</td>
+            <td>${item.impressions}</td>
+            <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
+            <td>${item.ctr_lift_vs_baseline == null ? 'n/a' : `${(Number(item.ctr_lift_vs_baseline) * 100).toFixed(2)}%`}</td>
+            <td>${item.ctr_confidence == null ? 'n/a' : `${(Number(item.ctr_confidence) * 100).toFixed(1)}%`}</td>
+            <td>${(Number(item.top_source_share || 0) * 100).toFixed(1)}%</td>
+            <td>${(Number(item.stale_ratio || 0) * 100).toFixed(1)}%</td>
+        </tr>
+    `).join('');
+    scenarioTable.innerHTML = scenarioRows || '<tr><td colspan="7" class="text-muted">No scenario KPI rows.</td></tr>';
+
+    const alertRows = (payload.alerts || []).map(item => `
+        <span class="badge bg-danger me-2">${item.metric}: value ${Number(item.value || 0).toFixed(4)} vs threshold ${Number(item.threshold || 0).toFixed(4)}</span>
+    `).join('');
+    alerts.innerHTML = alertRows || '<span class="text-success">No KPI alerts in this window.</span>';
+}
+
+async function loadOnlineKpis() {
+    const summary = document.getElementById('online-kpi-summary');
+    if (!summary) return;
+    const days = Math.max(1, Math.min(365, Number(document.getElementById('reporting-days')?.value || 30)));
+    const baselineConfig = document.getElementById('online-kpi-baseline-config')?.value || 'balanced';
+    const baselineScenario = document.getElementById('online-kpi-baseline-scenario')?.value || 'default';
+    const staleFloor = Math.max(0, Math.min(1, Number(document.getElementById('online-kpi-stale-floor')?.value || 0.2)));
+    summary.textContent = 'Loading online KPI metrics...';
+    const params = new URLSearchParams({
+        days: String(days),
+        baseline_config_id: baselineConfig,
+        baseline_scenario_id: baselineScenario,
+        stale_freshness_floor: String(staleFloor),
+        limit_runs: '1200',
+        limit_events: '100000'
+    });
+    const response = await fetch(`/api/metrics/online-kpis?${params.toString()}`);
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to load online KPIs');
+    }
+    const payload = await response.json();
+    renderOnlineKpiTables(payload);
+}
+
+async function promoteOnlineKpiCandidate() {
+    if (!reportingOnlineKpiSelectedConfig) {
+        throw new Error('Select a config row in Online KPI table first');
+    }
+    const summary = document.getElementById('reporting-config-compare-summary');
+    if (summary) summary.textContent = `Promoting ${reportingOnlineKpiSelectedConfig} based on online KPI selection...`;
+    const response = await fetch('/api/ranking-configs/promote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            source_config_id: reportingOnlineKpiSelectedConfig,
+            target_config_id: 'balanced',
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to promote config from online KPI');
+    }
+    if (summary) summary.textContent = `Promoted ${payload.source_config_id} to ${payload.target_config_id} v${payload.target_version}.`;
+    await loadRankingConfigs();
+    await loadOnlineKpis();
 }
 
 function collectPromotionGuardFromUi() {
@@ -3395,6 +3754,14 @@ async function loadReportingWorkspace() {
             }
         }
         renderScenarioTraceMetrics(tracePayload);
+        if (hasElement('online-kpi-summary')) {
+            try {
+                await loadOnlineKpis();
+            } catch (error) {
+                const el = document.getElementById('online-kpi-summary');
+                if (el) el.textContent = `Online KPI unavailable: ${error.message}`;
+            }
+        }
     } catch (error) {
         document.getElementById('reporting-summary').textContent = `Reporting unavailable: ${error.message}`;
         document.getElementById('reporting-scenario-table').innerHTML = '<tr><td colspan="5" class="text-danger">Failed to load reporting data.</td></tr>';
@@ -3687,6 +4054,10 @@ async function loadOfflineMetrics() {
 
 function displayArticles() {
     const articleList = document.getElementById('article-list');
+    const summary = document.getElementById('article-list-summary');
+    const pageInfo = document.getElementById('article-page-info');
+    const prevButton = document.getElementById('article-page-prev');
+    const nextButton = document.getElementById('article-page-next');
     if (!articles || articles.length === 0) {
         articleList.innerHTML = `
             <div class="alert alert-info">
@@ -3694,25 +4065,90 @@ function displayArticles() {
                 No articles available.
             </div>
         `;
+        if (summary) summary.textContent = '0 articles';
+        if (pageInfo) pageInfo.textContent = 'Page 0 of 0';
+        if (prevButton) prevButton.disabled = true;
+        if (nextButton) nextButton.disabled = true;
         return;
     }
 
-    articleList.innerHTML = articles.map(article => `
-        <a href="#" class="list-group-item list-group-item-action" data-id="${article.article_id}">
-            <div class="d-flex w-100 justify-content-between">
-                <h6 class="mb-1">${article.title}</h6>
+    const filtered = articles
+        .filter((article) => {
+            const source = article.source || 'unknown';
+            if (articleSourceFilter !== 'all' && source !== articleSourceFilter) {
+                return false;
+            }
+            if (!articleSearchTerm) return true;
+            const haystack = [
+                article.article_id || '',
+                article.title || '',
+                article.content || '',
+                article.source || '',
+                article.section || '',
+                article.metadata?.section || ''
+            ].join(' ').toLowerCase();
+            return haystack.includes(articleSearchTerm);
+        })
+        .sort((left, right) => compareArticles(left, right, articleSortMode));
+
+    const totalPages = Math.max(1, Math.ceil(filtered.length / articlePageSize));
+    articleCurrentPage = Math.min(Math.max(articleCurrentPage, 1), totalPages);
+    const startIndex = (articleCurrentPage - 1) * articlePageSize;
+    const paged = filtered.slice(startIndex, startIndex + articlePageSize);
+    const endIndex = startIndex + paged.length;
+
+    if (!paged.length) {
+        articleList.innerHTML = '<div class="text-muted">No matching articles for current filters.</div>';
+    } else {
+        articleList.innerHTML = `
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead>
+                        <tr>
+                            <th>Article</th>
+                            <th>Source</th>
+                            <th>Section</th>
+                            <th>Published</th>
+                            <th class="text-end">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${paged.map(article => {
+                            const isSelected = currentArticle && currentArticle.article_id === article.article_id;
+                            const published = getArticleTimestamp(article);
+                            const snippet = (article.content || '').trim();
+                            const section = article.section || article.metadata?.section || '-';
+                            return `
+                                <tr class="${isSelected ? 'table-primary' : ''}">
+                                    <td>
+                                        <div class="fw-semibold">${article.title || 'No title'}</div>
+                                        <div class="small text-muted">${article.article_id || 'n/a'}</div>
+                                        <div class="small text-muted">${snippet ? `${snippet.substring(0, 95)}${snippet.length > 95 ? '...' : ''}` : 'No preview content'}</div>
+                                    </td>
+                                    <td><span class="badge text-bg-light border">${article.source || 'unknown'}</span></td>
+                                    <td>${section}</td>
+                                    <td class="small text-muted">${published ? formatDate(published) : 'n/a'}</td>
+                                    <td class="text-end">
+                                        <button class="btn btn-sm ${isSelected ? 'btn-primary' : 'btn-outline-primary'} select-article-btn" data-id="${article.article_id}">
+                                            ${isSelected ? 'Selected' : 'Select'}
+                                        </button>
+                                    </td>
+                                </tr>
+                            `;
+                        }).join('')}
+                    </tbody>
+                </table>
             </div>
-            <small class="text-muted d-block">
-                <i class="fas fa-rss me-1"></i>${article.source || 'unknown source'}
-            </small>
-            ${article.metadata.scraped_at ? `
-                <small class="text-muted d-block">
-                    <i class="fas fa-clock me-1"></i>
-                    ${formatDate(article.metadata.scraped_at)}
-                </small>
-            ` : ''}
-        </a>
-    `).join('');
+        `;
+    }
+    if (summary) {
+        summary.textContent = filtered.length
+            ? `Showing ${startIndex + 1}-${endIndex} of ${filtered.length} matching articles (${articles.length} total)`
+            : `0 matching articles (${articles.length} total)`;
+    }
+    if (pageInfo) pageInfo.textContent = `Page ${articleCurrentPage} of ${totalPages}`;
+    if (prevButton) prevButton.disabled = articleCurrentPage <= 1;
+    if (nextButton) nextButton.disabled = articleCurrentPage >= totalPages;
 }
 
 function displayArticle(article) {
@@ -3736,6 +4172,10 @@ function displayArticle(article) {
     const whyNotInput = document.getElementById('why-not-article-id');
     if (whyNotInput && !whyNotInput.value) {
         whyNotInput.value = article.article_id || '';
+    }
+    const whyThisInput = document.getElementById('why-this-article-id');
+    if (whyThisInput && !whyThisInput.value) {
+        whyThisInput.value = article.article_id || '';
     }
 }
 
@@ -3788,6 +4228,10 @@ async function showSimilarArticles() {
         const similarArticles = responsePayload.recommendations;
         if (!Array.isArray(similarArticles)) {
             throw new Error('Invalid response format');
+        }
+        const whyThisInput = document.getElementById('why-this-article-id');
+        if (whyThisInput && !whyThisInput.value && similarArticles.length) {
+            whyThisInput.value = similarArticles[0].article_id || '';
         }
 
         if (similarArticles.length === 0) {
@@ -3912,6 +4356,40 @@ async function runWhyNotAnalysis() {
     output.textContent = JSON.stringify(payload, null, 2);
 }
 
+async function runWhyThisAnalysis() {
+    const output = document.getElementById('why-this-output');
+    if (!output) return;
+    const articleId = (document.getElementById('why-this-article-id')?.value || '').trim();
+    if (!articleId) {
+        throw new Error('Article ID is required');
+    }
+    const configId = document.getElementById('ranking-config')?.value || 'balanced';
+    const scenarioId = getSelectedScenarioId();
+    const externalUserId = getExternalUserId();
+    const userReads = currentArticle?.article_id ? [currentArticle.article_id] : [];
+    output.textContent = 'Running why-this analysis...';
+    const response = await fetch('/api/recommendations/explain-item', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            user_id: 'demo_user',
+            user_reads: userReads,
+            top_n: 5,
+            inspect_count: 80,
+            sources: getSelectedSources(),
+            config_id: configId,
+            scenario_id: scenarioId || undefined,
+            external_user_id: externalUserId || undefined,
+            article_id: articleId
+        }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to run why-this analysis');
+    }
+    output.textContent = JSON.stringify(payload, null, 2);
+}
+
 function formatContribution(value) {
     if (typeof value !== 'number') return 'n/a';
     return value.toFixed(3);
@@ -3995,17 +4473,57 @@ function setupEventListeners() {
     const articleList = document.getElementById('article-list');
     if (articleList) {
         articleList.addEventListener('click', (e) => {
+            const selectButton = e.target.closest('.select-article-btn');
+            if (!selectButton) return;
             e.preventDefault();
-            const articleItem = e.target.closest('.list-group-item');
-            if (!articleItem) return;
-            const articleId = articleItem.dataset.id;
-            const article = articles.find(a => a.article_id === articleId);
-            if (!article) return;
-            document.querySelectorAll('.list-group-item').forEach(item => item.classList.remove('active'));
-            articleItem.classList.add('active');
-            displayArticle(article);
+            selectArticleById(selectButton.dataset.id);
         });
     }
+    on('article-search-input', 'input', (event) => {
+        articleSearchTerm = (event.target.value || '').trim().toLowerCase();
+        articleCurrentPage = 1;
+        displayArticles();
+    });
+    on('article-source-select', 'change', (event) => {
+        articleSourceFilter = event.target.value || 'all';
+        articleCurrentPage = 1;
+        displayArticles();
+    });
+    on('article-sort-select', 'change', (event) => {
+        articleSortMode = event.target.value || 'newest';
+        articleCurrentPage = 1;
+        displayArticles();
+    });
+    on('article-page-size', 'change', (event) => {
+        const parsed = Number(event.target.value || 20);
+        articlePageSize = Number.isFinite(parsed) && parsed > 0 ? parsed : 20;
+        articleCurrentPage = 1;
+        displayArticles();
+    });
+    on('article-reset-filters', 'click', () => {
+        articleSearchTerm = '';
+        articleSourceFilter = 'all';
+        articleSortMode = 'newest';
+        articlePageSize = 20;
+        articleCurrentPage = 1;
+        const searchInput = document.getElementById('article-search-input');
+        const sourceSelect = document.getElementById('article-source-select');
+        const sortSelect = document.getElementById('article-sort-select');
+        const sizeSelect = document.getElementById('article-page-size');
+        if (searchInput) searchInput.value = '';
+        if (sourceSelect) sourceSelect.value = 'all';
+        if (sortSelect) sortSelect.value = 'newest';
+        if (sizeSelect) sizeSelect.value = '20';
+        displayArticles();
+    });
+    on('article-page-prev', 'click', () => {
+        articleCurrentPage = Math.max(1, articleCurrentPage - 1);
+        displayArticles();
+    });
+    on('article-page-next', 'click', () => {
+        articleCurrentPage += 1;
+        displayArticles();
+    });
 
     on('show-similar', 'click', showSimilarArticles);
     on('refresh-decision-context', 'click', loadDecisionContext);
@@ -4136,6 +4654,36 @@ function setupEventListeners() {
         } catch (error) {
             showError(error.message || 'Failed guarded promotion');
         }
+    });
+    on('rollback-default-config', 'click', async () => {
+        try {
+            await rollbackDefaultConfig();
+        } catch (error) {
+            showError(error.message || 'Failed to rollback config');
+        }
+    });
+    on('refresh-online-kpis', 'click', async () => {
+        try {
+            await loadOnlineKpis();
+        } catch (error) {
+            showError(error.message || 'Failed to load online KPIs');
+        }
+    });
+    on('promote-online-kpi-candidate', 'click', async () => {
+        try {
+            await promoteOnlineKpiCandidate();
+        } catch (error) {
+            showError(error.message || 'Failed to promote from online KPI');
+        }
+    });
+    on('online-kpi-baseline-config', 'change', loadOnlineKpis);
+    on('online-kpi-baseline-scenario', 'change', loadOnlineKpis);
+    on('online-kpi-stale-floor', 'change', loadOnlineKpis);
+    on('online-kpi-config-table', 'click', (event) => {
+        const button = event.target.closest('.select-online-kpi-config');
+        if (!button) return;
+        reportingOnlineKpiSelectedConfig = button.dataset.config || '';
+        renderOnlineKpiTables(reportingOnlineKpi || { by_config: [], by_scenario: [], summary: {}, alerts: [] });
     });
     on('apply-guard-preset', 'click', () => {
         const preset = document.getElementById('guard-preset')?.value || 'balanced';
@@ -4312,6 +4860,7 @@ function setupEventListeners() {
     });
     on('refresh-cleanup-status', 'click', loadCleanupStatus);
     on('refresh-rollups-status', 'click', loadRollupsStatus);
+    on('refresh-events-queue', 'click', loadEventsQueueStatus);
     on('rollups-days', 'change', loadRollupsStatus);
     on('rebuild-rollups', 'click', async () => {
         try {
@@ -4319,6 +4868,20 @@ function setupEventListeners() {
             if (hasElement('reporting-summary')) await loadReportingWorkspace();
         } catch (error) {
             showError(error.message || 'Failed to rebuild rollups');
+        }
+    });
+    on('rebuild-rollups-async', 'click', async () => {
+        try {
+            await rebuildRollupsAsync();
+        } catch (error) {
+            showError(error.message || 'Failed to queue async rollup rebuild');
+        }
+    });
+    on('enqueue-events-sample', 'click', async () => {
+        try {
+            await enqueueEventsSample();
+        } catch (error) {
+            showError(error.message || 'Failed to enqueue sample events');
         }
     });
     on('run-cleanup-now', 'click', async () => {
@@ -4418,6 +4981,15 @@ function setupEventListeners() {
             if (output) output.textContent = error.message || 'Why-not analysis failed';
         }
     });
+    on('run-why-this', 'click', async () => {
+        try {
+            await runWhyThisAnalysis();
+        } catch (error) {
+            showError(error.message || 'Failed to run why-this analysis');
+            const output = document.getElementById('why-this-output');
+            if (output) output.textContent = error.message || 'Why-this analysis failed';
+        }
+    });
     on('run-batch-recommendations', 'click', async () => {
         try {
             await runBatchRecommendations();
@@ -4465,6 +5037,42 @@ function formatDate(dateString) {
     } catch (_e) {
         return 'Invalid date';
     }
+}
+
+function getArticleTimestamp(article) {
+    return article?.metadata?.scraped_at || article?.metadata?.published_at || article?.published_at || null;
+}
+
+function compareArticles(left, right, mode) {
+    if (mode === 'title_asc') {
+        return String(left.title || '').localeCompare(String(right.title || ''), undefined, { sensitivity: 'base' });
+    }
+    if (mode === 'title_desc') {
+        return String(right.title || '').localeCompare(String(left.title || ''), undefined, { sensitivity: 'base' });
+    }
+    const leftTs = new Date(getArticleTimestamp(left) || 0).getTime();
+    const rightTs = new Date(getArticleTimestamp(right) || 0).getTime();
+    if (mode === 'oldest') return leftTs - rightTs;
+    return rightTs - leftTs;
+}
+
+function refreshArticleSourceFilterOptions() {
+    const sourceSelect = document.getElementById('article-source-select');
+    if (!sourceSelect) return;
+    const sources = Array.from(new Set(articles.map(item => item.source || 'unknown'))).sort((a, b) => a.localeCompare(b));
+    sourceSelect.innerHTML = '<option value="all">All sources</option>' + sources.map(src => `<option value="${src}">${src}</option>`).join('');
+    if (articleSourceFilter !== 'all' && !sources.includes(articleSourceFilter)) {
+        articleSourceFilter = 'all';
+    }
+    sourceSelect.value = articleSourceFilter;
+}
+
+function selectArticleById(articleId) {
+    const article = articles.find(a => a.article_id === articleId);
+    if (!article) return;
+    currentArticle = article;
+    displayArticle(article);
+    displayArticles();
 }
 
 function showError(message) {

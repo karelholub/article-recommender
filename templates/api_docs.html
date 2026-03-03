@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+    <div class="col-12">
+        <div class="page-intro">
+            <h3 class="mb-1">API Docs</h3>
+            <p>Use this page to inspect the live OpenAPI contract and copy ready-to-import Postman request examples.</p>
+        </div>
+    </div>
+
+    <div class="col-lg-7">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Live OpenAPI</strong>
+                <button id="refresh-openapi" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div id="openapi-summary" class="small text-muted mb-2">Loading schema...</div>
+                <pre id="openapi-json" class="small mb-0" style="max-height: 60vh; overflow:auto;">Loading...</pre>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-5">
+        <div class="card">
+            <div class="card-header"><strong>Postman Examples</strong></div>
+            <div class="card-body">
+                <div class="small text-muted mb-2">Examples target the current host. Copy body JSON into Postman.</div>
+                <div class="mb-3">
+                    <div class="fw-semibold small mb-1">1) Async Events Ingest</div>
+                    <code class="d-block small mb-1">POST /api/events/ingest-async</code>
+                    <button class="btn btn-sm btn-outline-primary mb-1 copy-snippet" data-target="snippet-events-async">Copy JSON</button>
+                    <pre id="snippet-events-async" class="small mb-0">{
+  "events": [
+    {
+      "event_type": "impression",
+      "run_id": "00000000-0000-0000-0000-000000000123",
+      "article_id": "article_123",
+      "scenario_id": "default",
+      "user_id": "demo_user",
+      "external_user_id": "customer-123",
+      "rank_position": 1,
+      "event_value": 1.0,
+      "metadata": { "source": "www.e15.cz" }
+    }
+  ]
+}</pre>
+                </div>
+
+                <div class="mb-3">
+                    <div class="fw-semibold small mb-1">2) Async Events Status</div>
+                    <code class="d-block small mb-1">GET /api/events/ingest-status/{job_id}</code>
+                    <button class="btn btn-sm btn-outline-primary mb-1 copy-snippet" data-target="snippet-events-status">Copy URL Path</button>
+                    <pre id="snippet-events-status" class="small mb-0">/api/events/ingest-status/REPLACE_WITH_JOB_ID</pre>
+                </div>
+
+                <div class="mb-3">
+                    <div class="fw-semibold small mb-1">3) Rollups Rebuild Async</div>
+                    <code class="d-block small mb-1">POST /api/metrics/rollups/rebuild-async</code>
+                    <button class="btn btn-sm btn-outline-primary mb-1 copy-snippet" data-target="snippet-rollups-async">Copy JSON</button>
+                    <pre id="snippet-rollups-async" class="small mb-0">{
+  "days": 30
+}</pre>
+                </div>
+
+                <div class="mb-3">
+                    <div class="fw-semibold small mb-1">4) Rollups Job Status</div>
+                    <code class="d-block small mb-1">GET /api/metrics/rollups/rebuild-async/{job_id}</code>
+                    <button class="btn btn-sm btn-outline-primary mb-1 copy-snippet" data-target="snippet-rollups-status">Copy URL Path</button>
+                    <pre id="snippet-rollups-status" class="small mb-0">/api/metrics/rollups/rebuild-async/REPLACE_WITH_JOB_ID</pre>
+                </div>
+
+                <div class="mb-0">
+                    <div class="fw-semibold small mb-1">5) Idempotent Recommendations Query</div>
+                    <code class="d-block small mb-1">POST /api/recommendations/query</code>
+                    <div class="small text-muted mb-1">Set header <code>Idempotency-Key</code> (for replay semantics).</div>
+                    <button class="btn btn-sm btn-outline-primary mb-1 copy-snippet" data-target="snippet-query">Copy JSON</button>
+                    <pre id="snippet-query" class="small mb-0">{
+  "user_id": "demo_user",
+  "external_user_id": "customer-123",
+  "top_n": 5,
+  "config_id": "balanced",
+  "scenario_id": "default",
+  "sources": ["www.e15.cz", "www.metro.cz"]
+}</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+async function loadOpenApiSpec() {
+    const summary = document.getElementById('openapi-summary');
+    const output = document.getElementById('openapi-json');
+    try {
+        const response = await fetch('/api/openapi.json');
+        if (!response.ok) {
+            const err = await response.json();
+            throw new Error(err.error || 'Failed to load OpenAPI schema');
+        }
+        const payload = await response.json();
+        const pathCount = Object.keys(payload.paths || {}).length;
+        summary.innerHTML = `<strong>Version:</strong> ${payload.info?.version || 'n/a'} | <strong>Paths:</strong> ${pathCount} | <strong>OpenAPI:</strong> ${payload.openapi || 'n/a'}`;
+        output.textContent = JSON.stringify(payload, null, 2);
+    } catch (error) {
+        summary.textContent = `OpenAPI unavailable: ${error.message}`;
+        output.textContent = 'Failed to load OpenAPI schema';
+    }
+}
+
+async function copySnippet(targetId) {
+    const el = document.getElementById(targetId);
+    if (!el) return;
+    try {
+        await navigator.clipboard.writeText(el.textContent || '');
+    } catch (_err) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('copy');
+        selection.removeAllRanges();
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadOpenApiSpec();
+    const refresh = document.getElementById('refresh-openapi');
+    if (refresh) refresh.addEventListener('click', loadOpenApiSpec);
+    document.querySelectorAll('.copy-snippet').forEach((button) => {
+        button.addEventListener('click', async () => {
+            await copySnippet(button.dataset.target);
+            const old = button.textContent;
+            button.textContent = 'Copied';
+            setTimeout(() => { button.textContent = old; }, 1000);
+        });
+    });
+});
+</script>
+{% endblock %}

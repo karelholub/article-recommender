@@ -16,7 +16,16 @@
             </div>
             <div class="card-body">
                 <div class="section-hint">Current runtime view of ranking, scenarios, and source defaults.</div>
-                <pre id="engine-config-snapshot" class="small mb-0">Loading...</pre>
+                <div id="engine-config-kpis" class="d-flex flex-wrap gap-2 mb-2 small"></div>
+                <div id="engine-config-summary" class="small text-muted mb-2">Loading snapshot summary...</div>
+                <details class="mb-2">
+                    <summary class="small">Show reasoning configuration details</summary>
+                    <div id="engine-config-details" class="small text-muted mt-2">Loading...</div>
+                </details>
+                <details>
+                    <summary class="small">Show raw snapshot JSON</summary>
+                    <pre id="engine-config-snapshot" class="small mb-0 mt-2" style="max-height: 180px; overflow:auto;">Loading...</pre>
+                </details>
             </div>
         </div>
     </div>
@@ -137,6 +146,12 @@
                 <input id="threshold-rollup-lag-hours" class="form-control form-control-sm mb-2" type="number" min="1" step="1" placeholder="24">
                 <label class="form-label small mb-1" for="threshold-min-ctr">Minimum CTR</label>
                 <input id="threshold-min-ctr" class="form-control form-control-sm mb-2" type="number" min="0" max="1" step="0.001" placeholder="0.01">
+                <label class="form-label small mb-1" for="threshold-max-source-top-share">Max Top Source Share</label>
+                <input id="threshold-max-source-top-share" class="form-control form-control-sm mb-2" type="number" min="0" max="1" step="0.01" placeholder="0.85">
+                <label class="form-label small mb-1" for="threshold-max-stale-ratio">Max Stale Ratio</label>
+                <input id="threshold-max-stale-ratio" class="form-control form-control-sm mb-2" type="number" min="0" max="1" step="0.01" placeholder="0.40">
+                <label class="form-label small mb-1" for="threshold-min-ctr-lift">Min CTR Lift vs Baseline</label>
+                <input id="threshold-min-ctr-lift" class="form-control form-control-sm mb-2" type="number" min="-1" max="1" step="0.01" placeholder="-0.05">
                 <div class="d-flex gap-2 mb-2">
                     <button id="save-alert-thresholds" class="btn btn-sm btn-outline-primary">Save Thresholds</button>
                     <button id="evaluate-alert-incidents" class="btn btn-sm btn-outline-warning">Evaluate Incidents</button>
@@ -181,6 +196,20 @@
             </div>
         </div>
     </div>
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>Async Events Queue</strong>
+                <button id="refresh-events-queue" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div id="events-queue-status" class="small text-muted mb-2">Loading queue status...</div>
+                <label class="form-label small mb-1" for="events-queue-sample-size">Sample Enqueue Size</label>
+                <input id="events-queue-sample-size" class="form-control form-control-sm mb-2" type="number" min="1" max="100" value="5">
+                <button id="enqueue-events-sample" class="btn btn-sm btn-outline-primary">Enqueue Sample Events</button>
+            </div>
+        </div>
+    </div>
     <div class="col-12">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
@@ -195,9 +224,11 @@
                     </div>
                     <div class="col-md-9 d-flex gap-2">
                         <button id="rebuild-rollups" class="btn btn-sm btn-outline-primary">Rebuild Rollups</button>
+                        <button id="rebuild-rollups-async" class="btn btn-sm btn-outline-secondary">Rebuild Async</button>
                     </div>
                 </div>
                 <div id="rollups-status" class="small text-muted">Loading rollup status...</div>
+                <div id="rollups-async-status" class="small text-muted mt-2">No async rebuild running.</div>
             </div>
         </div>
     </div>

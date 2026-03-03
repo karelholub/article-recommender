@@ -67,6 +67,9 @@
                     <a class="nav-link {% if active_page == 'runs' %}active{% endif %}" href="{{ url_for('runs_page') }}">
                         <i class="fas fa-history me-2"></i>Run Explorer
                     </a>
+                    <a class="nav-link {% if active_page == 'api_docs' %}active{% endif %}" href="{{ url_for('api_docs_page') }}">
+                        <i class="fas fa-book me-2"></i>API Docs
+                    </a>
                 </nav>
                 <hr class="border-secondary my-3">
                 <div class="small">

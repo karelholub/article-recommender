@@ -346,6 +346,9 @@ class SQLiteRecommenderStore(BaseRecommenderStore):
         "min_ctr": 0.01,
         "max_rollup_lag_hours": 24.0,
         "connector_blocker_rate": 0.2,
+        "max_source_top_share": 0.85,
+        "max_stale_ratio": 0.4,
+        "min_ctr_lift_vs_baseline": -0.05,
     }
 
     def __init__(self, db_path: str = "data/recommender.db"):
@@ -2342,6 +2345,9 @@ class PostgresRecommenderStore(BaseRecommenderStore):
         "min_ctr": 0.01,
         "max_rollup_lag_hours": 24.0,
         "connector_blocker_rate": 0.2,
+        "max_source_top_share": 0.85,
+        "max_stale_ratio": 0.4,
+        "min_ctr_lift_vs_baseline": -0.05,
     }
 
     def __init__(self, database_url: str):

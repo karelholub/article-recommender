@@ -160,6 +160,7 @@
                     <button id="run-config-compare" class="btn btn-sm btn-outline-primary">Run Config Compare</button>
                     <button id="promote-candidate-config" class="btn btn-sm btn-outline-warning">Promote Candidate to Default</button>
                     <button id="promote-with-guard" class="btn btn-sm btn-outline-danger">Promote With Guard</button>
+                    <button id="rollback-default-config" class="btn btn-sm btn-outline-dark">Rollback Default</button>
                 </div>
                 <div class="row g-2 mb-2">
                     <div class="col-md-2">
@@ -188,6 +189,46 @@
                         <tbody id="reporting-config-compare-table"><tr><td colspan="5" class="text-muted">No comparison yet.</td></tr></tbody>
                     </table>
                 </div>
+                <hr>
+                <div class="small text-muted mb-2">Online KPI monitor for live scenarios/configs with lift and confidence against selected baseline.</div>
+                <div class="row g-2 mb-2">
+                    <div class="col-md-3">
+                        <label class="form-label small mb-1" for="online-kpi-baseline-config">Baseline Config</label>
+                        <select id="online-kpi-baseline-config" class="form-select form-select-sm"></select>
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label small mb-1" for="online-kpi-baseline-scenario">Baseline Scenario</label>
+                        <select id="online-kpi-baseline-scenario" class="form-select form-select-sm">
+                            <option value="default">default</option>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label small mb-1" for="online-kpi-stale-floor">Stale Freshness Floor</label>
+                        <input id="online-kpi-stale-floor" class="form-control form-control-sm" type="number" min="0" max="1" step="0.01" value="0.20">
+                    </div>
+                    <div class="col-md-4 d-flex align-items-end gap-2">
+                        <button id="refresh-online-kpis" class="btn btn-sm btn-outline-secondary">Refresh KPIs</button>
+                        <button id="promote-online-kpi-candidate" class="btn btn-sm btn-outline-warning">Promote Selected Config</button>
+                    </div>
+                </div>
+                <div id="online-kpi-summary" class="small text-muted mb-2">Loading online KPI metrics...</div>
+                <div class="table-responsive mb-3">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr><th>Config</th><th>Impr.</th><th>CTR</th><th>CTR Lift</th><th>Confidence</th><th>CVR</th><th>Top Source Share</th><th>Stale Ratio</th></tr>
+                        </thead>
+                        <tbody id="online-kpi-config-table"><tr><td colspan="8" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="table-responsive mb-3">
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr><th>Scenario</th><th>Impr.</th><th>CTR</th><th>CTR Lift</th><th>Confidence</th><th>Top Source Share</th><th>Stale Ratio</th></tr>
+                        </thead>
+                        <tbody id="online-kpi-scenario-table"><tr><td colspan="7" class="text-muted">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+                <div id="online-kpi-alerts" class="small text-muted mb-2">No alerts.</div>
                 <div class="small text-muted mb-2">Scenario trace analytics aggregates persisted `scenario_trace` outcomes from recommendation runs.</div>
                 <div class="table-responsive">
                     <table class="table table-sm mb-0">
