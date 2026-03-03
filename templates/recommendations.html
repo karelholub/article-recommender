@@ -40,6 +40,52 @@
             <div class="card-header"><strong>Article Statistics</strong></div>
             <div class="card-body"><div id="article-stats">Loading...</div></div>
         </div>
+
+        <div class="card mb-4">
+            <div class="card-header"><strong>Available Articles</strong></div>
+            <div class="card-body">
+                <div class="section-hint">Find a working article quickly, then click Select to load it into the recommendation context.</div>
+                <div class="row g-2 mb-2">
+                    <div class="col-md-5">
+                        <label class="form-label small mb-1" for="article-search-input">Search</label>
+                        <input id="article-search-input" class="form-control form-control-sm" placeholder="Title, content, section, or ID">
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label small mb-1" for="article-source-select">Source</label>
+                        <select id="article-source-select" class="form-select form-select-sm">
+                            <option value="all">All sources</option>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label small mb-1" for="article-sort-select">Sort</label>
+                        <select id="article-sort-select" class="form-select form-select-sm">
+                            <option value="newest">Newest</option>
+                            <option value="oldest">Oldest</option>
+                            <option value="title_asc">Title A-Z</option>
+                            <option value="title_desc">Title Z-A</option>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label small mb-1" for="article-page-size">Rows</label>
+                        <select id="article-page-size" class="form-select form-select-sm">
+                            <option value="10">10</option>
+                            <option value="20" selected>20</option>
+                            <option value="40">40</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <div id="article-list-summary" class="small text-muted">Loading...</div>
+                    <button id="article-reset-filters" class="btn btn-sm btn-outline-secondary">Reset</button>
+                </div>
+                <div id="article-list" class="small"></div>
+                <div class="d-flex justify-content-between align-items-center mt-2">
+                    <button id="article-page-prev" class="btn btn-sm btn-outline-secondary">Previous</button>
+                    <div id="article-page-info" class="small text-muted">Page 1</div>
+                    <button id="article-page-next" class="btn btn-sm btn-outline-secondary">Next</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div class="col-xl-4">
@@ -282,51 +328,6 @@
             </div>
         </div>
 
-        <div class="card">
-            <div class="card-header"><strong>Available Articles</strong></div>
-            <div class="card-body">
-                <div class="section-hint">Find a working article quickly, then click Select to load it into the recommendation context.</div>
-                <div class="row g-2 mb-2">
-                    <div class="col-md-5">
-                        <label class="form-label small mb-1" for="article-search-input">Search</label>
-                        <input id="article-search-input" class="form-control form-control-sm" placeholder="Title, content, section, or ID">
-                    </div>
-                    <div class="col-md-3">
-                        <label class="form-label small mb-1" for="article-source-select">Source</label>
-                        <select id="article-source-select" class="form-select form-select-sm">
-                            <option value="all">All sources</option>
-                        </select>
-                    </div>
-                    <div class="col-md-2">
-                        <label class="form-label small mb-1" for="article-sort-select">Sort</label>
-                        <select id="article-sort-select" class="form-select form-select-sm">
-                            <option value="newest">Newest</option>
-                            <option value="oldest">Oldest</option>
-                            <option value="title_asc">Title A-Z</option>
-                            <option value="title_desc">Title Z-A</option>
-                        </select>
-                    </div>
-                    <div class="col-md-2">
-                        <label class="form-label small mb-1" for="article-page-size">Rows</label>
-                        <select id="article-page-size" class="form-select form-select-sm">
-                            <option value="10">10</option>
-                            <option value="20" selected>20</option>
-                            <option value="40">40</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="d-flex justify-content-between align-items-center mb-2">
-                    <div id="article-list-summary" class="small text-muted">Loading...</div>
-                    <button id="article-reset-filters" class="btn btn-sm btn-outline-secondary">Reset</button>
-                </div>
-                <div id="article-list" class="small"></div>
-                <div class="d-flex justify-content-between align-items-center mt-2">
-                    <button id="article-page-prev" class="btn btn-sm btn-outline-secondary">Previous</button>
-                    <div id="article-page-info" class="small text-muted">Page 1</div>
-                    <button id="article-page-next" class="btn btn-sm btn-outline-secondary">Next</button>
-                </div>
-            </div>
-        </div>
         <div class="card mt-4">
             <div class="card-header"><strong>Batch Recommendation API Playground</strong></div>
             <div class="card-body">
