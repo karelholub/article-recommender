@@ -99,6 +99,90 @@ function getReportingRolloutsModule() {
     return window.ReportingRolloutsModule;
 }
 
+function getRecommendationsArticlesModule() {
+    if (!window.RecommendationsArticlesModule) {
+        throw new Error('Recommendations articles module is not loaded');
+    }
+    return window.RecommendationsArticlesModule;
+}
+
+function getReportingDashboardModule() {
+    if (!window.ReportingDashboardModule) {
+        throw new Error('Reporting dashboard module is not loaded');
+    }
+    return window.ReportingDashboardModule;
+}
+
+function buildRecommendationsArticlesContext() {
+    return {
+        get articles() {
+            return articles;
+        },
+        get currentArticle() {
+            return currentArticle;
+        },
+        get articleSearchTerm() {
+            return articleSearchTerm;
+        },
+        get articleSourceFilter() {
+            return articleSourceFilter;
+        },
+        get articleSortMode() {
+            return articleSortMode;
+        },
+        get articlePageSize() {
+            return articlePageSize;
+        },
+        get articleCurrentPage() {
+            return articleCurrentPage;
+        },
+        setCurrentArticle: (value) => {
+            currentArticle = value;
+        },
+        setArticleSourceFilter: (value) => {
+            articleSourceFilter = value;
+        },
+        setArticleCurrentPage: (value) => {
+            articleCurrentPage = value;
+        },
+    };
+}
+
+function buildReportingDashboardContext() {
+    return {
+        get reportingVolumeChart() {
+            return reportingVolumeChart;
+        },
+        get reportingCtrChart() {
+            return reportingCtrChart;
+        },
+        get reportingScenarioOverlayChart() {
+            return reportingScenarioOverlayChart;
+        },
+        get reportingFunnelChart() {
+            return reportingFunnelChart;
+        },
+        setReportingVolumeChart: (value) => {
+            reportingVolumeChart = value;
+        },
+        setReportingCtrChart: (value) => {
+            reportingCtrChart = value;
+        },
+        setReportingScenarioOverlayChart: (value) => {
+            reportingScenarioOverlayChart = value;
+        },
+        setReportingFunnelChart: (value) => {
+            reportingFunnelChart = value;
+        },
+        setReportingLastPayload: (value) => {
+            reportingLastPayload = value;
+        },
+        setReportingLastAttribution: (value) => {
+            reportingLastAttribution = value;
+        },
+    };
+}
+
 function buildRolloutsModuleContext() {
     return {
         ApiClient,
@@ -2583,140 +2667,11 @@ function toCsvCell(value) {
 }
 
 function renderReportingWorkspace(payload) {
-    reportingLastPayload = payload;
-    const summary = payload.summary || {};
-    const summaryEl = document.getElementById('reporting-summary');
-    const selectedCount = (payload.filters?.scenario_ids || []).length;
-    const scopeLabel = selectedCount ? ` | filtered scenarios ${selectedCount}` : ' | all scenarios';
-    summaryEl.innerHTML = `
-        <strong>Totals (${payload.window_days} days):</strong>
-        impressions ${summary.impressions ?? 0},
-        clicks ${summary.clicks ?? 0},
-        conversions ${summary.conversions ?? 0},
-        CTR ${(Number(summary.ctr || 0) * 100).toFixed(2)}%
-        ${scopeLabel}
-    `;
-
-    const tableBody = document.getElementById('reporting-scenario-table');
-    const scenarioRows = (payload.scenarios || []).map(item => `
-        <tr>
-            <td>${item.name || item.scenario_id}</td>
-            <td>${item.impressions}</td>
-            <td>${item.clicks}</td>
-            <td>${item.conversions}</td>
-            <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
-        </tr>
-    `).join('');
-    tableBody.innerHTML = scenarioRows || '<tr><td colspan="5" class="text-muted">No scenario activity in selected window.</td></tr>';
-
-    const labels = (payload.totals_by_day || []).map(item => item.date);
-    const impressions = (payload.totals_by_day || []).map(item => item.impressions);
-    const clicks = (payload.totals_by_day || []).map(item => item.clicks);
-    const ctr = (payload.totals_by_day || []).map(item => Number(item.ctr || 0) * 100);
-
-    const volumeCtx = document.getElementById('reporting-volume-chart');
-    const ctrCtx = document.getElementById('reporting-ctr-chart');
-    const overlayCtx = document.getElementById('reporting-scenario-overlay-chart');
-    const funnelCtx = document.getElementById('reporting-funnel-chart');
-    if (reportingVolumeChart) reportingVolumeChart.destroy();
-    if (reportingCtrChart) reportingCtrChart.destroy();
-    if (reportingScenarioOverlayChart) reportingScenarioOverlayChart.destroy();
-    if (reportingFunnelChart) reportingFunnelChart.destroy();
-
-    reportingVolumeChart = new Chart(volumeCtx, {
-        type: 'bar',
-        data: {
-            labels,
-            datasets: [
-                { label: 'Impressions', data: impressions, backgroundColor: '#0d6efd' },
-                { label: 'Clicks', data: clicks, backgroundColor: '#198754' }
-            ]
-        },
-        options: { responsive: true, maintainAspectRatio: false }
-    });
-    reportingCtrChart = new Chart(ctrCtx, {
-        type: 'line',
-        data: {
-            labels,
-            datasets: [
-                {
-                    label: 'CTR %',
-                    data: ctr,
-                    borderColor: '#fd7e14',
-                    backgroundColor: 'rgba(253,126,20,0.2)',
-                    tension: 0.25,
-                    fill: true
-                }
-            ]
-        },
-        options: { responsive: true, maintainAspectRatio: false }
-    });
-
-    const palette = ['#6f42c1', '#0dcaf0', '#d63384', '#198754', '#ffc107', '#20c997'];
-    const overlayDatasets = (payload.scenarios || []).slice(0, 6).map((scenario, idx) => ({
-        label: scenario.name || scenario.scenario_id,
-        data: (scenario.points || []).map(point => Number(point.ctr || 0) * 100),
-        borderColor: palette[idx % palette.length],
-        backgroundColor: 'transparent',
-        tension: 0.25
-    }));
-    reportingScenarioOverlayChart = new Chart(overlayCtx, {
-        type: 'line',
-        data: { labels, datasets: overlayDatasets },
-        options: { responsive: true, maintainAspectRatio: false }
-    });
-    reportingFunnelChart = new Chart(funnelCtx, {
-        type: 'bar',
-        data: {
-            labels: ['Impressions', 'Clicks', 'Conversions'],
-            datasets: [{
-                label: 'Funnel',
-                data: [summary.impressions || 0, summary.clicks || 0, summary.conversions || 0],
-                backgroundColor: ['#0d6efd', '#198754', '#fd7e14']
-            }]
-        },
-        options: {
-            indexAxis: 'y',
-            responsive: true,
-            maintainAspectRatio: false
-        }
-    });
+    getReportingDashboardModule().renderReportingWorkspace(payload, buildReportingDashboardContext());
 }
 
 function renderReportingAttribution(payload) {
-    reportingLastAttribution = payload;
-    const attributionTable = document.getElementById('reporting-attribution-table');
-    if (attributionTable) {
-        const runRows = (payload.by_run || []).map(item => `
-            <tr>
-                <td><code>${item.run_id === 'untracked' ? 'untracked' : item.run_id.slice(0, 8)}</code></td>
-                <td>${item.config_id ? `${item.config_id} v${item.config_version}` : 'n/a'}</td>
-                <td>${item.scenario_name || item.scenario_id || 'default'}</td>
-                <td class="small">${(item.selected_sources || []).slice(0, 4).join(', ') || 'n/a'}</td>
-                <td>${item.impressions || 0}</td>
-                <td>${item.clicks || 0}</td>
-                <td>${item.conversions || 0}</td>
-                <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
-                <td>${(Number(item.conversion_rate || 0) * 100).toFixed(2)}%</td>
-            </tr>
-        `).join('');
-        attributionTable.innerHTML = runRows || '<tr><td colspan="9" class="text-muted">No run attribution in selected window.</td></tr>';
-    }
-
-    const sourceTable = document.getElementById('reporting-source-table');
-    if (sourceTable) {
-        const sourceRows = (payload.by_source || []).map(item => `
-            <tr>
-                <td>${item.source || 'unknown'}</td>
-                <td>${item.impressions || 0}</td>
-                <td>${item.clicks || 0}</td>
-                <td>${item.conversions || 0}</td>
-                <td>${(Number(item.ctr || 0) * 100).toFixed(2)}%</td>
-                <td>${(Number(item.conversion_rate || 0) * 100).toFixed(2)}%</td>
-            </tr>
-        `).join('');
-        sourceTable.innerHTML = sourceRows || '<tr><td colspan="6" class="text-muted">No source attribution in selected window.</td></tr>';
-    }
+    getReportingDashboardModule().renderReportingAttribution(payload, buildReportingDashboardContext());
 }
 
 function renderIdentityMetrics(payload) {
@@ -4291,130 +4246,11 @@ async function loadOfflineMetrics() {
 }
 
 function displayArticles() {
-    const articleList = document.getElementById('article-list');
-    const summary = document.getElementById('article-list-summary');
-    const pageInfo = document.getElementById('article-page-info');
-    const prevButton = document.getElementById('article-page-prev');
-    const nextButton = document.getElementById('article-page-next');
-    if (!articles || articles.length === 0) {
-        articleList.innerHTML = `
-            <div class="alert alert-info">
-                <i class="fas fa-info-circle me-2"></i>
-                No articles available.
-            </div>
-        `;
-        if (summary) summary.textContent = '0 articles';
-        if (pageInfo) pageInfo.textContent = 'Page 0 of 0';
-        if (prevButton) prevButton.disabled = true;
-        if (nextButton) nextButton.disabled = true;
-        return;
-    }
-
-    const filtered = articles
-        .filter((article) => {
-            const source = article.source || 'unknown';
-            if (articleSourceFilter !== 'all' && source !== articleSourceFilter) {
-                return false;
-            }
-            if (!articleSearchTerm) return true;
-            const haystack = [
-                article.article_id || '',
-                article.title || '',
-                article.content || '',
-                article.source || '',
-                article.section || '',
-                article.metadata?.section || ''
-            ].join(' ').toLowerCase();
-            return haystack.includes(articleSearchTerm);
-        })
-        .sort((left, right) => compareArticles(left, right, articleSortMode));
-
-    const totalPages = Math.max(1, Math.ceil(filtered.length / articlePageSize));
-    articleCurrentPage = Math.min(Math.max(articleCurrentPage, 1), totalPages);
-    const startIndex = (articleCurrentPage - 1) * articlePageSize;
-    const paged = filtered.slice(startIndex, startIndex + articlePageSize);
-    const endIndex = startIndex + paged.length;
-
-    if (!paged.length) {
-        articleList.innerHTML = '<div class="text-muted">No matching articles for current filters.</div>';
-    } else {
-        articleList.innerHTML = `
-            <div class="table-responsive">
-                <table class="table table-sm align-middle">
-                    <thead>
-                        <tr>
-                            <th>Article</th>
-                            <th>Source</th>
-                            <th>Section</th>
-                            <th>Published</th>
-                            <th class="text-end">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${paged.map(article => {
-                            const isSelected = currentArticle && currentArticle.article_id === article.article_id;
-                            const published = getArticleTimestamp(article);
-                            const snippet = (article.content || '').trim();
-                            const section = article.section || article.metadata?.section || '-';
-                            return `
-                                <tr class="${isSelected ? 'table-primary' : ''}">
-                                    <td>
-                                        <div class="fw-semibold">${article.title || 'No title'}</div>
-                                        <div class="small text-muted">${article.article_id || 'n/a'}</div>
-                                        <div class="small text-muted">${snippet ? `${snippet.substring(0, 95)}${snippet.length > 95 ? '...' : ''}` : 'No preview content'}</div>
-                                    </td>
-                                    <td><span class="badge text-bg-light border">${article.source || 'unknown'}</span></td>
-                                    <td>${section}</td>
-                                    <td class="small text-muted">${published ? formatDate(published) : 'n/a'}</td>
-                                    <td class="text-end">
-                                        <button class="btn btn-sm ${isSelected ? 'btn-primary' : 'btn-outline-primary'} select-article-btn" data-id="${article.article_id}">
-                                            ${isSelected ? 'Selected' : 'Select'}
-                                        </button>
-                                    </td>
-                                </tr>
-                            `;
-                        }).join('')}
-                    </tbody>
-                </table>
-            </div>
-        `;
-    }
-    if (summary) {
-        summary.textContent = filtered.length
-            ? `Showing ${startIndex + 1}-${endIndex} of ${filtered.length} matching articles (${articles.length} total)`
-            : `0 matching articles (${articles.length} total)`;
-    }
-    if (pageInfo) pageInfo.textContent = `Page ${articleCurrentPage} of ${totalPages}`;
-    if (prevButton) prevButton.disabled = articleCurrentPage <= 1;
-    if (nextButton) nextButton.disabled = articleCurrentPage >= totalPages;
+    getRecommendationsArticlesModule().displayArticles(buildRecommendationsArticlesContext());
 }
 
 function displayArticle(article) {
-    if (!article) return;
-
-    currentArticle = article;
-
-    document.getElementById('article-title').textContent = article.title || 'No Title';
-    document.getElementById('article-content').textContent = article.content || 'No content available';
-
-    const articleUrl = article.metadata?.url;
-    const urlElement = document.getElementById('article-url');
-    if (articleUrl) {
-        urlElement.href = articleUrl;
-        urlElement.style.display = 'inline-block';
-    } else {
-        urlElement.style.display = 'none';
-    }
-
-    document.getElementById('show-similar').style.display = 'inline-block';
-    const whyNotInput = document.getElementById('why-not-article-id');
-    if (whyNotInput && !whyNotInput.value) {
-        whyNotInput.value = article.article_id || '';
-    }
-    const whyThisInput = document.getElementById('why-this-article-id');
-    if (whyThisInput && !whyThisInput.value) {
-        whyThisInput.value = article.article_id || '';
-    }
+    getRecommendationsArticlesModule().displayArticle(article, buildRecommendationsArticlesContext());
 }
 
 function getSelectedSources() {
@@ -5334,54 +5170,12 @@ function setupEventListeners() {
     on('audit-resource-filter', 'change', loadAuditLogs);
 }
 
-function formatDate(dateString) {
-    if (!dateString) return 'No date';
-    try {
-        const date = new Date(dateString);
-        return date.toLocaleDateString('en-US', {
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric'
-        });
-    } catch (_e) {
-        return 'Invalid date';
-    }
-}
-
-function getArticleTimestamp(article) {
-    return article?.metadata?.scraped_at || article?.metadata?.published_at || article?.published_at || null;
-}
-
-function compareArticles(left, right, mode) {
-    if (mode === 'title_asc') {
-        return String(left.title || '').localeCompare(String(right.title || ''), undefined, { sensitivity: 'base' });
-    }
-    if (mode === 'title_desc') {
-        return String(right.title || '').localeCompare(String(left.title || ''), undefined, { sensitivity: 'base' });
-    }
-    const leftTs = new Date(getArticleTimestamp(left) || 0).getTime();
-    const rightTs = new Date(getArticleTimestamp(right) || 0).getTime();
-    if (mode === 'oldest') return leftTs - rightTs;
-    return rightTs - leftTs;
-}
-
 function refreshArticleSourceFilterOptions() {
-    const sourceSelect = document.getElementById('article-source-select');
-    if (!sourceSelect) return;
-    const sources = Array.from(new Set(articles.map(item => item.source || 'unknown'))).sort((a, b) => a.localeCompare(b));
-    sourceSelect.innerHTML = '<option value="all">All sources</option>' + sources.map(src => `<option value="${src}">${src}</option>`).join('');
-    if (articleSourceFilter !== 'all' && !sources.includes(articleSourceFilter)) {
-        articleSourceFilter = 'all';
-    }
-    sourceSelect.value = articleSourceFilter;
+    getRecommendationsArticlesModule().refreshArticleSourceFilterOptions(buildRecommendationsArticlesContext());
 }
 
 function selectArticleById(articleId) {
-    const article = articles.find(a => a.article_id === articleId);
-    if (!article) return;
-    currentArticle = article;
-    displayArticle(article);
-    displayArticles();
+    getRecommendationsArticlesModule().selectArticleById(articleId, buildRecommendationsArticlesContext());
 }
 
 function showError(message) {
