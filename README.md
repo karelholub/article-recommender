@@ -368,3 +368,8 @@ k6 run scripts/loadtest_k6.js
 Optional environment overrides:
 - `BASE_URL=http://localhost:5001`
 - `ACTOR_ID=ops-user` (for smoke script)
+
+Async ingest queue operations:
+- `GET /api/events/ingest-queue-status`
+- `GET /api/events/ingest-queue-health` (5m/15m trend + throttle advisories)
+- `POST /api/events/ingest-queue-control` with `action=enable|disable|drain`

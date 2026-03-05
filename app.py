@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from datetime import datetime, timedelta
 import fcntl
 import hashlib
@@ -90,6 +91,7 @@ _events_queue_state = {
 _events_worker_stop_event = threading.Event()
 _events_worker_thread: Optional[threading.Thread] = None
 _events_queue_jobs: Dict[str, Dict[str, Any]] = {}
+_events_queue_history: "deque[Dict[str, Any]]" = deque(maxlen=max(120, int(os.getenv("EVENTS_QUEUE_HISTORY_MAXLEN", "720"))))
 _rollup_jobs_lock = threading.Lock()
 _rollup_jobs: Dict[str, Dict[str, Any]] = {}
 _rollup_executor = ThreadPoolExecutor(max_workers=1)
@@ -881,6 +883,7 @@ def _enqueue_event_batch(validated_events: List[Dict[str, Any]], actor_id: str =
         _events_queue_jobs[job_id] = job
         _events_queue_state["enqueued_total"] += 1
     _events_queue.put({"job_id": job_id, "events": validated_events})
+    _record_events_queue_sample()
     return job
 
 
@@ -909,6 +912,7 @@ def _events_worker_loop() -> None:
                     _events_queue_jobs[job_id]["status"] = "completed"
                     _events_queue_jobs[job_id]["inserted"] = inserted
                     _events_queue_jobs[job_id]["updated_at"] = now_str
+            _record_events_queue_sample()
         except Exception as exc:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with _events_queue_lock:
@@ -920,6 +924,7 @@ def _events_worker_loop() -> None:
                     _events_queue_jobs[job_id]["updated_at"] = now_str
             logger.error(f"Async events ingestion failed: {str(exc)}")
             logger.error(traceback.format_exc())
+            _record_events_queue_sample()
         finally:
             _events_queue.task_done()
 
@@ -945,9 +950,112 @@ def _get_events_job(job_id: str) -> Optional[Dict[str, Any]]:
 def _events_queue_snapshot() -> Dict[str, Any]:
     with _events_queue_lock:
         snapshot = dict(_events_queue_state)
-    snapshot["queue_size"] = int(_events_queue.qsize())
+    queue_size = int(_events_queue.qsize())
+    queue_capacity = int(_events_queue.maxsize or 0)
+    saturation = (float(queue_size) / float(queue_capacity)) if queue_capacity > 0 else 0.0
+    snapshot["queue_size"] = queue_size
+    snapshot["queue_capacity"] = queue_capacity
+    snapshot["saturation"] = round(saturation, 6)
     snapshot["jobs_tracked"] = int(len(_events_queue_jobs))
     return snapshot
+
+
+def _record_events_queue_sample(snapshot: Optional[Dict[str, Any]] = None) -> None:
+    snap = snapshot or _events_queue_snapshot()
+    sample = {
+        "at": datetime.now().isoformat(),
+        "queue_size": int(snap.get("queue_size") or 0),
+        "queue_capacity": int(snap.get("queue_capacity") or 0),
+        "saturation": float(snap.get("saturation") or 0.0),
+        "enabled": bool(snap.get("enabled")),
+        "running": bool(snap.get("running")),
+        "enqueued_total": int(snap.get("enqueued_total") or 0),
+        "processed_total": int(snap.get("processed_total") or 0),
+        "failed_total": int(snap.get("failed_total") or 0),
+    }
+    with _events_queue_lock:
+        _events_queue_history.append(sample)
+
+
+def _events_queue_health_snapshot() -> Dict[str, Any]:
+    now = datetime.now()
+    base = _events_queue_snapshot()
+    _record_events_queue_sample(base)
+    with _events_queue_lock:
+        samples = list(_events_queue_history)
+
+    def _window(minutes: int) -> Dict[str, Any]:
+        cutoff = now - timedelta(minutes=int(minutes))
+        in_window = []
+        for sample in samples:
+            ts = _safe_parse_timestamp(sample.get("at"))
+            if ts and ts >= cutoff:
+                in_window.append(sample)
+        if not in_window:
+            return {
+                "minutes": minutes,
+                "samples": 0,
+                "enqueued_delta": 0,
+                "processed_delta": 0,
+                "failed_delta": 0,
+                "peak_queue_size": int(base.get("queue_size") or 0),
+                "peak_saturation": float(base.get("saturation") or 0.0),
+            }
+        first = in_window[0]
+        last = in_window[-1]
+        return {
+            "minutes": minutes,
+            "samples": len(in_window),
+            "enqueued_delta": int(last.get("enqueued_total", 0)) - int(first.get("enqueued_total", 0)),
+            "processed_delta": int(last.get("processed_total", 0)) - int(first.get("processed_total", 0)),
+            "failed_delta": int(last.get("failed_total", 0)) - int(first.get("failed_total", 0)),
+            "peak_queue_size": max(int(item.get("queue_size") or 0) for item in in_window),
+            "peak_saturation": round(max(float(item.get("saturation") or 0.0) for item in in_window), 6),
+        }
+
+    window_5m = _window(5)
+    window_15m = _window(15)
+    warnings: List[Dict[str, Any]] = []
+    if float(base.get("saturation") or 0.0) >= 0.85:
+        warnings.append(
+            {
+                "code": "queue_near_capacity",
+                "severity": "high",
+                "message": "Async events queue is near capacity.",
+                "recommendation": "Disable ingestion temporarily or drain queue.",
+            }
+        )
+    if int(window_5m.get("failed_delta") or 0) > 0:
+        warnings.append(
+            {
+                "code": "queue_processing_failures",
+                "severity": "warn",
+                "message": "Async queue worker reported failures in the last 5 minutes.",
+                "recommendation": "Inspect worker errors and payload validity.",
+            }
+        )
+    if int(window_5m.get("enqueued_delta") or 0) > 0 and int(window_5m.get("processed_delta") or 0) == 0 and bool(base.get("enabled")):
+        warnings.append(
+            {
+                "code": "queue_backlog_stagnation",
+                "severity": "warn",
+                "message": "Queue received events but no processing progress in the last 5 minutes.",
+                "recommendation": "Check worker status and temporarily reduce ingest rate.",
+            }
+        )
+    advisories = {
+        "ingest_async": "throttle" if warnings else "normal",
+        "recommendations": "monitor" if warnings else "normal",
+    }
+    return {
+        "queue": base,
+        "trend": {
+            "window_5m": window_5m,
+            "window_15m": window_15m,
+        },
+        "warnings": warnings,
+        "advisories": advisories,
+    }
 
 
 def _set_events_queue_enabled(enabled: bool) -> Dict[str, Any]:
@@ -957,7 +1065,9 @@ def _set_events_queue_enabled(enabled: bool) -> Dict[str, Any]:
             _events_queue_state["running"] = False
     if enabled:
         _start_events_worker_if_enabled()
-    return _events_queue_snapshot()
+    snapshot = _events_queue_snapshot()
+    _record_events_queue_sample(snapshot)
+    return snapshot
 
 
 def _drain_events_queue(max_items: int = 100000) -> Dict[str, Any]:
@@ -980,7 +1090,9 @@ def _drain_events_queue(max_items: int = 100000) -> Dict[str, Any]:
                 _events_queue_jobs[job_id]["error"] = "queue_drained_by_operator"
         drained += 1
         _events_queue.task_done()
-    return {"drained": drained, "queue": _events_queue_snapshot()}
+    snapshot = _events_queue_snapshot()
+    _record_events_queue_sample(snapshot)
+    return {"drained": drained, "queue": snapshot}
 
 
 def _run_rollup_rebuild_job(job_id: str, days: int, actor_id: str) -> None:
@@ -2011,6 +2123,7 @@ app.config["APP_HELPERS"] = {
     "enqueue_event_batch": _enqueue_event_batch,
     "get_events_job": _get_events_job,
     "events_queue_state": _events_queue_snapshot,
+    "events_queue_health": _events_queue_health_snapshot,
     "set_events_queue_enabled": _set_events_queue_enabled,
     "drain_events_queue": _drain_events_queue,
     "build_recommendation_cache_key": _build_recommendation_cache_key,
@@ -2106,6 +2219,7 @@ def openapi_spec():
                 }
             },
             "/api/events/ingest-queue-status": {"get": {"summary": "Get async events queue status"}},
+            "/api/events/ingest-queue-health": {"get": {"summary": "Get async events queue trend and advisory health"}},
             "/api/events/ingest-queue-control": {"post": {"summary": "Control async events queue (enable/disable/drain)"}},
             "/api/metrics/online-kpis": {
                 "get": {

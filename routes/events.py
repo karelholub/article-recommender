@@ -176,6 +176,12 @@ def recommendation_events_async_queue_status():
     return jsonify({'api_version': 'v1', 'queue': _helpers()['events_queue_state']()})
 
 
+@events_blueprint.route('/api/events/ingest-queue-health', methods=['GET'])
+@events_blueprint.route('/api/v1/events/ingest-queue-health', methods=['GET'])
+def recommendation_events_async_queue_health():
+    return jsonify({'api_version': 'v1', **_helpers()['events_queue_health']()})
+
+
 @events_blueprint.route('/api/events/ingest-queue-control', methods=['POST'])
 @events_blueprint.route('/api/v1/events/ingest-queue-control', methods=['POST'])
 def recommendation_events_async_queue_control():

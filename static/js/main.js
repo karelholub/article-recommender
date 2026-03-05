@@ -85,6 +85,39 @@ function hasElement(id) {
     return Boolean(document.getElementById(id));
 }
 
+function getOperationsQueueModule() {
+    if (!window.OperationsQueueModule) {
+        throw new Error('Operations queue module is not loaded');
+    }
+    return window.OperationsQueueModule;
+}
+
+function getReportingRolloutsModule() {
+    if (!window.ReportingRolloutsModule) {
+        throw new Error('Reporting rollouts module is not loaded');
+    }
+    return window.ReportingRolloutsModule;
+}
+
+function buildRolloutsModuleContext() {
+    return {
+        ApiClient,
+        rolloutItems,
+        selectedRolloutId,
+        rankingConfigs,
+        setRolloutItems: (items) => {
+            rolloutItems = items;
+        },
+        setSelectedRolloutId: (rolloutId) => {
+            selectedRolloutId = rolloutId;
+        },
+        getOperatorId,
+        getOperatorHeaders,
+        renderRolloutControls,
+        loadRollouts,
+    };
+}
+
 // Initialize the application
 document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('article-list')) loadArticles();
@@ -102,8 +135,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('cleanup-status')) loadCleanupStatus();
     if (hasElement('rollups-status')) loadRollupsStatus();
     if (hasElement('events-queue-status')) loadEventsQueueStatus();
+    if (hasElement('events-queue-health')) loadEventsQueueHealth();
     if (hasElement('api-protection-status')) loadApiProtectionStatus();
     if (hasElement('events-queue-status')) setInterval(loadEventsQueueStatus, 5000);
+    if (hasElement('events-queue-health')) setInterval(loadEventsQueueHealth, 10000);
     setInterval(() => {
         if (rollupAsyncJobId) {
             loadRollupAsyncStatus().catch(() => {});
@@ -2203,67 +2238,27 @@ async function loadRollupsStatus() {
 let rollupAsyncJobId = null;
 
 async function loadEventsQueueStatus() {
-    const container = document.getElementById('events-queue-status');
-    if (!container) return;
-    try {
-        const payload = await ApiClient.get('/api/events/ingest-queue-status');
-        const queue = payload.queue || {};
-        container.innerHTML = `
-            <div><strong>Enabled:</strong> ${queue.enabled ? 'yes' : 'no'}</div>
-            <div><strong>Running:</strong> ${queue.running ? 'yes' : 'no'}</div>
-            <div><strong>Queue size:</strong> ${queue.queue_size ?? 0}</div>
-            <div><strong>Enqueued:</strong> ${queue.enqueued_total ?? 0} | <strong>Processed:</strong> ${queue.processed_total ?? 0} | <strong>Failed:</strong> ${queue.failed_total ?? 0}</div>
-            <div><strong>Last processed:</strong> ${queue.last_processed_at || 'n/a'}</div>
-        `;
-    } catch (error) {
-        container.textContent = `Events queue unavailable: ${error.message}`;
-    }
+    await getOperationsQueueModule().loadEventsQueueStatus({ ApiClient });
+}
+
+async function loadEventsQueueHealth() {
+    await getOperationsQueueModule().loadEventsQueueHealth({ ApiClient });
 }
 
 async function enqueueEventsSample() {
-    const countRaw = Number(document.getElementById('events-queue-sample-size')?.value || 5);
-    const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(5, Math.round(countRaw))) : 5;
-    const now = Date.now();
-    const runSuffix = String(now % 1000000000000).padStart(12, '0');
-    const runId = `00000000-0000-0000-0000-${runSuffix}`;
-    const events = Array.from({ length: count }).map((_, idx) => ({
-        event_type: 'impression',
-        run_id: runId,
-        article_id: `sample_article_${idx + 1}`,
-        scenario_id: 'default',
-        user_id: `sample_user_${idx + 1}`,
-        external_user_id: `sample_ext_${idx + 1}`,
-        rank_position: idx + 1,
-        event_value: 1.0,
-        metadata: { source: 'sample.source.local', synthetic: true },
-    }));
-    const response = await fetch('/api/events/ingest-async', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
-        body: JSON.stringify({ events, actor_id: getOperatorId() || undefined }),
+    await getOperationsQueueModule().enqueueEventsSample({
+        ApiClient,
+        getOperatorHeaders,
+        getOperatorId,
     });
-    const payload = await response.json();
-    if (!response.ok) {
-        throw new Error(payload.error || 'Failed to enqueue sample events');
-    }
-    await loadEventsQueueStatus();
 }
 
 async function controlEventsQueue(action) {
-    if (!['enable', 'disable', 'drain'].includes(action)) {
-        throw new Error('Unsupported queue action');
-    }
-    const payload = { action, actor_id: getOperatorId() || undefined };
-    const response = await fetch('/api/events/ingest-queue-control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
-        body: JSON.stringify(payload)
+    await getOperationsQueueModule().controlEventsQueue(action, {
+        ApiClient,
+        getOperatorHeaders,
+        getOperatorId,
     });
-    const body = await response.json();
-    if (!response.ok) {
-        throw new Error(body.error || 'Failed to control events queue');
-    }
-    await loadEventsQueueStatus();
 }
 
 async function rebuildRollupsAsync() {
@@ -2904,147 +2899,39 @@ async function promoteExperimentCandidateVariant() {
 }
 
 function rolloutConfigOptionsHtml(selectedValue = '') {
-    const configs = Object.values(rankingConfigs || {});
-    const options = configs.map((item) => {
-        const configId = item?.config?.config_id || '';
-        const version = item?.version ?? 0;
-        return `<option value="${configId}" ${selectedValue === configId ? 'selected' : ''}>${configId} (v${version})</option>`;
-    }).join('');
-    return options || '<option value="balanced">balanced</option>';
+    return getReportingRolloutsModule().rolloutConfigOptionsHtml(rankingConfigs, selectedValue);
 }
 
 function renderRolloutControls() {
-    const summary = document.getElementById('rollout-summary');
-    const table = document.getElementById('rollout-table');
-    const select = document.getElementById('rollout-select');
-    const activeHint = document.getElementById('active-rollout-hint');
-    if (!select && !activeHint) return;
-
-    const active = rolloutItems.find(item => item.enabled && item.status === 'running') || null;
-    if (activeHint) {
-        activeHint.textContent = active
-            ? `Active canary rollout: ${active.name} (${Number(active.traffic_percentage || 0).toFixed(1)}% candidate traffic).`
-            : 'No active canary rollout detected.';
-    }
-    if (!select || !table || !summary) return;
-
-    const previous = selectedRolloutId || select.value || '';
-    const options = ['<option value="">New rollout</option>']
-        .concat((rolloutItems || []).map(item => `<option value="${item.rollout_id}">${item.name} (${item.status})</option>`));
-    select.innerHTML = options.join('');
-    select.value = rolloutItems.some(item => item.rollout_id === previous) ? previous : '';
-    selectedRolloutId = select.value;
-
-    const activeCount = rolloutItems.filter(item => item.enabled && item.status === 'running').length;
-    summary.textContent = `Rollouts: ${rolloutItems.length} total | Active: ${activeCount}`;
-    table.innerHTML = (rolloutItems || []).map(item => {
-        const lastGuard = item.last_evaluation?.passed == null
-            ? 'n/a'
-            : (item.last_evaluation.passed ? 'PASS' : 'FAIL');
-        return `
-            <tr data-rollout-id="${item.rollout_id}" class="rollout-row">
-                <td>${item.name}</td>
-                <td>${item.status}${item.enabled ? ' / enabled' : ''}</td>
-                <td>${Number(item.traffic_percentage || 0).toFixed(1)}%</td>
-                <td>${item.baseline_config_id || 'n/a'}</td>
-                <td>${item.candidate_config_id || 'n/a'}</td>
-                <td>${lastGuard}</td>
-                <td>${item.updated_at || 'n/a'}</td>
-            </tr>
-        `;
-    }).join('') || '<tr><td colspan="7" class="text-muted">No rollout definitions yet.</td></tr>';
-
-    const selected = rolloutItems.find(item => item.rollout_id === selectedRolloutId) || null;
-    document.getElementById('rollout-name').value = selected?.name || '';
-    document.getElementById('rollout-baseline-config').innerHTML = rolloutConfigOptionsHtml(selected?.baseline_config_id || 'balanced');
-    document.getElementById('rollout-candidate-config').innerHTML = rolloutConfigOptionsHtml(selected?.candidate_config_id || 'balanced');
-    if (!document.getElementById('rollout-baseline-config').value) document.getElementById('rollout-baseline-config').value = 'balanced';
-    if (!document.getElementById('rollout-candidate-config').value) document.getElementById('rollout-candidate-config').value = 'balanced';
-    document.getElementById('rollout-traffic-percentage').value = Number(selected?.traffic_percentage ?? 10).toFixed(1);
-    document.getElementById('rollout-auto-rollback-enabled').checked = Boolean(selected?.auto_rollback?.enabled ?? true);
-    document.getElementById('rollout-evaluation-days').value = Number(selected?.auto_rollback?.evaluation_days ?? 7);
-    document.getElementById('rollout-min-candidate-runs').value = Number(selected?.auto_rollback?.min_candidate_runs ?? 200);
-    document.getElementById('rollout-min-ctr-lift').value = Number(selected?.auto_rollback?.min_ctr_lift ?? -0.01).toFixed(3);
-    document.getElementById('rollout-max-ctr-drop').value = Number(selected?.auto_rollback?.max_ctr_drop ?? 0.02).toFixed(3);
+    getReportingRolloutsModule().renderRolloutControls(buildRolloutsModuleContext());
 }
 
 async function loadRollouts() {
-    try {
-        const payload = await ApiClient.get('/api/rollouts');
-        rolloutItems = payload.rollouts || [];
-        renderRolloutControls();
-    } catch (error) {
-        const summary = document.getElementById('rollout-summary');
-        const table = document.getElementById('rollout-table');
-        if (summary) summary.textContent = `Rollout loading failed: ${error.message}`;
-        if (table) table.innerHTML = '<tr><td colspan="7" class="text-danger">Failed to load rollouts.</td></tr>';
-    }
+    await getReportingRolloutsModule().loadRollouts(buildRolloutsModuleContext());
 }
 
 function collectRolloutPayloadFromUi() {
-    return {
-        name: document.getElementById('rollout-name')?.value?.trim() || '',
-        baseline_config_id: document.getElementById('rollout-baseline-config')?.value || 'balanced',
-        candidate_config_id: document.getElementById('rollout-candidate-config')?.value || '',
-        traffic_percentage: Number(document.getElementById('rollout-traffic-percentage')?.value || 10),
-        auto_rollback: {
-            enabled: Boolean(document.getElementById('rollout-auto-rollback-enabled')?.checked),
-            evaluation_days: Number(document.getElementById('rollout-evaluation-days')?.value || 7),
-            min_candidate_runs: Number(document.getElementById('rollout-min-candidate-runs')?.value || 200),
-            min_ctr_lift: Number(document.getElementById('rollout-min-ctr-lift')?.value || -0.01),
-            max_ctr_drop: Number(document.getElementById('rollout-max-ctr-drop')?.value || 0.02)
-        },
-        actor_id: getOperatorId() || undefined
-    };
+    return getReportingRolloutsModule().collectRolloutPayloadFromUi(getOperatorId);
 }
 
 async function saveRollout() {
-    const payload = collectRolloutPayloadFromUi();
-    if (!payload.candidate_config_id) {
-        throw new Error('Candidate config is required');
-    }
-    if (selectedRolloutId) {
-        await ApiClient.put(`/api/rollouts/${encodeURIComponent(selectedRolloutId)}`, payload, { headers: getOperatorHeaders() });
-    } else {
-        const created = await ApiClient.post('/api/rollouts', payload, { headers: getOperatorHeaders() });
-        selectedRolloutId = created.rollout?.rollout_id || '';
-    }
-    await loadRollouts();
+    await getReportingRolloutsModule().saveRollout(buildRolloutsModuleContext());
 }
 
 async function startSelectedRollout() {
-    if (!selectedRolloutId) throw new Error('Select rollout first');
-    await ApiClient.post(`/api/rollouts/${encodeURIComponent(selectedRolloutId)}/start`, { actor_id: getOperatorId() || undefined }, { headers: getOperatorHeaders() });
-    await loadRollouts();
+    await getReportingRolloutsModule().startSelectedRollout(buildRolloutsModuleContext());
 }
 
 async function stopSelectedRollout() {
-    if (!selectedRolloutId) throw new Error('Select rollout first');
-    await ApiClient.post(`/api/rollouts/${encodeURIComponent(selectedRolloutId)}/stop`, { actor_id: getOperatorId() || undefined }, { headers: getOperatorHeaders() });
-    await loadRollouts();
+    await getReportingRolloutsModule().stopSelectedRollout(buildRolloutsModuleContext());
 }
 
 async function evaluateSelectedRollout() {
-    if (!selectedRolloutId) throw new Error('Select rollout first');
-    const response = await ApiClient.post(
-        `/api/rollouts/${encodeURIComponent(selectedRolloutId)}/evaluate`,
-        { apply_auto_rollback: true, actor_id: getOperatorId() || undefined },
-        { headers: getOperatorHeaders() }
-    );
-    const summary = document.getElementById('rollout-summary');
-    if (summary) {
-        summary.textContent = response.evaluation?.passed
-            ? 'Selected rollout guard passed.'
-            : `Selected rollout guard failed${response.evaluation?.auto_rollback_applied ? ' and rollout was auto-paused.' : '.'}`;
-    }
-    await loadRollouts();
+    await getReportingRolloutsModule().evaluateSelectedRollout(buildRolloutsModuleContext());
 }
 
 async function evaluateActiveRollouts() {
-    const response = await ApiClient.post('/api/rollouts/evaluate-active', { apply_auto_rollback: true, actor_id: getOperatorId() || undefined }, { headers: getOperatorHeaders() });
-    const summary = document.getElementById('rollout-summary');
-    if (summary) summary.textContent = `Evaluated ${response.count || 0} active rollouts.`;
-    await loadRollouts();
+    await getReportingRolloutsModule().evaluateActiveRollouts(buildRolloutsModuleContext());
 }
 
 function renderScenarioTraceMetrics(payload) {
@@ -5258,7 +5145,10 @@ function setupEventListeners() {
     });
     on('refresh-cleanup-status', 'click', loadCleanupStatus);
     on('refresh-rollups-status', 'click', loadRollupsStatus);
-    on('refresh-events-queue', 'click', loadEventsQueueStatus);
+    on('refresh-events-queue', 'click', async () => {
+        await loadEventsQueueStatus();
+        await loadEventsQueueHealth();
+    });
     on('rollups-days', 'change', loadRollupsStatus);
     on('rebuild-rollups', 'click', async () => {
         try {
