@@ -27,6 +27,8 @@ let reportingLastExperimentComparison = null;
 let reportingQualitySnapshots = [];
 let reportingLastQualityCompare = null;
 let reportingLastConfigCompare = null;
+let rolloutItems = [];
+let selectedRolloutId = '';
 let cdpIntegration = null;
 let recommendationRuns = [];
 let rankingLabContexts = [];
@@ -37,6 +39,7 @@ let articleSourceFilter = 'all';
 let articleSortMode = 'newest';
 let articlePageSize = 20;
 let articleCurrentPage = 1;
+const preferredSourceFromQuery = new URLSearchParams(window.location.search).get('source');
 const GUARD_PRESET_STORAGE_KEY = 'reporting_guard_preset_v1';
 const RANKING_LAB_BOOKMARKS_STORAGE_KEY = 'ranking_lab_context_sets_v1';
 const GUARD_PRESETS = {
@@ -99,6 +102,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hasElement('cleanup-status')) loadCleanupStatus();
     if (hasElement('rollups-status')) loadRollupsStatus();
     if (hasElement('events-queue-status')) loadEventsQueueStatus();
+    if (hasElement('api-protection-status')) loadApiProtectionStatus();
     if (hasElement('events-queue-status')) setInterval(loadEventsQueueStatus, 5000);
     setInterval(() => {
         if (rollupAsyncJobId) {
@@ -133,6 +137,7 @@ document.addEventListener('DOMContentLoaded', () => {
         loadReportingWorkspace();
         loadQualitySnapshotHistory();
     }
+    if (hasElement('rollout-select') || hasElement('active-rollout-hint')) loadRollouts();
     if (hasElement('online-kpi-summary')) {
         loadOnlineKpis();
     }
@@ -252,11 +257,20 @@ function renderConnectors() {
 
     container.innerHTML = filtered.map(connector => {
         const metric = connectorMetricsById[connector.connector_id] || {};
+        const rawUrl = connector.config?.base_url || connector.config?.feed_url || '';
+        let sourceDomain = '';
+        if (rawUrl) {
+            try {
+                sourceDomain = new URL(rawUrl).hostname.replace(/^www\./, '');
+            } catch (_error) {
+                sourceDomain = '';
+            }
+        }
         return `
             <div class="border rounded p-2 mb-2 connector-card" data-id="${connector.connector_id}">
                 <div class="fw-semibold">${connector.name}</div>
                 <div class="text-muted">${connector.connector_type}</div>
-                <div class="text-muted small">${connector.config?.base_url || connector.config?.feed_url || 'n/a'}</div>
+                <div class="text-muted small">${rawUrl || 'n/a'}</div>
                 <div class="text-muted small">
                     Auto-sync: ${connector.config?.auto_sync_enabled ? 'on' : 'off'}
                     (${Number(connector.config?.sync_interval_minutes || 60)} min)
@@ -269,6 +283,7 @@ function renderConnectors() {
                     Health: ${metric.health_state || 'unknown'}
                     ${metric.last_error_code ? ` | Last error: ${metric.last_error_code}` : ''}
                 </div>
+                ${sourceDomain ? `<div class="small mt-1"><a class="text-decoration-none" href="/recommendations?source=${encodeURIComponent(sourceDomain)}">Open in Recommendations (source filter)</a></div>` : ''}
                 <div class="row g-2 mt-1">
                     <div class="col-4">
                         <input class="form-control form-control-sm connector-max-articles" type="number" min="1" max="50" value="${Number(connector.config?.max_articles || 10)}" title="max_articles">
@@ -658,6 +673,15 @@ function renderSourceFilters() {
             </div>
         </div>
     `).join('');
+    const hint = document.getElementById('active-rollout-hint');
+    if (preferredSourceFromQuery) {
+        document.querySelectorAll('.source-filter').forEach(el => {
+            el.checked = el.value === preferredSourceFromQuery;
+        });
+        if (hint) {
+            hint.textContent = `Source preselected from Operations: ${preferredSourceFromQuery}`;
+        }
+    }
 }
 
 function renderReportingSourceFilterOptions() {
@@ -741,6 +765,7 @@ async function loadRankingConfigs() {
         renderOnlineKpiSelectors();
         renderRankingLabConfigSelectors();
         renderRuleBuilderConfigOptions();
+        renderRolloutControls();
         loadDecisionContext();
     } catch (error) {
         console.error('Error loading ranking configs:', error);
@@ -751,6 +776,7 @@ async function loadRankingConfigs() {
         renderConfigCompareSelectors();
         renderOnlineKpiSelectors();
         renderRankingLabConfigSelectors();
+        renderRolloutControls();
         if (select) populateRankingConfigEditor('balanced');
     }
 }
@@ -1670,6 +1696,23 @@ async function loadCleanupStatus() {
     } catch (error) {
         console.error('Error loading cleanup status:', error);
         container.textContent = `Cleanup status unavailable: ${error.message}`;
+    }
+}
+
+async function loadApiProtectionStatus() {
+    const container = document.getElementById('api-protection-status');
+    if (!container) return;
+    try {
+        const payload = await ApiClient.get('/api/operations/api-protection-status');
+        container.innerHTML = `
+            <div>API key auth: <strong>${payload.api_auth_enabled ? 'enabled' : 'disabled'}</strong> (keys: ${payload.configured_api_key_count || 0})</div>
+            <div>Request signature: <strong>${payload.api_signature_enabled ? 'enabled' : 'disabled'}</strong></div>
+            <div>Rate limit: <strong>${payload.rate_limit_enabled ? 'enabled' : 'disabled'}</strong> (default ${payload.rate_limit_default_per_minute || 0}/min)</div>
+            <div>Active buckets: ${payload.active_rate_limit_buckets || 0}</div>
+            <div class="mt-1">Effective limits: CMS ${payload.effective_limits_preview?.recommendations_cms ?? 'n/a'}/min, events ${payload.effective_limits_preview?.events ?? 'n/a'}/min, configs ${payload.effective_limits_preview?.ranking_configs ?? 'n/a'}/min</div>
+        `;
+    } catch (error) {
+        container.textContent = `API protection status unavailable: ${error.message}`;
     }
 }
 
@@ -2732,7 +2775,7 @@ function renderExperimentMetrics(payload) {
     if (table) {
         const rows = (payload.variants || []).map(item => `
             <tr>
-                <td>${item.variant_id}</td>
+                <td>${item.variant_id}${item.top_config_id ? `<div class="small text-muted">cfg: ${item.top_config_id}</div>` : ''}</td>
                 <td>${item.runs || 0}</td>
                 <td>${item.impressions || 0}</td>
                 <td>${item.clicks || 0}</td>
@@ -2809,6 +2852,182 @@ async function compareExperimentVariants() {
     }
     const payload = await response.json();
     renderExperimentComparison(payload);
+}
+
+async function promoteExperimentCandidateVariant() {
+    const variantId = document.getElementById('experiment-candidate')?.value || '';
+    if (!variantId) {
+        throw new Error('Select candidate variant first');
+    }
+    const days = Math.max(1, Math.min(365, Number(document.getElementById('reporting-days')?.value || 30)));
+    const experimentId = reportingLastExperiments?.experiment_id || '';
+    const response = await fetch('/api/metrics/experiments/promote-variant', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            experiment_id: experimentId || undefined,
+            variant_id: variantId,
+            target_config_id: 'balanced',
+            days,
+            limit_runs: 5000,
+            limit_events: 100000,
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to promote experiment variant');
+    }
+    const summary = document.getElementById('reporting-experiment-compare-summary');
+    if (summary) {
+        summary.textContent = `Promoted variant ${payload.variant_id} config ${payload.source_config_id} to ${payload.target_config_id} v${payload.target_version}.`;
+    }
+    await loadRankingConfigs();
+    await loadReportingWorkspace();
+}
+
+function rolloutConfigOptionsHtml(selectedValue = '') {
+    const configs = Object.values(rankingConfigs || {});
+    const options = configs.map((item) => {
+        const configId = item?.config?.config_id || '';
+        const version = item?.version ?? 0;
+        return `<option value="${configId}" ${selectedValue === configId ? 'selected' : ''}>${configId} (v${version})</option>`;
+    }).join('');
+    return options || '<option value="balanced">balanced</option>';
+}
+
+function renderRolloutControls() {
+    const summary = document.getElementById('rollout-summary');
+    const table = document.getElementById('rollout-table');
+    const select = document.getElementById('rollout-select');
+    const activeHint = document.getElementById('active-rollout-hint');
+    if (!select && !activeHint) return;
+
+    const active = rolloutItems.find(item => item.enabled && item.status === 'running') || null;
+    if (activeHint) {
+        activeHint.textContent = active
+            ? `Active canary rollout: ${active.name} (${Number(active.traffic_percentage || 0).toFixed(1)}% candidate traffic).`
+            : 'No active canary rollout detected.';
+    }
+    if (!select || !table || !summary) return;
+
+    const previous = selectedRolloutId || select.value || '';
+    const options = ['<option value="">New rollout</option>']
+        .concat((rolloutItems || []).map(item => `<option value="${item.rollout_id}">${item.name} (${item.status})</option>`));
+    select.innerHTML = options.join('');
+    select.value = rolloutItems.some(item => item.rollout_id === previous) ? previous : '';
+    selectedRolloutId = select.value;
+
+    const activeCount = rolloutItems.filter(item => item.enabled && item.status === 'running').length;
+    summary.textContent = `Rollouts: ${rolloutItems.length} total | Active: ${activeCount}`;
+    table.innerHTML = (rolloutItems || []).map(item => {
+        const lastGuard = item.last_evaluation?.passed == null
+            ? 'n/a'
+            : (item.last_evaluation.passed ? 'PASS' : 'FAIL');
+        return `
+            <tr data-rollout-id="${item.rollout_id}" class="rollout-row">
+                <td>${item.name}</td>
+                <td>${item.status}${item.enabled ? ' / enabled' : ''}</td>
+                <td>${Number(item.traffic_percentage || 0).toFixed(1)}%</td>
+                <td>${item.baseline_config_id || 'n/a'}</td>
+                <td>${item.candidate_config_id || 'n/a'}</td>
+                <td>${lastGuard}</td>
+                <td>${item.updated_at || 'n/a'}</td>
+            </tr>
+        `;
+    }).join('') || '<tr><td colspan="7" class="text-muted">No rollout definitions yet.</td></tr>';
+
+    const selected = rolloutItems.find(item => item.rollout_id === selectedRolloutId) || null;
+    document.getElementById('rollout-name').value = selected?.name || '';
+    document.getElementById('rollout-baseline-config').innerHTML = rolloutConfigOptionsHtml(selected?.baseline_config_id || 'balanced');
+    document.getElementById('rollout-candidate-config').innerHTML = rolloutConfigOptionsHtml(selected?.candidate_config_id || 'balanced');
+    if (!document.getElementById('rollout-baseline-config').value) document.getElementById('rollout-baseline-config').value = 'balanced';
+    if (!document.getElementById('rollout-candidate-config').value) document.getElementById('rollout-candidate-config').value = 'balanced';
+    document.getElementById('rollout-traffic-percentage').value = Number(selected?.traffic_percentage ?? 10).toFixed(1);
+    document.getElementById('rollout-auto-rollback-enabled').checked = Boolean(selected?.auto_rollback?.enabled ?? true);
+    document.getElementById('rollout-evaluation-days').value = Number(selected?.auto_rollback?.evaluation_days ?? 7);
+    document.getElementById('rollout-min-candidate-runs').value = Number(selected?.auto_rollback?.min_candidate_runs ?? 200);
+    document.getElementById('rollout-min-ctr-lift').value = Number(selected?.auto_rollback?.min_ctr_lift ?? -0.01).toFixed(3);
+    document.getElementById('rollout-max-ctr-drop').value = Number(selected?.auto_rollback?.max_ctr_drop ?? 0.02).toFixed(3);
+}
+
+async function loadRollouts() {
+    try {
+        const payload = await ApiClient.get('/api/rollouts');
+        rolloutItems = payload.rollouts || [];
+        renderRolloutControls();
+    } catch (error) {
+        const summary = document.getElementById('rollout-summary');
+        const table = document.getElementById('rollout-table');
+        if (summary) summary.textContent = `Rollout loading failed: ${error.message}`;
+        if (table) table.innerHTML = '<tr><td colspan="7" class="text-danger">Failed to load rollouts.</td></tr>';
+    }
+}
+
+function collectRolloutPayloadFromUi() {
+    return {
+        name: document.getElementById('rollout-name')?.value?.trim() || '',
+        baseline_config_id: document.getElementById('rollout-baseline-config')?.value || 'balanced',
+        candidate_config_id: document.getElementById('rollout-candidate-config')?.value || '',
+        traffic_percentage: Number(document.getElementById('rollout-traffic-percentage')?.value || 10),
+        auto_rollback: {
+            enabled: Boolean(document.getElementById('rollout-auto-rollback-enabled')?.checked),
+            evaluation_days: Number(document.getElementById('rollout-evaluation-days')?.value || 7),
+            min_candidate_runs: Number(document.getElementById('rollout-min-candidate-runs')?.value || 200),
+            min_ctr_lift: Number(document.getElementById('rollout-min-ctr-lift')?.value || -0.01),
+            max_ctr_drop: Number(document.getElementById('rollout-max-ctr-drop')?.value || 0.02)
+        },
+        actor_id: getOperatorId() || undefined
+    };
+}
+
+async function saveRollout() {
+    const payload = collectRolloutPayloadFromUi();
+    if (!payload.candidate_config_id) {
+        throw new Error('Candidate config is required');
+    }
+    if (selectedRolloutId) {
+        await ApiClient.put(`/api/rollouts/${encodeURIComponent(selectedRolloutId)}`, payload, { headers: getOperatorHeaders() });
+    } else {
+        const created = await ApiClient.post('/api/rollouts', payload, { headers: getOperatorHeaders() });
+        selectedRolloutId = created.rollout?.rollout_id || '';
+    }
+    await loadRollouts();
+}
+
+async function startSelectedRollout() {
+    if (!selectedRolloutId) throw new Error('Select rollout first');
+    await ApiClient.post(`/api/rollouts/${encodeURIComponent(selectedRolloutId)}/start`, { actor_id: getOperatorId() || undefined }, { headers: getOperatorHeaders() });
+    await loadRollouts();
+}
+
+async function stopSelectedRollout() {
+    if (!selectedRolloutId) throw new Error('Select rollout first');
+    await ApiClient.post(`/api/rollouts/${encodeURIComponent(selectedRolloutId)}/stop`, { actor_id: getOperatorId() || undefined }, { headers: getOperatorHeaders() });
+    await loadRollouts();
+}
+
+async function evaluateSelectedRollout() {
+    if (!selectedRolloutId) throw new Error('Select rollout first');
+    const response = await ApiClient.post(
+        `/api/rollouts/${encodeURIComponent(selectedRolloutId)}/evaluate`,
+        { apply_auto_rollback: true, actor_id: getOperatorId() || undefined },
+        { headers: getOperatorHeaders() }
+    );
+    const summary = document.getElementById('rollout-summary');
+    if (summary) {
+        summary.textContent = response.evaluation?.passed
+            ? 'Selected rollout guard passed.'
+            : `Selected rollout guard failed${response.evaluation?.auto_rollback_applied ? ' and rollout was auto-paused.' : '.'}`;
+    }
+    await loadRollouts();
+}
+
+async function evaluateActiveRollouts() {
+    const response = await ApiClient.post('/api/rollouts/evaluate-active', { apply_auto_rollback: true, actor_id: getOperatorId() || undefined }, { headers: getOperatorHeaders() });
+    const summary = document.getElementById('rollout-summary');
+    if (summary) summary.textContent = `Evaluated ${response.count || 0} active rollouts.`;
+    await loadRollouts();
 }
 
 function renderScenarioTraceMetrics(payload) {
@@ -2968,6 +3187,10 @@ function renderPromotionGuardResult(guardEvaluation) {
         return `<tr><td>${status}</td><td>${item.metric}</td><td>${value}</td><td>${item.operator}</td><td>${target}</td></tr>`;
     }).join('');
     panel.className = toneClass;
+    const recommendations = Array.isArray(guardEvaluation.recommendations) ? guardEvaluation.recommendations : [];
+    const recommendationsHtml = recommendations.length
+        ? `<div class="mt-2"><strong>Recommended next steps:</strong><ul class="mb-0">${recommendations.map((item) => `<li>${item}</li>`).join('')}</ul></div>`
+        : '';
     panel.innerHTML = `
         <div class="mb-1">${title}</div>
         <div class="table-responsive">
@@ -2976,6 +3199,7 @@ function renderPromotionGuardResult(guardEvaluation) {
                 <tbody>${rows}</tbody>
             </table>
         </div>
+        ${recommendationsHtml}
     `;
 }
 
@@ -3321,6 +3545,46 @@ async function promoteWithGuard() {
     renderPromotionGuardResult(payload.guard_evaluation || null);
     if (summary) summary.textContent = `Guard passed. Promoted ${payload.source_config_id} to ${payload.target_config_id} v${payload.target_version}.`;
     await loadRankingConfigs();
+}
+
+async function evaluatePromotionGuard() {
+    const baselineId = document.getElementById('config-compare-baseline')?.value || '';
+    const candidateId = document.getElementById('config-compare-candidate')?.value || '';
+    if (!baselineId || !candidateId) {
+        throw new Error('Select baseline and candidate configs');
+    }
+    const days = Math.max(1, Math.min(365, Number(document.getElementById('reporting-days')?.value || 30)));
+    const topN = Math.max(1, Math.min(20, Number(document.getElementById('config-compare-top-n')?.value || 5)));
+    const limitRuns = Math.max(10, Math.min(5000, Number(document.getElementById('config-compare-limit-runs')?.value || 300)));
+    const requireRelevant = Boolean(document.getElementById('config-compare-require-relevant')?.checked);
+    const summary = document.getElementById('reporting-config-compare-summary');
+    if (summary) summary.textContent = 'Evaluating promotion guard (no promotion)...';
+
+    const response = await fetch('/api/ranking-configs/guard-evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            baseline_config_id: baselineId,
+            candidate_config_id: candidateId,
+            days,
+            top_n: topN,
+            limit_runs: limitRuns,
+            require_relevant: requireRelevant,
+            guard: collectPromotionGuardFromUi(),
+            actor_id: getOperatorId() || undefined
+        })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to evaluate promotion guard');
+    }
+    renderConfigCompareResult(payload.comparison || {});
+    renderPromotionGuardResult(payload.guard_evaluation || null);
+    if (summary) {
+        summary.textContent = payload.guard_evaluation?.passed
+            ? 'Guard evaluation passed. Candidate is eligible for guarded promotion.'
+            : 'Guard evaluation failed. Review failed checks and recommendations below.';
+    }
 }
 
 async function autoTuneRankingConfig(apply = false) {
@@ -4654,6 +4918,66 @@ function setupEventListeners() {
             showError(error.message || 'Failed to compare ranking configs');
         }
     });
+    on('rollout-select', 'change', (event) => {
+        selectedRolloutId = event.target.value || '';
+        renderRolloutControls();
+    });
+    on('rollout-table', 'click', (event) => {
+        const row = event.target.closest('.rollout-row');
+        if (!row) return;
+        selectedRolloutId = row.dataset.rolloutId || '';
+        const select = document.getElementById('rollout-select');
+        if (select) select.value = selectedRolloutId;
+        renderRolloutControls();
+    });
+    on('new-rollout', 'click', () => {
+        selectedRolloutId = '';
+        const select = document.getElementById('rollout-select');
+        if (select) select.value = '';
+        renderRolloutControls();
+    });
+    on('save-rollout', 'click', async () => {
+        try {
+            await saveRollout();
+        } catch (error) {
+            showError(error.message || 'Failed to save rollout');
+        }
+    });
+    on('start-rollout', 'click', async () => {
+        try {
+            await startSelectedRollout();
+        } catch (error) {
+            showError(error.message || 'Failed to start rollout');
+        }
+    });
+    on('stop-rollout', 'click', async () => {
+        try {
+            await stopSelectedRollout();
+        } catch (error) {
+            showError(error.message || 'Failed to stop rollout');
+        }
+    });
+    on('evaluate-rollout', 'click', async () => {
+        try {
+            await evaluateSelectedRollout();
+        } catch (error) {
+            showError(error.message || 'Failed to evaluate rollout');
+        }
+    });
+    on('evaluate-active-rollouts', 'click', async () => {
+        try {
+            await evaluateActiveRollouts();
+        } catch (error) {
+            showError(error.message || 'Failed to evaluate active rollouts');
+        }
+    });
+    on('evaluate-promotion-guard', 'click', async () => {
+        try {
+            await evaluatePromotionGuard();
+        } catch (error) {
+            showError(error.message || 'Failed to evaluate guard');
+        }
+    });
     on('promote-candidate-config', 'click', async () => {
         try {
             await promoteCandidateConfig();
@@ -4730,6 +5054,13 @@ function setupEventListeners() {
             showError(error.message || 'Failed to compare experiment variants');
         }
     });
+    on('promote-experiment-candidate', 'click', async () => {
+        try {
+            await promoteExperimentCandidateVariant();
+        } catch (error) {
+            showError(error.message || 'Failed to promote experiment candidate');
+        }
+    });
     on('refresh-run-explorer', 'click', loadRecommendationRuns);
     on('run-limit', 'change', loadRecommendationRuns);
     on('run-list', 'click', async (event) => {
@@ -4804,6 +5135,7 @@ function setupEventListeners() {
     on('sync-due-connectors', 'click', syncDueConnectors);
     on('run-scheduler-now', 'click', runSchedulerNow);
     on('connector-list', 'click', handleConnectorAction);
+    on('refresh-api-protection', 'click', loadApiProtectionStatus);
     on('save-scenario', 'click', async () => {
         try {
             applyRuleBuilderToJson();

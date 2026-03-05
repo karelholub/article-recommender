@@ -93,6 +93,9 @@ _events_queue_jobs: Dict[str, Dict[str, Any]] = {}
 _rollup_jobs_lock = threading.Lock()
 _rollup_jobs: Dict[str, Dict[str, Any]] = {}
 _rollup_executor = ThreadPoolExecutor(max_workers=1)
+_rollouts_lock = threading.Lock()
+_rollout_auto_eval_lock = threading.Lock()
+_rollout_last_auto_eval_at: Optional[datetime] = None
 _scheduler_state = {
     "enabled": False,
     "running": False,
@@ -394,6 +397,251 @@ def _compute_scenario_publish_guard(rule_set: Dict, known_sources: List[str]) ->
     passed = all(bool(item.get("pass")) for item in checks)
     return {"passed": passed, "checks": checks}
 
+
+def _rollouts_state_path() -> str:
+    return os.getenv("ROLLOUTS_STATE_PATH", "data/rollouts.json")
+
+
+def _normalize_rollout_payload(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    now_iso = datetime.now().isoformat()
+    current = existing or {}
+    rollout_id = str(payload.get("rollout_id") or current.get("rollout_id") or str(uuid.uuid4())).strip()
+    if not rollout_id:
+        rollout_id = str(uuid.uuid4())
+    name = str(payload.get("name") or current.get("name") or f"Rollout {rollout_id[:8]}").strip()
+    baseline_config_id = str(payload.get("baseline_config_id") or current.get("baseline_config_id") or "balanced").strip() or "balanced"
+    candidate_config_id = str(payload.get("candidate_config_id") or current.get("candidate_config_id") or "").strip()
+    traffic_percentage = float(payload.get("traffic_percentage", current.get("traffic_percentage", 10.0)) or 0.0)
+    traffic_percentage = max(0.0, min(100.0, traffic_percentage))
+    baseline_scenario_id = str(payload.get("baseline_scenario_id") or current.get("baseline_scenario_id") or "").strip() or None
+    candidate_scenario_id = str(payload.get("candidate_scenario_id") or current.get("candidate_scenario_id") or "").strip() or None
+    notes = str(payload.get("notes") or current.get("notes") or "").strip()
+    enabled = bool(payload.get("enabled", current.get("enabled", False)))
+    status = str(payload.get("status") or current.get("status") or ("running" if enabled else "draft")).strip().lower()
+    if status not in {"draft", "running", "paused", "completed"}:
+        status = "draft"
+    experiment_id = str(payload.get("experiment_id") or current.get("experiment_id") or f"rollout:{rollout_id}").strip()
+    if not experiment_id:
+        experiment_id = f"rollout:{rollout_id}"
+
+    auto_raw = payload.get("auto_rollback") if "auto_rollback" in payload else current.get("auto_rollback") or {}
+    if not isinstance(auto_raw, dict):
+        auto_raw = {}
+    auto_rollback = {
+        "enabled": bool(auto_raw.get("enabled", True)),
+        "evaluation_days": max(1, min(90, int(auto_raw.get("evaluation_days", 7) or 7))),
+        "min_candidate_runs": max(1, min(100000, int(auto_raw.get("min_candidate_runs", 200) or 200))),
+        "min_ctr_lift": float(auto_raw.get("min_ctr_lift", -0.01) or -0.01),
+        "max_ctr_drop": max(0.0, float(auto_raw.get("max_ctr_drop", 0.02) or 0.02)),
+    }
+
+    return {
+        "rollout_id": rollout_id,
+        "name": name,
+        "experiment_id": experiment_id,
+        "baseline_config_id": baseline_config_id,
+        "candidate_config_id": candidate_config_id,
+        "baseline_scenario_id": baseline_scenario_id,
+        "candidate_scenario_id": candidate_scenario_id,
+        "traffic_percentage": round(traffic_percentage, 3),
+        "enabled": enabled,
+        "status": status,
+        "notes": notes,
+        "auto_rollback": auto_rollback,
+        "created_at": current.get("created_at") or now_iso,
+        "updated_at": now_iso,
+        "last_evaluated_at": current.get("last_evaluated_at"),
+        "last_evaluation": current.get("last_evaluation"),
+        "last_transition": current.get("last_transition"),
+    }
+
+
+def _load_rollouts_state() -> Dict[str, Any]:
+    path = _rollouts_state_path()
+    if not os.path.exists(path):
+        return {"rollouts": []}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        logger.warning("Failed to parse rollouts state file; using empty state")
+        return {"rollouts": []}
+    items = payload.get("rollouts") if isinstance(payload, dict) else []
+    normalized = []
+    for row in items or []:
+        if isinstance(row, dict):
+            normalized.append(_normalize_rollout_payload(row, row))
+    return {"rollouts": normalized}
+
+
+def _save_rollouts_state(state: Dict[str, Any]) -> None:
+    path = _rollouts_state_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"rollouts": state.get("rollouts", [])}, handle, ensure_ascii=False, indent=2)
+
+
+def _find_rollout(state: Dict[str, Any], rollout_id: str) -> Optional[Dict[str, Any]]:
+    for row in state.get("rollouts", []):
+        if str(row.get("rollout_id") or "") == rollout_id:
+            return row
+    return None
+
+
+def _sorted_rollouts_for_view(rollouts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(rollouts, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+
+
+def _build_rollout_experiment(rollout: Dict[str, Any]) -> Dict[str, Any]:
+    traffic_pct = max(0.0, min(100.0, float(rollout.get("traffic_percentage", 0.0) or 0.0)))
+    candidate_weight = max(0.0, traffic_pct)
+    baseline_weight = max(0.0, 100.0 - candidate_weight)
+    variants = []
+    if baseline_weight > 0:
+        variants.append(
+            {
+                "variant_id": "baseline",
+                "weight": baseline_weight,
+                "config_id": rollout.get("baseline_config_id"),
+                "scenario_id": rollout.get("baseline_scenario_id") or "",
+            }
+        )
+    if candidate_weight > 0:
+        variants.append(
+            {
+                "variant_id": "candidate",
+                "weight": candidate_weight,
+                "config_id": rollout.get("candidate_config_id"),
+                "scenario_id": rollout.get("candidate_scenario_id") or "",
+            }
+        )
+    return {
+        "experiment_id": rollout.get("experiment_id"),
+        "variants": variants,
+    }
+
+
+def _resolve_active_rollout_assignment(effective_user_id: str) -> Optional[Dict[str, Any]]:
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+    active = next(
+        (
+            item
+            for item in _sorted_rollouts_for_view(state.get("rollouts", []))
+            if bool(item.get("enabled")) and str(item.get("status") or "") == "running"
+        ),
+        None,
+    )
+    if not active:
+        return None
+    experiment = _build_rollout_experiment(active)
+    assignment = _resolve_experiment_assignment(experiment, effective_user_id)
+    if not assignment:
+        return None
+    assignment["rollout_id"] = active.get("rollout_id")
+    assignment["rollout_name"] = active.get("name")
+    return assignment
+
+
+def _evaluate_rollout(rollout: Dict[str, Any], apply_auto_rollback: bool = True, actor_id: str = "system") -> Dict[str, Any]:
+    auto = rollout.get("auto_rollback") or {}
+    metrics = _compute_experiment_metrics(
+        days=max(1, min(90, int(auto.get("evaluation_days", 7) or 7))),
+        experiment_id=str(rollout.get("experiment_id") or ""),
+        limit_runs=5000,
+        limit_events=100000,
+    )
+    by_variant = {str(item.get("variant_id") or ""): item for item in (metrics.get("variants") or [])}
+    baseline = by_variant.get("baseline") or {}
+    candidate = by_variant.get("candidate") or {}
+    baseline_ctr = float(baseline.get("ctr", 0.0) or 0.0)
+    candidate_ctr = float(candidate.get("ctr", 0.0) or 0.0)
+    candidate_runs = int(candidate.get("runs", 0) or 0)
+    ctr_lift = candidate_ctr - baseline_ctr
+    ctr_drop = max(0.0, baseline_ctr - candidate_ctr)
+    checks = [
+        {
+            "metric": "candidate_runs",
+            "value": candidate_runs,
+            "operator": ">=",
+            "target": int(auto.get("min_candidate_runs", 200) or 200),
+            "pass": candidate_runs >= int(auto.get("min_candidate_runs", 200) or 200),
+        },
+        {
+            "metric": "ctr_lift",
+            "value": round(ctr_lift, 6),
+            "operator": ">=",
+            "target": float(auto.get("min_ctr_lift", -0.01) or -0.01),
+            "pass": ctr_lift >= float(auto.get("min_ctr_lift", -0.01) or -0.01),
+        },
+        {
+            "metric": "ctr_drop",
+            "value": round(ctr_drop, 6),
+            "operator": "<=",
+            "target": float(auto.get("max_ctr_drop", 0.02) or 0.02),
+            "pass": ctr_drop <= float(auto.get("max_ctr_drop", 0.02) or 0.02),
+        },
+    ]
+    passed = all(bool(item.get("pass")) for item in checks)
+    evaluation = {
+        "evaluated_at": datetime.now().isoformat(),
+        "rollout_id": rollout.get("rollout_id"),
+        "experiment_id": rollout.get("experiment_id"),
+        "checks": checks,
+        "passed": passed,
+        "metrics": {
+            "baseline": {
+                "runs": int(baseline.get("runs", 0) or 0),
+                "impressions": int(baseline.get("impressions", 0) or 0),
+                "ctr": baseline_ctr,
+            },
+            "candidate": {
+                "runs": candidate_runs,
+                "impressions": int(candidate.get("impressions", 0) or 0),
+                "ctr": candidate_ctr,
+            },
+            "ctr_lift": ctr_lift,
+        },
+        "auto_rollback_applied": False,
+    }
+    if apply_auto_rollback and bool(auto.get("enabled")) and not passed and bool(rollout.get("enabled")):
+        rollout["enabled"] = False
+        rollout["status"] = "paused"
+        rollout["last_transition"] = {
+            "type": "auto_rollback",
+            "at": datetime.now().isoformat(),
+            "actor_id": actor_id,
+            "reason": "guard_failed",
+        }
+        evaluation["auto_rollback_applied"] = True
+    rollout["last_evaluated_at"] = evaluation["evaluated_at"]
+    rollout["last_evaluation"] = evaluation
+    rollout["updated_at"] = datetime.now().isoformat()
+    return evaluation
+
+
+def _maybe_auto_evaluate_rollouts() -> None:
+    interval_seconds = max(30, int(os.getenv("ROLLOUT_AUTO_EVAL_INTERVAL_SECONDS", "120")))
+    now = datetime.now()
+    global _rollout_last_auto_eval_at
+    with _rollout_auto_eval_lock:
+        if _rollout_last_auto_eval_at and (now - _rollout_last_auto_eval_at).total_seconds() < interval_seconds:
+            return
+        _rollout_last_auto_eval_at = now
+
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+        changed = False
+        for rollout in state.get("rollouts", []):
+            if not bool(rollout.get("enabled")) or str(rollout.get("status") or "") != "running":
+                continue
+            auto = rollout.get("auto_rollback") or {}
+            if not bool(auto.get("enabled", False)):
+                continue
+            _evaluate_rollout(rollout, apply_auto_rollback=True, actor_id="system:auto")
+            changed = True
+        if changed:
+            _save_rollouts_state(state)
 
 def _embedding_config_path() -> str:
     return os.getenv("EMBEDDING_CONFIG_PATH", "config/embedding_settings.json")
@@ -783,6 +1031,7 @@ def _is_protected_request() -> bool:
         or request.path.startswith("/api/events")
         or request.path.startswith("/api/scenarios")
         or request.path.startswith("/api/ranking-configs")
+        or request.path.startswith("/api/rollouts")
         or request.path.startswith("/api/connectors")
         or request.path.startswith("/api/source-settings")
         or request.path.startswith("/api/cdp")
@@ -1836,7 +2085,17 @@ def openapi_spec():
                 }
             },
             "/api/ranking-configs/promote": {"post": {"summary": "Promote config", "responses": {"200": {"description": "Promoted"}}}},
+            "/api/ranking-configs/promote-with-guard": {"post": {"summary": "Promote config with guard evaluation", "responses": {"200": {"description": "Promoted"}, "409": {"description": "Guard blocked"}}}},
+            "/api/ranking-configs/guard-evaluate": {"post": {"summary": "Evaluate guard thresholds without promotion", "responses": {"200": {"description": "Guard evaluation"}}}},
             "/api/ranking-configs/rollback": {"post": {"summary": "Rollback promoted config", "responses": {"200": {"description": "Rolled back"}}}},
+            "/api/rollouts": {"get": {"summary": "List rollout/canary definitions"}, "post": {"summary": "Create rollout/canary definition"}},
+            "/api/rollouts/{rollout_id}": {"put": {"summary": "Update rollout"}, "delete": {"summary": "Delete rollout"}},
+            "/api/rollouts/{rollout_id}/start": {"post": {"summary": "Start rollout"}},
+            "/api/rollouts/{rollout_id}/stop": {"post": {"summary": "Stop rollout"}},
+            "/api/rollouts/{rollout_id}/evaluate": {"post": {"summary": "Evaluate rollout guard"}},
+            "/api/rollouts/evaluate-active": {"post": {"summary": "Evaluate all active rollout guards"}},
+            "/api/operations/api-protection-status": {"get": {"summary": "Read API protection and rate limit settings"}},
+            "/api/metrics/experiments/promote-variant": {"post": {"summary": "Promote config from selected experiment variant"}},
             "/api/alerts/thresholds": {"get": {"summary": "Get thresholds"}, "put": {"summary": "Update thresholds"}},
         },
         "components": {
@@ -2654,6 +2913,55 @@ def ranking_config_promote_with_guard():
         return jsonify({"error": str(e)}), 400
 
 
+@app.route("/api/ranking-configs/guard-evaluate", methods=["POST"])
+def ranking_config_guard_evaluate():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json() or {}
+        baseline_config_id = str(payload.get("baseline_config_id", "balanced")).strip() or "balanced"
+        candidate_config_id = str(payload.get("candidate_config_id", "")).strip()
+        if not candidate_config_id:
+            return jsonify({"error": "candidate_config_id is required"}), 400
+
+        compare = _compute_offline_config_compare_result(
+            baseline_config_id=baseline_config_id,
+            candidate_config_id=candidate_config_id,
+            days=max(1, min(365, int(payload.get("days", 30)))),
+            limit_runs=max(10, min(5000, int(payload.get("limit_runs", 300)))),
+            limit_events=max(1000, min(200000, int(payload.get("limit_events", 100000)))),
+            top_n=max(1, min(20, int(payload.get("top_n", 5)))),
+            require_relevant=bool(payload.get("require_relevant", True)),
+        )
+        guard_eval = _evaluate_promotion_guard(compare, payload.get("guard") or {})
+        _record_audit(
+            action="guard_evaluate",
+            resource_type="ranking_config",
+            resource_id=candidate_config_id,
+            payload=payload,
+            extra={
+                "baseline_config_id": baseline_config_id,
+                "candidate_config_id": candidate_config_id,
+                "passed": bool(guard_eval.get("passed")),
+                "failed_checks": int(len(guard_eval.get("failed_checks") or [])),
+            },
+        )
+        return jsonify(
+            {
+                "baseline_config_id": baseline_config_id,
+                "candidate_config_id": candidate_config_id,
+                "guard_evaluation": guard_eval,
+                "comparison": compare,
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        logger.error(f"Error evaluating promotion guard: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
 @app.route("/api/ranking-configs/rollback", methods=["POST"])
 def ranking_config_rollback():
     if not recommender or not store:
@@ -2876,6 +3184,158 @@ def ranking_config_auto_tune(config_id):
         logger.error(f"Error auto-tuning ranking config: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/rollouts", methods=["GET", "POST"])
+def rollouts_collection():
+    if request.method == "GET":
+        with _rollouts_lock:
+            state = _load_rollouts_state()
+        items = _sorted_rollouts_for_view(state.get("rollouts", []))
+        active = [item for item in items if bool(item.get("enabled")) and str(item.get("status") or "") == "running"]
+        return jsonify({"rollouts": items, "active_rollouts": active, "count": len(items), "active_count": len(active)})
+
+    payload = request.get_json(silent=True) or {}
+    actor_id = _request_actor_id(payload)
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+        normalized = _normalize_rollout_payload(payload)
+        if not normalized.get("candidate_config_id"):
+            return jsonify({"error": "candidate_config_id is required"}), 400
+        state.setdefault("rollouts", []).append(normalized)
+        _save_rollouts_state(state)
+    _record_audit(
+        action="create",
+        resource_type="rollout",
+        resource_id=normalized.get("rollout_id"),
+        payload=payload,
+        extra={"status": normalized.get("status"), "enabled": normalized.get("enabled")},
+    )
+    return jsonify({"rollout": normalized}), 201
+
+
+@app.route("/api/rollouts/<rollout_id>", methods=["PUT", "DELETE"])
+def rollout_detail(rollout_id: str):
+    payload = request.get_json(silent=True) or {}
+    actor_id = _request_actor_id(payload)
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+        existing = _find_rollout(state, rollout_id)
+        if not existing:
+            return jsonify({"error": "Rollout not found"}), 404
+
+        if request.method == "DELETE":
+            state["rollouts"] = [item for item in state.get("rollouts", []) if str(item.get("rollout_id") or "") != rollout_id]
+            _save_rollouts_state(state)
+            _record_audit(
+                action="delete",
+                resource_type="rollout",
+                resource_id=rollout_id,
+                payload=payload,
+            )
+            return jsonify({"rollout_id": rollout_id, "deleted": True})
+
+        merged = dict(existing)
+        merged.update(payload if isinstance(payload, dict) else {})
+        updated = _normalize_rollout_payload(merged, existing=existing)
+        if not updated.get("candidate_config_id"):
+            return jsonify({"error": "candidate_config_id is required"}), 400
+        for index, row in enumerate(state.get("rollouts", [])):
+            if str(row.get("rollout_id") or "") == rollout_id:
+                state["rollouts"][index] = updated
+                break
+        _save_rollouts_state(state)
+    _record_audit(
+        action="update",
+        resource_type="rollout",
+        resource_id=rollout_id,
+        payload=payload,
+        extra={"status": updated.get("status"), "enabled": updated.get("enabled")},
+    )
+    return jsonify({"rollout": updated})
+
+
+@app.route("/api/rollouts/<rollout_id>/start", methods=["POST"])
+def rollout_start(rollout_id: str):
+    payload = request.get_json(silent=True) or {}
+    actor_id = _request_actor_id(payload)
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+        rollout = _find_rollout(state, rollout_id)
+        if not rollout:
+            return jsonify({"error": "Rollout not found"}), 404
+        rollout["enabled"] = True
+        rollout["status"] = "running"
+        rollout["updated_at"] = datetime.now().isoformat()
+        rollout["last_transition"] = {"type": "start", "at": datetime.now().isoformat(), "actor_id": actor_id}
+        _save_rollouts_state(state)
+    _record_audit(action="start", resource_type="rollout", resource_id=rollout_id, payload=payload)
+    return jsonify({"rollout": rollout})
+
+
+@app.route("/api/rollouts/<rollout_id>/stop", methods=["POST"])
+def rollout_stop(rollout_id: str):
+    payload = request.get_json(silent=True) or {}
+    actor_id = _request_actor_id(payload)
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+        rollout = _find_rollout(state, rollout_id)
+        if not rollout:
+            return jsonify({"error": "Rollout not found"}), 404
+        rollout["enabled"] = False
+        rollout["status"] = "paused"
+        rollout["updated_at"] = datetime.now().isoformat()
+        rollout["last_transition"] = {"type": "stop", "at": datetime.now().isoformat(), "actor_id": actor_id}
+        _save_rollouts_state(state)
+    _record_audit(action="stop", resource_type="rollout", resource_id=rollout_id, payload=payload)
+    return jsonify({"rollout": rollout})
+
+
+@app.route("/api/rollouts/<rollout_id>/evaluate", methods=["POST"])
+def rollout_evaluate(rollout_id: str):
+    payload = request.get_json(silent=True) or {}
+    actor_id = _request_actor_id(payload)
+    apply_auto_rollback = bool(payload.get("apply_auto_rollback", True))
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+        rollout = _find_rollout(state, rollout_id)
+        if not rollout:
+            return jsonify({"error": "Rollout not found"}), 404
+        evaluation = _evaluate_rollout(rollout, apply_auto_rollback=apply_auto_rollback, actor_id=actor_id)
+        _save_rollouts_state(state)
+    _record_audit(
+        action="evaluate",
+        resource_type="rollout",
+        resource_id=rollout_id,
+        payload=payload,
+        extra={"passed": evaluation.get("passed"), "auto_rollback_applied": evaluation.get("auto_rollback_applied")},
+    )
+    return jsonify({"rollout": rollout, "evaluation": evaluation})
+
+
+@app.route("/api/rollouts/evaluate-active", methods=["POST"])
+def rollout_evaluate_active():
+    payload = request.get_json(silent=True) or {}
+    actor_id = _request_actor_id(payload)
+    apply_auto_rollback = bool(payload.get("apply_auto_rollback", True))
+    with _rollouts_lock:
+        state = _load_rollouts_state()
+        evaluated = []
+        for rollout in state.get("rollouts", []):
+            if not bool(rollout.get("enabled")) or str(rollout.get("status") or "") != "running":
+                continue
+            evaluation = _evaluate_rollout(rollout, apply_auto_rollback=apply_auto_rollback, actor_id=actor_id)
+            evaluated.append({"rollout_id": rollout.get("rollout_id"), "evaluation": evaluation, "status": rollout.get("status")})
+        if evaluated:
+            _save_rollouts_state(state)
+    _record_audit(
+        action="evaluate_active",
+        resource_type="rollout",
+        resource_id="*",
+        payload=payload,
+        extra={"evaluated_count": len(evaluated)},
+    )
+    return jsonify({"evaluated": evaluated, "count": len(evaluated)})
 
 
 @app.route("/api/scenarios", methods=["GET", "POST"])
@@ -3149,8 +3609,10 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
     requested_sources = payload.get("sources") or []
     config_explicit = bool(str(payload.get("config_id", "")).strip())
     config_id = str(payload.get("config_id", "balanced")).strip() or "balanced"
+    allow_rollout = bool(payload.get("allow_rollout", True))
     ranking_config = payload.get("ranking_config")
     experiment = payload.get("experiment")
+    rollout_assignment = None
     scenario_id = (payload.get("scenario_id") or "").strip() or None
     scenario_explicit = bool(scenario_id)
     scenario_ids = payload.get("scenario_ids") or []
@@ -3184,6 +3646,10 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
             config_id = scenario_rule_set.get("ranking_config_id")
 
     experiment_assignment = _resolve_experiment_assignment(experiment, effective_user_id)
+    if not experiment_assignment and allow_rollout and (not config_explicit or config_id == "balanced"):
+        rollout_assignment = _resolve_active_rollout_assignment(effective_user_id)
+        if rollout_assignment:
+            experiment_assignment = rollout_assignment
     if experiment_assignment:
         if experiment_assignment.get("selected_scenario_id"):
             scenario_id = experiment_assignment["selected_scenario_id"]
@@ -3257,10 +3723,12 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
             "top_n": top_n,
             "sources": selected_sources,
             "config_id": effective_config_id,
+            "allow_rollout": allow_rollout,
             "effective_ranking_config": effective_ranking_config,
             "scenario_id": scenario_id,
             "scenario_trace": scenario_trace,
             "experiment_assignment": experiment_assignment,
+            "rollout_assignment": rollout_assignment,
             "cdp_context": cdp_context,
             "api_surface": api_surface,
         },
@@ -3284,6 +3752,7 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
                 for idx, rec in enumerate(recs, start=1)
             ]
         )
+    _maybe_auto_evaluate_rollouts()
 
     return {
         "run_id": run_id,
@@ -3299,6 +3768,7 @@ def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "q
         "scenario_id": scenario_id,
         "scenario_trace": scenario_trace,
         "experiment_assignment": experiment_assignment,
+        "rollout_assignment": rollout_assignment,
         "cdp_context": cdp_context,
         "explainability_schema_version": "v2",
         "cache_hit": cache_hit,
@@ -3732,10 +4202,32 @@ def _evaluate_promotion_guard(compare_payload: Dict[str, Any], guard: Dict[str, 
         }
     )
 
-    passed = all(item["pass"] for item in checks)
+    failed_checks = [item for item in checks if not item["pass"]]
+    suggestions_by_metric = {
+        "ndcg_at_k_delta": "Increase semantic relevance weight or lower noisy source preference before promotion.",
+        "historical_ctr_delta": "Validate click-through impact in a narrower audience slice before promoting globally.",
+        "precision_drop": "Reduce exploration/diversity pressure to protect precision.",
+        "recall_drop": "Increase candidate pool breadth or soften strict filters to recover recall.",
+        "mrr_drop": "Tune top-rank weights to improve first-hit relevance.",
+        "source_coverage_at_k": "Increase diversity constraints to broaden source mix.",
+        "section_coverage_at_k": "Relax section filters or increase section diversity weight.",
+        "avg_freshness": "Increase freshness weight or tighten max age limits.",
+        "top_source_share_at_k": "Apply stronger per-source caps to avoid source concentration.",
+        "stale_ratio_at_k": "Raise freshness floor and reduce hard max article age.",
+    }
+    recommendations = []
+    for item in failed_checks:
+        metric = str(item.get("metric") or "")
+        advice = suggestions_by_metric.get(metric)
+        if advice and advice not in recommendations:
+            recommendations.append(advice)
+
+    passed = len(failed_checks) == 0
     return {
         "passed": passed,
         "checks": checks,
+        "failed_checks": failed_checks,
+        "recommendations": recommendations,
         "guard": {
             "min_ndcg_lift": min_ndcg_lift,
             "min_ctr_lift": min_ctr_lift,
@@ -4803,7 +5295,12 @@ def _compute_experiment_metrics(days: int, experiment_id: str, limit_runs: int, 
         if not run_id:
             continue
         experiment_ids.add(exp_id)
-        run_assignments[run_id] = {"experiment_id": exp_id, "variant_id": variant_id}
+        run_assignments[run_id] = {
+            "experiment_id": exp_id,
+            "variant_id": variant_id,
+            "config_id": str(run.get("config_id") or "").strip() or None,
+            "scenario_id": str((run.get("request", {}) or {}).get("scenario_id") or "").strip() or None,
+        }
         bucket = by_variant.setdefault(
             variant_id,
             {
@@ -4812,9 +5309,17 @@ def _compute_experiment_metrics(days: int, experiment_id: str, limit_runs: int, 
                 "impressions": 0,
                 "clicks": 0,
                 "conversions": 0,
+                "config_counts": {},
+                "scenario_counts": {},
             },
         )
         bucket["runs"] += 1
+        cfg = run_assignments[run_id].get("config_id")
+        scn = run_assignments[run_id].get("scenario_id")
+        if cfg:
+            bucket["config_counts"][cfg] = int(bucket["config_counts"].get(cfg, 0)) + 1
+        if scn:
+            bucket["scenario_counts"][scn] = int(bucket["scenario_counts"].get(scn, 0)) + 1
 
     events = store.list_events(limit=limit_events, days=days)
     for event in events:
@@ -4832,11 +5337,17 @@ def _compute_experiment_metrics(days: int, experiment_id: str, limit_runs: int, 
     for bucket in by_variant.values():
         impressions = bucket["impressions"]
         clicks = bucket["clicks"]
+        config_counts = bucket.get("config_counts") or {}
+        scenario_counts = bucket.get("scenario_counts") or {}
+        top_config = max(config_counts.items(), key=lambda item: item[1])[0] if config_counts else None
+        top_scenario = max(scenario_counts.items(), key=lambda item: item[1])[0] if scenario_counts else None
         variants.append(
             {
                 **bucket,
                 "ctr": round((clicks / impressions), 4) if impressions else 0.0,
                 "conversion_rate": round((bucket["conversions"] / clicks), 4) if clicks else 0.0,
+                "top_config_id": top_config,
+                "top_scenario_id": top_scenario,
             }
         )
     variants.sort(key=lambda item: item["runs"], reverse=True)
@@ -5322,6 +5833,80 @@ def metrics_experiments_compare():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/metrics/experiments/promote-variant", methods=["POST"])
+def metrics_experiments_promote_variant():
+    if not recommender or not store:
+        return jsonify({"error": "Recommender not initialized"}), 500
+    try:
+        payload = request.get_json() or {}
+        experiment_id = str(payload.get("experiment_id", "")).strip()
+        variant_id = str(payload.get("variant_id", "")).strip()
+        target_config_id = str(payload.get("target_config_id", "balanced")).strip() or "balanced"
+        days = max(1, min(365, int(payload.get("days", 30))))
+        limit_runs = max(1, min(20000, int(payload.get("limit_runs", 5000))))
+        limit_events = max(1, min(200000, int(payload.get("limit_events", 100000))))
+        if not variant_id:
+            return jsonify({"error": "variant_id is required"}), 400
+
+        metrics = _compute_experiment_metrics(
+            days=days,
+            experiment_id=experiment_id,
+            limit_runs=limit_runs,
+            limit_events=limit_events,
+        )
+        variants = {item["variant_id"]: item for item in metrics.get("variants", [])}
+        variant = variants.get(variant_id)
+        if not variant:
+            return jsonify({"error": "Variant not found in selected window"}), 404
+        source_config_id = str(variant.get("top_config_id") or "").strip()
+        if not source_config_id:
+            return jsonify({"error": "Variant has no dominant config_id to promote"}), 400
+        source = store.get_config(source_config_id)
+        if not source:
+            return jsonify({"error": f"Unknown source config: {source_config_id}"}), 404
+
+        previous = store.get_config(target_config_id)
+        previous_config_id = previous[0].get("config_id", target_config_id) if previous else None
+        previous_version = previous[1] if previous else None
+        source_config, source_version, _is_system = source
+        promoted_payload = dict(source_config)
+        promoted_payload["config_id"] = target_config_id
+        recommender._resolve_config(config_id=target_config_id, ranking_config=promoted_payload)
+        target_version = store.create_or_update_config(target_config_id, promoted_payload, is_system=False)
+        _record_audit(
+            action="promote_experiment_variant",
+            resource_type="ranking_config",
+            resource_id=target_config_id,
+            payload=payload,
+            extra={
+                "experiment_id": metrics.get("experiment_id"),
+                "variant_id": variant_id,
+                "source_config_id": source_config_id,
+                "source_version": source_version,
+                "target_version": target_version,
+                "previous_config_id": previous_config_id,
+                "previous_version": previous_version,
+            },
+        )
+        return jsonify(
+            {
+                "target_config_id": target_config_id,
+                "target_version": target_version,
+                "source_config_id": source_config_id,
+                "source_version": source_version,
+                "experiment_id": metrics.get("experiment_id"),
+                "variant_id": variant_id,
+                "variant_summary": variant,
+                "previous_config_id": previous_config_id,
+                "previous_version": previous_version,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error promoting experiment variant: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
 @app.route("/api/metrics/online-kpis", methods=["GET"])
 @app.route("/api/v1/metrics/online-kpis", methods=["GET"])
 def metrics_online_kpis():
@@ -5710,6 +6295,41 @@ def alerts_thresholds():
         logger.error(f"Error updating alert thresholds: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/operations/api-protection-status", methods=["GET"])
+def api_protection_status():
+    configured_keys = [part.strip() for part in os.getenv("API_AUTH_KEYS", "").split(",") if part.strip()]
+    rules_env = os.getenv("API_RATE_LIMIT_RULES", "").strip()
+    rules = {}
+    if rules_env:
+        try:
+            parsed = json.loads(rules_env)
+            if isinstance(parsed, dict):
+                rules = {str(k): int(v) for k, v in parsed.items()}
+        except Exception:
+            rules = {}
+    defaults_preview = {
+        "recommendations_cms": _rate_limit_for_endpoint("/api/recommendations/cms"),
+        "events": _rate_limit_for_endpoint("/api/events"),
+        "scenarios": _rate_limit_for_endpoint("/api/scenarios"),
+        "ranking_configs": _rate_limit_for_endpoint("/api/ranking-configs"),
+        "cdp": _rate_limit_for_endpoint("/api/cdp"),
+    }
+    with _rate_limit_lock:
+        counters = list(_rate_limit_counters.values())
+    return jsonify(
+        {
+            "api_auth_enabled": os.getenv("API_AUTH_ENABLED", "false").strip().lower() == "true",
+            "configured_api_key_count": len(configured_keys),
+            "api_signature_enabled": os.getenv("API_SIGNATURE_ENABLED", "false").strip().lower() == "true",
+            "rate_limit_enabled": os.getenv("API_RATE_LIMIT_ENABLED", "false").strip().lower() == "true",
+            "rate_limit_default_per_minute": max(1, int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "120"))),
+            "rate_limit_rules": rules,
+            "effective_limits_preview": defaults_preview,
+            "active_rate_limit_buckets": len(counters),
+        }
+    )
 
 
 @app.route("/api/audit-logs", methods=["GET"])

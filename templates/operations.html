@@ -131,6 +131,18 @@
     <div class="col-lg-4">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>API Protection</strong>
+                <button id="refresh-api-protection" class="btn btn-sm btn-outline-secondary">Refresh</button>
+            </div>
+            <div class="card-body">
+                <div class="section-hint">Read-only view of API auth/signature/rate-limit state used by external CMS and app integrations.</div>
+                <div id="api-protection-status" class="small text-muted">Loading...</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
                 <strong><span class="step-chip">3</span>SLI & Alerts</strong>
                 <button id="refresh-sli" class="btn btn-sm btn-outline-secondary">Refresh</button>
             </div>
