@@ -113,6 +113,20 @@ function getReportingDashboardModule() {
     return window.ReportingDashboardModule;
 }
 
+function getConnectorsControllerModule() {
+    if (!window.ConnectorsControllerModule) {
+        throw new Error('Connectors controller module is not loaded');
+    }
+    return window.ConnectorsControllerModule;
+}
+
+function getCdpControllerModule() {
+    if (!window.CdpControllerModule) {
+        throw new Error('CDP controller module is not loaded');
+    }
+    return window.CdpControllerModule;
+}
+
 function buildRecommendationsArticlesContext() {
     return {
         get articles() {
@@ -145,6 +159,44 @@ function buildRecommendationsArticlesContext() {
         setArticleCurrentPage: (value) => {
             articleCurrentPage = value;
         },
+    };
+}
+
+function buildConnectorsControllerContext() {
+    return {
+        ApiClient,
+        get connectors() {
+            return connectors;
+        },
+        get connectorMetricsById() {
+            return connectorMetricsById;
+        },
+        get connectorSearchTerm() {
+            return connectorSearchTerm;
+        },
+        get connectorStatusFilter() {
+            return connectorStatusFilter;
+        },
+        connectorRunsCache,
+        loadConnectors,
+        loadConnectorMetrics,
+        showError,
+    };
+}
+
+function buildCdpControllerContext() {
+    return {
+        get cdpMappingPresets() {
+            return cdpMappingPresets;
+        },
+        setCdpMappingPresets: (value) => {
+            cdpMappingPresets = value;
+        },
+        setCdpIntegration: (value) => {
+            cdpIntegration = value;
+        },
+        getOperatorId,
+        getOperatorHeaders,
     };
 }
 
@@ -252,6 +304,7 @@ document.addEventListener('DOMContentLoaded', () => {
         setInterval(loadEmbeddingStatus, 5000);
     }
     if (hasElement('decision-context')) loadDecisionContext();
+    if (hasElement('external-user-id')) loadExternalUserIdSuggestions();
     if (hasElement('reporting-summary')) {
         loadReportingWorkspace();
         loadQualitySnapshotHistory();
@@ -320,6 +373,30 @@ async function loadSources() {
     }
 }
 
+async function loadExternalUserIdSuggestions() {
+    const input = document.getElementById('external-user-id');
+    const datalist = document.getElementById('external-user-id-options');
+    const hint = document.getElementById('external-user-id-hint');
+    if (!input || !datalist) return;
+    try {
+        const response = await fetch('/api/cdp/meiro/profiles?limit=100');
+        if (!response.ok) {
+            throw new Error('not available');
+        }
+        const payload = await response.json();
+        const ids = Array.from(new Set((payload.profiles || []).map(item => item.external_user_id).filter(Boolean)));
+        datalist.innerHTML = ids.map(id => `<option value="${id}"></option>`).join('');
+        if (hint) {
+            hint.textContent = ids.length
+                ? `Loaded ${ids.length} recent external IDs from CDP sync.`
+                : 'No synced external IDs yet. Add one in CDP > Profile Sync.';
+        }
+    } catch (_error) {
+        datalist.innerHTML = '';
+        if (hint) hint.textContent = 'CDP profile suggestions unavailable. You can still enter an external ID manually.';
+    }
+}
+
 async function loadConnectors() {
     try {
         const data = await ApiClient.get('/api/connectors');
@@ -354,416 +431,51 @@ async function loadConnectorMetrics() {
 }
 
 function renderConnectors() {
-    const container = document.getElementById('connector-list');
-    if (!connectors.length) {
-        container.innerHTML = '<span>No connectors configured.</span>';
-        return;
-    }
-
-    const filtered = connectors.filter(connector => {
-        const name = (connector.name || '').toLowerCase();
-        const metric = connectorMetricsById[connector.connector_id] || {};
-        const status = metric.last_status || 'none';
-        const matchesName = !connectorSearchTerm || name.includes(connectorSearchTerm);
-        const matchesStatus = connectorStatusFilter === 'all' || status === connectorStatusFilter;
-        return matchesName && matchesStatus;
-    });
-
-    if (!filtered.length) {
-        container.innerHTML = '<span>No connectors match current filters.</span>';
-        return;
-    }
-
-    container.innerHTML = filtered.map(connector => {
-        const metric = connectorMetricsById[connector.connector_id] || {};
-        const rawUrl = connector.config?.base_url || connector.config?.feed_url || '';
-        let sourceDomain = '';
-        if (rawUrl) {
-            try {
-                sourceDomain = new URL(rawUrl).hostname.replace(/^www\./, '');
-            } catch (_error) {
-                sourceDomain = '';
-            }
-        }
-        return `
-            <div class="border rounded p-2 mb-2 connector-card" data-id="${connector.connector_id}">
-                <div class="fw-semibold">${connector.name}</div>
-                <div class="text-muted">${connector.connector_type}</div>
-                <div class="text-muted small">${rawUrl || 'n/a'}</div>
-                <div class="text-muted small">
-                    Auto-sync: ${connector.config?.auto_sync_enabled ? 'on' : 'off'}
-                    (${Number(connector.config?.sync_interval_minutes || 60)} min)
-                </div>
-                <div class="text-muted small">
-                    Last status: ${metric.last_status || 'none'}
-                    ${typeof metric.success_rate === 'number' ? ` | Success ${(metric.success_rate * 100).toFixed(0)}%` : ''}
-                </div>
-                <div class="text-muted small">
-                    Health: ${metric.health_state || 'unknown'}
-                    ${metric.last_error_code ? ` | Last error: ${metric.last_error_code}` : ''}
-                </div>
-                ${sourceDomain ? `<div class="small mt-1"><a class="text-decoration-none" href="/recommendations?source=${encodeURIComponent(sourceDomain)}">Open in Recommendations (source filter)</a></div>` : ''}
-                <div class="row g-2 mt-1">
-                    <div class="col-4">
-                        <input class="form-control form-control-sm connector-max-articles" type="number" min="1" max="50" value="${Number(connector.config?.max_articles || 10)}" title="max_articles">
-                    </div>
-                    <div class="col-4">
-                        <input class="form-control form-control-sm connector-sync-interval" type="number" min="1" value="${Number(connector.config?.sync_interval_minutes || 60)}" title="sync_interval_minutes">
-                    </div>
-                    <div class="col-4 d-flex align-items-center">
-                        <div class="form-check mb-0">
-                            <input class="form-check-input connector-auto-sync" type="checkbox" ${connector.config?.auto_sync_enabled ? 'checked' : ''}>
-                            <label class="form-check-label small">Auto</label>
-                        </div>
-                    </div>
-                </div>
-                <div class="d-flex gap-2 mt-2">
-                    <button class="btn btn-sm btn-outline-secondary connector-sync" data-id="${connector.connector_id}">Sync</button>
-                    <button class="btn btn-sm btn-outline-primary connector-sync-async" data-id="${connector.connector_id}">Sync Async</button>
-                    <button class="btn btn-sm btn-outline-info connector-runs" data-id="${connector.connector_id}">Runs</button>
-                    <button class="btn btn-sm btn-outline-success connector-save-config" data-id="${connector.connector_id}">Save Config</button>
-                    <button class="btn btn-sm btn-outline-warning connector-toggle" data-id="${connector.connector_id}" data-enabled="${connector.enabled}">
-                        ${connector.enabled ? 'Disable' : 'Enable'}
-                    </button>
-                    <button class="btn btn-sm btn-outline-danger connector-delete" data-id="${connector.connector_id}">Delete</button>
-                </div>
-                ${connector.last_run_at ? `<div class="small text-muted mt-1">Last sync: ${connector.last_run_at}</div>` : ''}
-                <div id="connector-config-error-${connector.connector_id}" class="small text-danger mt-1" style="display:none;"></div>
-                <div id="connector-runs-${connector.connector_id}" class="small mt-2"></div>
-            </div>
-        `;
-    }).join('');
+    getConnectorsControllerModule().renderConnectors(buildConnectorsControllerContext());
 }
 
 async function createConnector() {
-    setConnectorFormError('');
-    const name = document.getElementById('connector-name').value.trim();
-    const connectorType = document.getElementById('connector-type').value;
-    const url = document.getElementById('connector-url').value.trim();
-    const maxArticles = Number(document.getElementById('connector-max-articles').value);
-    const autoSyncEnabled = document.getElementById('connector-auto-sync').checked;
-    const syncIntervalMinutes = Number(document.getElementById('connector-sync-interval').value);
-
-    const validationError = validateConnectorInputs({
-        name,
-        url,
-        maxArticles,
-        syncIntervalMinutes
-    });
-    if (validationError) {
-        setConnectorFormError(validationError);
-        throw new Error(validationError);
-    }
-
-    const config = connectorType === 'rss' ? { feed_url: url } : { base_url: url };
-    config.max_articles = Number.isFinite(maxArticles) && maxArticles > 0 ? maxArticles : 10;
-    config.auto_sync_enabled = Boolean(autoSyncEnabled);
-    config.sync_interval_minutes = Number.isFinite(syncIntervalMinutes) && syncIntervalMinutes > 0
-        ? syncIntervalMinutes
-        : 60;
-    const response = await fetch('/api/connectors', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            name,
-            connector_type: connectorType,
-            config,
-            enabled: true
-        })
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to create connector');
-    }
-    document.getElementById('connector-name').value = '';
-    document.getElementById('connector-url').value = '';
-    document.getElementById('connector-max-articles').value = '10';
-    document.getElementById('connector-sync-interval').value = '60';
-    document.getElementById('connector-auto-sync').checked = false;
-    await loadConnectors();
+    await getConnectorsControllerModule().createConnector(buildConnectorsControllerContext());
 }
 
 async function handleConnectorAction(event) {
-    const syncBtn = event.target.closest('.connector-sync');
-    const syncAsyncBtn = event.target.closest('.connector-sync-async');
-    const runsBtn = event.target.closest('.connector-runs');
-    const saveConfigBtn = event.target.closest('.connector-save-config');
-    const toggleBtn = event.target.closest('.connector-toggle');
-    const deleteBtn = event.target.closest('.connector-delete');
-    const card = event.target.closest('.connector-card');
-
-    if (!syncBtn && !syncAsyncBtn && !runsBtn && !saveConfigBtn && !toggleBtn && !deleteBtn) return;
-
-    try {
-        if (syncBtn) {
-            const id = syncBtn.dataset.id;
-            const response = await fetch(`/api/connectors/${encodeURIComponent(id)}/sync`, { method: 'POST' });
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error || 'Failed to sync connector');
-            }
-            document.getElementById('connector-sync-summary').textContent = `Sync finished for ${id}`;
-            await loadConnectorRuns(id);
-        }
-
-        if (syncAsyncBtn) {
-            const id = syncAsyncBtn.dataset.id;
-            const response = await fetch(`/api/connectors/${encodeURIComponent(id)}/sync-async`, { method: 'POST' });
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error || 'Failed to enqueue connector sync');
-            }
-            const payload = await response.json();
-            document.getElementById('connector-sync-summary').textContent = `Queued run ${payload.run_id} for ${id}`;
-            await pollConnectorRun(payload.run_id, id);
-        }
-
-        if (runsBtn) {
-            const id = runsBtn.dataset.id;
-            await loadConnectorRuns(id);
-            return;
-        }
-
-        if (saveConfigBtn) {
-            const id = saveConfigBtn.dataset.id;
-            const target = connectors.find(connector => connector.connector_id === id);
-            setConnectorCardError(id, '');
-            const nextMaxArticles = Number(card?.querySelector('.connector-max-articles')?.value);
-            const nextSyncInterval = Number(card?.querySelector('.connector-sync-interval')?.value);
-            const nextAutoSync = Boolean(card?.querySelector('.connector-auto-sync')?.checked);
-            const connectorUrl = target?.config?.feed_url || target?.config?.base_url || '';
-            const validationError = validateConnectorInputs({
-                name: target?.name || '',
-                url: connectorUrl,
-                maxArticles: nextMaxArticles,
-                syncIntervalMinutes: nextSyncInterval
-            });
-            if (validationError) {
-                setConnectorCardError(id, validationError);
-                throw new Error(validationError);
-            }
-            const config = { ...(target?.config || {}) };
-            config.max_articles = Number.isFinite(nextMaxArticles) && nextMaxArticles > 0 ? nextMaxArticles : 10;
-            config.sync_interval_minutes = Number.isFinite(nextSyncInterval) && nextSyncInterval > 0
-                ? nextSyncInterval
-                : 60;
-            config.auto_sync_enabled = nextAutoSync;
-
-            const response = await fetch(`/api/connectors/${encodeURIComponent(id)}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    enabled: target?.enabled,
-                    name: target?.name,
-                    connector_type: target?.connector_type,
-                    config
-                })
-            });
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error || 'Failed to save connector config');
-            }
-            document.getElementById('connector-sync-summary').textContent = `Saved config for ${id}`;
-        }
-
-        if (toggleBtn) {
-            const id = toggleBtn.dataset.id;
-            const currentlyEnabled = toggleBtn.dataset.enabled === 'true';
-            if (currentlyEnabled) {
-                const confirmed = window.confirm('Disable this connector? Scheduled and manual syncs will be blocked.');
-                if (!confirmed) return;
-            }
-            const target = connectors.find(connector => connector.connector_id === id);
-            const response = await fetch(`/api/connectors/${encodeURIComponent(id)}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    enabled: !currentlyEnabled,
-                    name: target?.name,
-                    connector_type: target?.connector_type,
-                    config: target?.config || {}
-                })
-            });
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error || 'Failed to update connector');
-            }
-        }
-
-        if (deleteBtn) {
-            const id = deleteBtn.dataset.id;
-            const confirmed = window.confirm('Delete this connector and its future sync ability?');
-            if (!confirmed) return;
-            const response = await fetch(`/api/connectors/${encodeURIComponent(id)}`, { method: 'DELETE' });
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error || 'Failed to delete connector');
-            }
-        }
-
-        await loadConnectors();
-    } catch (error) {
-        console.error('Connector action failed:', error);
-        showError(error.message || 'Connector operation failed');
-    }
+    await getConnectorsControllerModule().handleConnectorAction(event, buildConnectorsControllerContext());
 }
 
 async function syncDueConnectors() {
-    try {
-        document.getElementById('connector-sync-summary').textContent = 'Scanning due connectors...';
-        const response = await fetch('/api/connectors/sync-due', { method: 'POST' });
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to trigger due connector sync');
-        }
-        const payload = await response.json();
-        document.getElementById('connector-sync-summary').textContent =
-            `Triggered ${payload.triggered_count}, skipped ${payload.skipped_count}`;
-
-        const pollTasks = (payload.triggered || []).map(item => pollConnectorRun(item.run_id, item.connector_id));
-        await Promise.all(pollTasks);
-        await loadConnectors();
-        await loadConnectorMetrics();
-    } catch (error) {
-        console.error('Error syncing due connectors:', error);
-        showError(error.message || 'Failed to run due connector sync');
-    }
+    await getConnectorsControllerModule().syncDueConnectors(buildConnectorsControllerContext());
 }
 
 async function loadSchedulerStatus() {
-    const statusEl = document.getElementById('scheduler-status');
-    if (!statusEl) return;
-    try {
-        const payload = await ApiClient.get('/api/connectors/scheduler/status');
-        const lastRun = payload.last_run_at || 'never';
-        const state = payload.running ? 'running' : (payload.enabled ? 'enabled' : 'disabled');
-        statusEl.textContent = `${state}; runs ${payload.runs_total}; last ${lastRun}`;
-    } catch (error) {
-        statusEl.textContent = `Scheduler status error: ${error.message}`;
-    }
+    await getConnectorsControllerModule().loadSchedulerStatus(buildConnectorsControllerContext());
 }
 
 async function runSchedulerNow() {
-    try {
-        const response = await fetch('/api/connectors/scheduler/run-now', { method: 'POST' });
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to run scheduler now');
-        }
-        const payload = await response.json();
-        const summary = payload.scheduler_run || {};
-        document.getElementById('connector-sync-summary').textContent =
-            `Scheduler run: triggered ${summary.triggered_count || 0}, skipped ${summary.skipped_count || 0}`;
-        await loadSchedulerStatus();
-        await loadConnectors();
-        await loadConnectorMetrics();
-    } catch (error) {
-        showError(error.message || 'Scheduler run failed');
-    }
+    await getConnectorsControllerModule().runSchedulerNow(buildConnectorsControllerContext());
 }
 
 async function pollConnectorRun(runId, connectorId) {
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-        const response = await fetch(`/api/connector-runs/${encodeURIComponent(runId)}`);
-        if (!response.ok) {
-            break;
-        }
-        const run = await response.json();
-        if (['completed', 'completed_with_errors', 'failed'].includes(run.status)) {
-            await loadConnectorRuns(connectorId);
-            return;
-        }
-        await new Promise(resolve => setTimeout(resolve, 800));
-    }
-}
-
-function statusBadgeClass(status) {
-    if (status === 'completed') return 'bg-success';
-    if (status === 'completed_with_errors') return 'bg-warning text-dark';
-    if (status === 'failed') return 'bg-danger';
-    return 'bg-secondary';
+    await getConnectorsControllerModule().pollConnectorRun(runId, connectorId, buildConnectorsControllerContext());
 }
 
 async function loadConnectorRuns(connectorId) {
-    try {
-        const response = await fetch(`/api/connectors/${encodeURIComponent(connectorId)}/runs?limit=5`);
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to load connector runs');
-        }
-        const payload = await response.json();
-        connectorRunsCache[connectorId] = payload.runs || [];
-        renderConnectorRuns(connectorId);
-        await loadConnectorMetrics();
-    } catch (error) {
-        console.error('Error loading connector runs:', error);
-        showError(error.message || 'Failed to load connector runs');
-    }
+    await getConnectorsControllerModule().loadConnectorRuns(connectorId, buildConnectorsControllerContext());
 }
 
 function renderConnectorRuns(connectorId) {
-    const target = document.getElementById(`connector-runs-${connectorId}`);
-    if (!target) return;
-
-    const runs = connectorRunsCache[connectorId] || [];
-    if (!runs.length) {
-        target.innerHTML = '<span class="text-muted">No run history.</span>';
-        return;
-    }
-
-    target.innerHTML = runs.map(run => `
-        <div class="border-top pt-1 mt-1">
-            <span class="badge ${statusBadgeClass(run.status)}">${run.status}</span>
-            <span class="ms-1">attempted ${run.attempted}, ingested ${run.ingested}</span>
-            ${run.error_count ? `<div class="text-danger">errors: ${run.error_count}</div>` : ''}
-            ${run.errors && run.errors.length ? `<div class="text-danger small">${run.errors[0]}</div>` : ''}
-            <div class="text-muted">${run.created_at}</div>
-        </div>
-    `).join('');
+    getConnectorsControllerModule().renderConnectorRuns(connectorId, buildConnectorsControllerContext());
 }
 
 function validateConnectorInputs({ name, url, maxArticles, syncIntervalMinutes }) {
-    if (!name || !name.trim()) return 'Connector name is required.';
-    if (!url || !url.trim()) return 'Connector URL is required.';
-    try {
-        const parsed = new URL(url);
-        if (!['http:', 'https:'].includes(parsed.protocol)) {
-            return 'URL must start with http:// or https://';
-        }
-    } catch (_error) {
-        return 'Please enter a valid URL.';
-    }
-    if (!Number.isFinite(maxArticles) || maxArticles < 1 || maxArticles > 50) {
-        return 'Max articles must be between 1 and 50.';
-    }
-    if (!Number.isFinite(syncIntervalMinutes) || syncIntervalMinutes < 1 || syncIntervalMinutes > 1440) {
-        return 'Sync interval must be between 1 and 1440 minutes.';
-    }
-    return '';
+    return getConnectorsControllerModule().validateConnectorInputs({ name, url, maxArticles, syncIntervalMinutes });
 }
 
 function setConnectorFormError(message) {
-    const el = document.getElementById('connector-form-error');
-    if (!el) return;
-    if (!message) {
-        el.style.display = 'none';
-        el.textContent = '';
-        return;
-    }
-    el.style.display = 'block';
-    el.textContent = message;
+    getConnectorsControllerModule().setConnectorFormError(message);
 }
 
 function setConnectorCardError(connectorId, message) {
-    const el = document.getElementById(`connector-config-error-${connectorId}`);
-    if (!el) return;
-    if (!message) {
-        el.style.display = 'none';
-        el.textContent = '';
-        return;
-    }
-    el.style.display = 'block';
-    el.textContent = message;
+    getConnectorsControllerModule().setConnectorCardError(connectorId, message);
 }
 
 function renderSourceFilters() {
@@ -1836,444 +1548,67 @@ async function loadApiProtectionStatus() {
 }
 
 async function loadCdpConfig() {
-    const statusEl = document.getElementById('cdp-config-status');
-    try {
-        const response = await fetch('/api/cdp/meiro');
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to load CDP config');
-        }
-        const payload = await response.json();
-        cdpIntegration = payload;
-        document.getElementById('cdp-enabled').checked = Boolean(payload.enabled);
-        document.getElementById('cdp-base-url').value = payload.config?.base_url || '';
-        document.getElementById('cdp-request-url-template').value = payload.config?.request_url_template || '';
-        document.getElementById('cdp-profile-endpoint-template').value = payload.config?.profile_endpoint_template || '/profiles/{external_user_id}';
-        document.getElementById('cdp-api-key').value = payload.config?.api_key || '';
-        document.getElementById('cdp-timeout-seconds').value = Number(payload.config?.timeout_seconds ?? 5);
-        document.getElementById('cdp-request-retries').value = Number(payload.config?.request_retries ?? 2);
-        document.getElementById('cdp-external-id-path').value = payload.mapping?.external_id_path || 'customer_entity_id';
-        document.getElementById('cdp-traits-path').value = payload.mapping?.traits_path || 'returned_attributes';
-        document.getElementById('cdp-segments-path').value = payload.mapping?.segments_path || '';
-        document.getElementById('cdp-fixed-segments').value = (payload.mapping?.fixed_segments || []).join(', ');
-        document.getElementById('cdp-preferred-sources-trait').value = payload.mapping?.preferred_sources_trait || 'preferred_sources';
-        document.getElementById('cdp-excluded-sources-trait').value = payload.mapping?.excluded_sources_trait || 'excluded_sources';
-        document.getElementById('cdp-source-weights-trait').value = payload.mapping?.source_weights_trait || 'source_weights';
-        document.getElementById('cdp-source-weight-prefix').value = payload.mapping?.source_weight_trait_prefix || 'source_weight_';
-        document.getElementById('cdp-derivation-min-source-events').value = Number(payload.mapping?.derivation_min_source_events ?? 3);
-        document.getElementById('cdp-derivation-min-category-events').value = Number(payload.mapping?.derivation_min_category_events ?? 1);
-        document.getElementById('cdp-derivation-max-sources').value = Number(payload.mapping?.derivation_max_preferred_sources ?? 5);
-        document.getElementById('cdp-derivation-weight-range').value = `${Number(payload.mapping?.derivation_min_source_weight ?? 1.05)}:${Number(payload.mapping?.derivation_max_source_weight ?? 2.0)}`;
-        document.getElementById('cdp-derivation-allowlist').value = (payload.mapping?.derivation_allowed_sources || []).join(', ');
-        document.getElementById('cdp-derivation-blocklist').value = (payload.mapping?.derivation_blocked_sources || []).join(', ');
-        document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(payload.mapping?.scenario_segment_map || {}, null, 2);
-        document.getElementById('cdp-config-segment-map').value = JSON.stringify(payload.mapping?.config_segment_map || {}, null, 2);
-        document.getElementById('cdp-segment-priority').value = (payload.mapping?.segment_priority || []).join(', ');
-        document.getElementById('cdp-personalization-mode').value = payload.mapping?.personalization_mode || 'active';
-        document.getElementById('cdp-fallback-mode').value = payload.mapping?.fallback_mode || 'source_defaults';
-        document.getElementById('cdp-freshness-sla-hours').value = Number(payload.mapping?.freshness_sla_hours ?? 24);
-        const mappingJson = document.getElementById('cdp-mapping-json');
-        if (mappingJson) mappingJson.value = JSON.stringify(payload.mapping || {}, null, 2);
-        const previewInput = document.getElementById('cdp-preview-payload');
-        if (previewInput && !previewInput.value.trim()) {
-            previewInput.value = JSON.stringify(
-                {
-                    customer_entity_id: 'external-user-id',
-                    returned_attributes: {
-                        web_all_products_viewed_3: [
-                            '["2026-03-02T12:00:49","sku","name","200","tops","Brand","https://source.example/a","img"]'
-                        ]
-                    }
-                },
-                null,
-                2
-            );
-        }
-        if (statusEl) statusEl.textContent = `Loaded. Updated at ${payload.updated_at || 'n/a'}.`;
-    } catch (error) {
-        if (statusEl) statusEl.textContent = `CDP config unavailable: ${error.message}`;
-    }
+    await getCdpControllerModule().loadCdpConfig(buildCdpControllerContext());
 }
 
 async function loadCdpMappingPresets() {
-    const select = document.getElementById('cdp-mapping-preset');
-    if (!select) return;
-    try {
-        const response = await fetch('/api/cdp/meiro/presets');
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to load mapping presets');
-        }
-        const payload = await response.json();
-        cdpMappingPresets = payload.presets || [];
-        const options = ['<option value="">Select preset</option>']
-            .concat(cdpMappingPresets.map(item => `<option value="${item.preset_id}">${item.label} (${item.preset_id})</option>`));
-        select.innerHTML = options.join('');
-    } catch (error) {
-        select.innerHTML = '<option value="">Presets unavailable</option>';
-    }
+    await getCdpControllerModule().loadCdpMappingPresets(buildCdpControllerContext());
 }
 
 function applyCdpPresetToForm() {
-    const presetId = document.getElementById('cdp-mapping-preset')?.value || '';
-    if (!presetId) {
-        throw new Error('Choose a mapping preset first.');
-    }
-    const preset = cdpMappingPresets.find(item => item.preset_id === presetId);
-    if (!preset) {
-        throw new Error(`Unknown mapping preset: ${presetId}`);
-    }
-    const merged = {
-        ...collectCdpMappingFromForm(),
-        ...(preset.mapping || {}),
-    };
-    document.getElementById('cdp-external-id-path').value = merged.external_id_path || '';
-    document.getElementById('cdp-traits-path').value = merged.traits_path || '';
-    document.getElementById('cdp-segments-path').value = merged.segments_path || '';
-    document.getElementById('cdp-fixed-segments').value = (merged.fixed_segments || []).join(', ');
-    document.getElementById('cdp-preferred-sources-trait').value = merged.preferred_sources_trait || '';
-    document.getElementById('cdp-excluded-sources-trait').value = merged.excluded_sources_trait || '';
-    document.getElementById('cdp-source-weights-trait').value = merged.source_weights_trait || '';
-    document.getElementById('cdp-source-weight-prefix').value = merged.source_weight_trait_prefix || '';
-    document.getElementById('cdp-derivation-min-source-events').value = Number(merged.derivation_min_source_events ?? 3);
-    document.getElementById('cdp-derivation-min-category-events').value = Number(merged.derivation_min_category_events ?? 1);
-    document.getElementById('cdp-derivation-max-sources').value = Number(merged.derivation_max_preferred_sources ?? 5);
-    document.getElementById('cdp-derivation-weight-range').value = `${Number(merged.derivation_min_source_weight ?? 1.05)}:${Number(merged.derivation_max_source_weight ?? 2.0)}`;
-    document.getElementById('cdp-derivation-allowlist').value = (merged.derivation_allowed_sources || []).join(', ');
-    document.getElementById('cdp-derivation-blocklist').value = (merged.derivation_blocked_sources || []).join(', ');
-    document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(merged.scenario_segment_map || {}, null, 2);
-    document.getElementById('cdp-config-segment-map').value = JSON.stringify(merged.config_segment_map || {}, null, 2);
-    document.getElementById('cdp-segment-priority').value = (merged.segment_priority || []).join(', ');
-    document.getElementById('cdp-personalization-mode').value = merged.personalization_mode || 'active';
-    document.getElementById('cdp-fallback-mode').value = merged.fallback_mode || 'source_defaults';
-    document.getElementById('cdp-freshness-sla-hours').value = Number(merged.freshness_sla_hours ?? 24);
-    const mappingJson = document.getElementById('cdp-mapping-json');
-    if (mappingJson) mappingJson.value = JSON.stringify(merged, null, 2);
-    const statusEl = document.getElementById('cdp-config-status');
-    if (statusEl) statusEl.textContent = `Applied preset ${preset.label} to form. Save to persist.`;
+    getCdpControllerModule().applyCdpPresetToForm(buildCdpControllerContext());
 }
 
 function exportCdpMappingJson() {
-    const mapping = collectCdpMappingFromForm();
-    const target = document.getElementById('cdp-mapping-json');
-    if (!target) return;
-    target.value = JSON.stringify(mapping, null, 2);
+    getCdpControllerModule().exportCdpMappingJson();
 }
 
 function importCdpMappingJson() {
-    const target = document.getElementById('cdp-mapping-json');
-    if (!target) return;
-    let parsed = {};
-    try {
-        parsed = JSON.parse(target.value || '{}');
-    } catch (_error) {
-        throw new Error('Mapping JSON is invalid');
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('Mapping JSON must be an object');
-    }
-    const merged = _normalizeImportedCdpMapping(parsed);
-    document.getElementById('cdp-external-id-path').value = merged.external_id_path || '';
-    document.getElementById('cdp-traits-path').value = merged.traits_path || '';
-    document.getElementById('cdp-segments-path').value = merged.segments_path || '';
-    document.getElementById('cdp-fixed-segments').value = (merged.fixed_segments || []).join(', ');
-    document.getElementById('cdp-preferred-sources-trait').value = merged.preferred_sources_trait || '';
-    document.getElementById('cdp-excluded-sources-trait').value = merged.excluded_sources_trait || '';
-    document.getElementById('cdp-source-weights-trait').value = merged.source_weights_trait || '';
-    document.getElementById('cdp-source-weight-prefix').value = merged.source_weight_trait_prefix || '';
-    document.getElementById('cdp-derivation-min-source-events').value = Number(merged.derivation_min_source_events ?? 3);
-    document.getElementById('cdp-derivation-min-category-events').value = Number(merged.derivation_min_category_events ?? 1);
-    document.getElementById('cdp-derivation-max-sources').value = Number(merged.derivation_max_preferred_sources ?? 5);
-    document.getElementById('cdp-derivation-weight-range').value = `${Number(merged.derivation_min_source_weight ?? 1.05)}:${Number(merged.derivation_max_source_weight ?? 2.0)}`;
-    document.getElementById('cdp-derivation-allowlist').value = (merged.derivation_allowed_sources || []).join(', ');
-    document.getElementById('cdp-derivation-blocklist').value = (merged.derivation_blocked_sources || []).join(', ');
-    document.getElementById('cdp-scenario-segment-map').value = JSON.stringify(merged.scenario_segment_map || {}, null, 2);
-    document.getElementById('cdp-config-segment-map').value = JSON.stringify(merged.config_segment_map || {}, null, 2);
-    document.getElementById('cdp-segment-priority').value = (merged.segment_priority || []).join(', ');
-    document.getElementById('cdp-personalization-mode').value = merged.personalization_mode || 'active';
-    document.getElementById('cdp-fallback-mode').value = merged.fallback_mode || 'source_defaults';
-    document.getElementById('cdp-freshness-sla-hours').value = Number(merged.freshness_sla_hours ?? 24);
+    getCdpControllerModule().importCdpMappingJson();
 }
 
 function _normalizeImportedCdpMapping(mapping) {
-    const current = collectCdpMappingFromForm();
-    return { ...current, ...(mapping || {}) };
+    return getCdpControllerModule().normalizeImportedCdpMapping(mapping);
 }
 
 function collectCdpMappingFromForm() {
-    let scenarioMap = {};
-    let configMap = {};
-    try {
-        scenarioMap = JSON.parse(document.getElementById('cdp-scenario-segment-map').value || '{}');
-        configMap = JSON.parse(document.getElementById('cdp-config-segment-map').value || '{}');
-    } catch (error) {
-        throw new Error('Invalid JSON in mapping fields');
-    }
-    const weightRangeRaw = (document.getElementById('cdp-derivation-weight-range').value || '').trim();
-    const weightRange = weightRangeRaw.split(':').map(item => Number(item.trim()));
-    if (weightRange.length !== 2 || !Number.isFinite(weightRange[0]) || !Number.isFinite(weightRange[1])) {
-        throw new Error('Invalid derivation weight range (expected min:max)');
-    }
-    return {
-        external_id_path: (document.getElementById('cdp-external-id-path').value || '').trim(),
-        traits_path: (document.getElementById('cdp-traits-path').value || '').trim(),
-        segments_path: (document.getElementById('cdp-segments-path').value || '').trim(),
-        fixed_segments: (document.getElementById('cdp-fixed-segments').value || '').split(',').map(item => item.trim()).filter(Boolean),
-        preferred_sources_trait: (document.getElementById('cdp-preferred-sources-trait').value || '').trim(),
-        excluded_sources_trait: (document.getElementById('cdp-excluded-sources-trait').value || '').trim(),
-        source_weights_trait: (document.getElementById('cdp-source-weights-trait').value || '').trim(),
-        source_weight_trait_prefix: (document.getElementById('cdp-source-weight-prefix').value || '').trim(),
-        derivation_min_source_events: Number(document.getElementById('cdp-derivation-min-source-events').value || 3),
-        derivation_min_category_events: Number(document.getElementById('cdp-derivation-min-category-events').value || 1),
-        derivation_max_preferred_sources: Number(document.getElementById('cdp-derivation-max-sources').value || 5),
-        derivation_min_source_weight: Number(weightRange[0]),
-        derivation_max_source_weight: Number(weightRange[1]),
-        derivation_allowed_sources: (document.getElementById('cdp-derivation-allowlist').value || '').split(',').map(item => item.trim()).filter(Boolean),
-        derivation_blocked_sources: (document.getElementById('cdp-derivation-blocklist').value || '').split(',').map(item => item.trim()).filter(Boolean),
-        scenario_segment_map: scenarioMap,
-        config_segment_map: configMap,
-        segment_priority: (document.getElementById('cdp-segment-priority').value || '').split(',').map(item => item.trim()).filter(Boolean),
-        personalization_mode: (document.getElementById('cdp-personalization-mode').value || 'active').trim(),
-        fallback_mode: (document.getElementById('cdp-fallback-mode').value || 'source_defaults').trim(),
-        freshness_sla_hours: Number(document.getElementById('cdp-freshness-sla-hours').value || 24),
-    };
+    return getCdpControllerModule().collectCdpMappingFromForm();
 }
 
 async function saveCdpConfig() {
-    const statusEl = document.getElementById('cdp-config-status');
-    const payload = {
-        enabled: document.getElementById('cdp-enabled').checked,
-        config: {
-            base_url: (document.getElementById('cdp-base-url').value || '').trim(),
-            request_url_template: (document.getElementById('cdp-request-url-template').value || '').trim(),
-            profile_endpoint_template: (document.getElementById('cdp-profile-endpoint-template').value || '').trim(),
-            api_key: (document.getElementById('cdp-api-key').value || '').trim(),
-            timeout_seconds: Number(document.getElementById('cdp-timeout-seconds').value || 5),
-            request_retries: Number(document.getElementById('cdp-request-retries').value || 2)
-        },
-        mapping: collectCdpMappingFromForm(),
-        actor_id: getOperatorId() || undefined
-    };
-    if (statusEl) statusEl.textContent = 'Saving CDP config...';
-    const response = await fetch('/api/cdp/meiro', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
-        body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to save CDP config');
-    }
-    const saved = await response.json();
-    cdpIntegration = saved;
-    if (statusEl) statusEl.textContent = 'CDP config saved.';
+    await getCdpControllerModule().saveCdpConfig(buildCdpControllerContext());
 }
 
 async function loadCdpProfiles() {
-    const table = document.getElementById('cdp-profiles-table');
-    if (!table) return;
-    try {
-        const response = await fetch('/api/cdp/meiro/profiles?limit=50');
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to load CDP profiles');
-        }
-        const payload = await response.json();
-        const rows = (payload.profiles || []).map(item => `
-            <tr>
-                <td><code>${item.external_user_id}</code></td>
-                <td class="small">${(item.segments || []).join(', ') || 'n/a'}</td>
-                <td class="small">${Object.keys(item.traits || {}).slice(0, 6).join(', ') || 'n/a'}</td>
-                <td>${item.synced_at || 'n/a'}</td>
-            </tr>
-        `).join('');
-        table.innerHTML = rows || '<tr><td colspan="4" class="text-muted">No CDP profiles ingested yet.</td></tr>';
-    } catch (error) {
-        table.innerHTML = `<tr><td colspan="4" class="text-danger">CDP profiles unavailable: ${error.message}</td></tr>`;
-    }
+    await getCdpControllerModule().loadCdpProfiles();
 }
 
 async function syncCdpProfiles() {
-    const statusEl = document.getElementById('cdp-sync-status');
-    const raw = document.getElementById('cdp-sync-external-ids').value || '';
-    const externalIds = raw.split(',').map(item => item.trim()).filter(Boolean);
-    if (!externalIds.length) {
-        throw new Error('Enter at least one external ID');
-    }
-    if (statusEl) statusEl.textContent = 'Sync in progress...';
-    const response = await fetch('/api/cdp/meiro/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
-        body: JSON.stringify({ external_user_ids: externalIds, actor_id: getOperatorId() || undefined })
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to sync profiles');
-    }
-    const payload = await response.json();
-    if (statusEl) statusEl.textContent = `Sync finished. Synced: ${payload.synced_count || 0}, errors: ${payload.error_count || 0}.`;
-    await loadCdpProfiles();
-    await loadCdpDiagnostics();
+    await getCdpControllerModule().syncCdpProfiles(buildCdpControllerContext());
 }
 
 async function loadCdpSchedulerStatus() {
-    const container = document.getElementById('cdp-scheduler-status');
-    if (!container) return;
-    try {
-        const response = await fetch('/api/cdp/meiro/scheduler/status');
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to load scheduler status');
-        }
-        const payload = await response.json();
-        container.innerHTML = `
-            <div><strong>Enabled:</strong> ${payload.enabled ? 'yes' : 'no'}</div>
-            <div><strong>Running:</strong> ${payload.running ? 'yes' : 'no'}</div>
-            <div><strong>Runs total:</strong> ${payload.runs_total || 0}</div>
-            <div><strong>Errors total:</strong> ${payload.errors_total || 0}</div>
-            <div><strong>Last run:</strong> ${payload.last_run_at || 'n/a'}</div>
-            <div><strong>Last result:</strong> ${payload.last_result ? JSON.stringify(payload.last_result) : 'n/a'}</div>
-        `;
-    } catch (error) {
-        container.textContent = `Scheduler status unavailable: ${error.message}`;
-    }
+    await getCdpControllerModule().loadCdpSchedulerStatus();
 }
 
 async function runCdpSchedulerNow() {
-    const statusEl = document.getElementById('cdp-scheduler-status');
-    if (statusEl) statusEl.textContent = 'Running CDP sync now...';
-    const response = await fetch('/api/cdp/meiro/scheduler/run-now', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
-        body: JSON.stringify({ actor_id: getOperatorId() || undefined })
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to run scheduler now');
-    }
-    await loadCdpSchedulerStatus();
-    await loadCdpDiagnostics();
-    await loadCdpProfiles();
+    await getCdpControllerModule().runCdpSchedulerNow(buildCdpControllerContext());
 }
 
 async function loadCdpDiagnostics() {
-    const summary = document.getElementById('cdp-diagnostics-summary');
-    const table = document.getElementById('cdp-sync-runs-table');
-    if (!summary || !table) return;
-    try {
-        const response = await fetch('/api/cdp/meiro/diagnostics?freshness_hours=24');
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to load diagnostics');
-        }
-        const payload = await response.json();
-        const p = payload.profiles || {};
-        const m = payload.mapping_coverage || {};
-        const s = payload.sync_runs || {};
-        summary.innerHTML = `
-            <strong>Profiles:</strong> ${p.count || 0} (fresh ${(Number(p.fresh_ratio || 0) * 100).toFixed(1)}%, stale ${(Number(p.stale_ratio || 0) * 100).toFixed(1)}%)
-            | <strong>Mapping hit:</strong> ${(Number(m.profile_found_ratio || 0) * 100).toFixed(1)}%
-            | <strong>Applied:</strong> ${(Number(m.applied_ratio || 0) * 100).toFixed(1)}%
-            | <strong>Sync success:</strong> ${(Number(s.success_ratio || 0) * 100).toFixed(1)}%
-        `;
-        const rows = (s.recent || []).map(item => `
-            <tr>
-                <td><code>${(item.run_id || '').slice(0, 8)}</code></td>
-                <td>${item.status || 'n/a'}</td>
-                <td>${item.attempted || 0}</td>
-                <td>${item.synced || 0}</td>
-                <td>${item.error_count || 0}</td>
-            </tr>
-        `).join('');
-        table.innerHTML = rows || '<tr><td colspan="5" class="text-muted">No sync runs yet.</td></tr>';
-    } catch (error) {
-        summary.textContent = `CDP diagnostics unavailable: ${error.message}`;
-        table.innerHTML = '<tr><td colspan="5" class="text-danger">Failed to load diagnostics.</td></tr>';
-    }
+    await getCdpControllerModule().loadCdpDiagnostics();
 }
 
 async function deriveCdpProfile(persist = false) {
-    const externalId = (document.getElementById('cdp-derive-external-id')?.value || '').trim();
-    if (!externalId) {
-        throw new Error('Enter external user ID for derivation');
-    }
-    const output = document.getElementById('cdp-derivation-output');
-    if (output) output.textContent = 'Deriving...';
-    const response = await fetch(`/api/cdp/meiro/profiles/${encodeURIComponent(externalId)}/derive`, {
-        method: persist ? 'POST' : 'GET',
-        headers: persist ? { 'Content-Type': 'application/json', ...getOperatorHeaders() } : undefined,
-        body: persist ? JSON.stringify({
-            persist: true,
-            force: Boolean(document.getElementById('cdp-derive-force')?.checked),
-            actor_id: getOperatorId() || undefined
-        }) : undefined
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to derive profile traits');
-    }
-    const payload = await response.json();
-    if (output) output.textContent = JSON.stringify(payload, null, 2);
-    if (persist) {
-        await loadCdpProfiles();
-        await loadCdpDiagnostics();
-    }
+    await getCdpControllerModule().deriveCdpProfile(persist, buildCdpControllerContext());
 }
 
 async function previewCdpMapping() {
-    const output = document.getElementById('cdp-mapping-preview-output');
-    if (!output) return;
-    let samplePayload = {};
-    try {
-        samplePayload = JSON.parse(document.getElementById('cdp-preview-payload')?.value || '{}');
-    } catch (_error) {
-        throw new Error('Invalid JSON in sample payload');
-    }
-    output.textContent = 'Previewing mapping...';
-    const response = await fetch('/api/cdp/meiro/mapping/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
-        body: JSON.stringify({
-            payload: samplePayload,
-            fallback_external_user_id: (document.getElementById('cdp-preview-fallback-external-id')?.value || '').trim(),
-            mapping: collectCdpMappingFromForm(),
-            actor_id: getOperatorId() || undefined
-        })
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to preview mapping');
-    }
-    const preview = await response.json();
-    output.textContent = JSON.stringify(preview, null, 2);
+    await getCdpControllerModule().previewCdpMapping(buildCdpControllerContext());
 }
 
 async function previewCdpFallback() {
-    const output = document.getElementById('cdp-mapping-preview-output');
-    if (!output) return;
-    const externalUserId = (document.getElementById('cdp-fallback-preview-external-id')?.value || '').trim();
-    if (!externalUserId) {
-        throw new Error('Enter fallback preview external user ID');
-    }
-    output.textContent = 'Previewing fallback behavior...';
-    const response = await fetch('/api/cdp/meiro/fallback-preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
-        body: JSON.stringify({
-            external_user_id: externalUserId,
-            sources: [],
-            config_id: 'balanced',
-            scenario_id: '',
-            scenario_explicit: false,
-            config_explicit: false,
-        }),
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to preview CDP fallback');
-    }
-    const payload = await response.json();
-    output.textContent = JSON.stringify(payload, null, 2);
+    await getCdpControllerModule().previewCdpFallback(buildCdpControllerContext());
 }
 
 async function runCleanupNow() {
@@ -5109,6 +4444,11 @@ function setupEventListeners() {
         } catch (error) {
             showError(error.message || 'Failed to preview CDP mapping');
         }
+    });
+    on('cdp-preview-payload', 'input', () => {
+        try {
+            getCdpControllerModule().validatePreviewPayloadInput();
+        } catch (_error) {}
     });
     on('preview-cdp-fallback', 'click', async () => {
         try {
