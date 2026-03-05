@@ -350,3 +350,21 @@ pytest
 black .
 flake8
 ```
+
+## Load And Smoke Validation
+
+Operator flow smoke (rollout + recommendation + queue controls):
+
+```bash
+./scripts/smoke_operator_flow.sh
+```
+
+k6 load profile (recommendations + async event ingest queue pressure):
+
+```bash
+k6 run scripts/loadtest_k6.js
+```
+
+Optional environment overrides:
+- `BASE_URL=http://localhost:5001`
+- `ACTOR_ID=ops-user` (for smoke script)

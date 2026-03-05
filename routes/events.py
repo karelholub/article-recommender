@@ -174,3 +174,47 @@ def recommendation_events_async_status(job_id):
 @events_blueprint.route('/api/v1/events/ingest-queue-status', methods=['GET'])
 def recommendation_events_async_queue_status():
     return jsonify({'api_version': 'v1', 'queue': _helpers()['events_queue_state']()})
+
+
+@events_blueprint.route('/api/events/ingest-queue-control', methods=['POST'])
+@events_blueprint.route('/api/v1/events/ingest-queue-control', methods=['POST'])
+def recommendation_events_async_queue_control():
+    payload = request.get_json(silent=True) or {}
+    action = str(payload.get('action', '')).strip().lower()
+    if action not in {'enable', 'disable', 'drain'}:
+        return jsonify({'error': 'action must be one of: enable, disable, drain'}), 400
+    actor_id = str(payload.get('actor_id', 'system')).strip() or 'system'
+    try:
+        if action == 'enable':
+            state = _helpers()['set_events_queue_enabled'](True)
+            _helpers()['record_audit'](
+                action='enable_queue',
+                resource_type='events_queue',
+                resource_id='global',
+                payload={'actor_id': actor_id, **payload},
+                extra={'queue': state},
+            )
+            return jsonify({'api_version': 'v1', 'action': action, 'queue': state})
+        if action == 'disable':
+            state = _helpers()['set_events_queue_enabled'](False)
+            _helpers()['record_audit'](
+                action='disable_queue',
+                resource_type='events_queue',
+                resource_id='global',
+                payload={'actor_id': actor_id, **payload},
+                extra={'queue': state},
+            )
+            return jsonify({'api_version': 'v1', 'action': action, 'queue': state})
+        result = _helpers()['drain_events_queue'](max_items=int(payload.get('max_items', 100000)))
+        _helpers()['record_audit'](
+            action='drain_queue',
+            resource_type='events_queue',
+            resource_id='global',
+            payload={'actor_id': actor_id, **payload},
+            extra=result,
+        )
+        return jsonify({'api_version': 'v1', 'action': action, **result})
+    except Exception as e:
+        _logger().error(f'Error controlling async events queue: {str(e)}')
+        _logger().error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 400

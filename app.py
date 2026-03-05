@@ -950,6 +950,39 @@ def _events_queue_snapshot() -> Dict[str, Any]:
     return snapshot
 
 
+def _set_events_queue_enabled(enabled: bool) -> Dict[str, Any]:
+    with _events_queue_lock:
+        _events_queue_state["enabled"] = bool(enabled)
+        if not enabled:
+            _events_queue_state["running"] = False
+    if enabled:
+        _start_events_worker_if_enabled()
+    return _events_queue_snapshot()
+
+
+def _drain_events_queue(max_items: int = 100000) -> Dict[str, Any]:
+    drained = 0
+    max_items = max(1, int(max_items))
+    with _events_queue_lock:
+        _events_queue_state["enabled"] = False
+        _events_queue_state["running"] = False
+    while drained < max_items:
+        try:
+            payload = _events_queue.get_nowait()
+        except Empty:
+            break
+        job_id = str((payload or {}).get("job_id") or "").strip()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _events_queue_lock:
+            if job_id in _events_queue_jobs and _events_queue_jobs[job_id].get("status") == "queued":
+                _events_queue_jobs[job_id]["status"] = "cancelled"
+                _events_queue_jobs[job_id]["updated_at"] = now_str
+                _events_queue_jobs[job_id]["error"] = "queue_drained_by_operator"
+        drained += 1
+        _events_queue.task_done()
+    return {"drained": drained, "queue": _events_queue_snapshot()}
+
+
 def _run_rollup_rebuild_job(job_id: str, days: int, actor_id: str) -> None:
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _rollup_jobs_lock:
@@ -1978,6 +2011,8 @@ app.config["APP_HELPERS"] = {
     "enqueue_event_batch": _enqueue_event_batch,
     "get_events_job": _get_events_job,
     "events_queue_state": _events_queue_snapshot,
+    "set_events_queue_enabled": _set_events_queue_enabled,
+    "drain_events_queue": _drain_events_queue,
     "build_recommendation_cache_key": _build_recommendation_cache_key,
     "get_cached_recommendations": _get_cached_recommendations,
     "set_cached_recommendations": _set_cached_recommendations,
@@ -2071,6 +2106,7 @@ def openapi_spec():
                 }
             },
             "/api/events/ingest-queue-status": {"get": {"summary": "Get async events queue status"}},
+            "/api/events/ingest-queue-control": {"post": {"summary": "Control async events queue (enable/disable/drain)"}},
             "/api/metrics/online-kpis": {
                 "get": {
                     "summary": "Online KPI monitor with lift and confidence",

@@ -2249,6 +2249,23 @@ async function enqueueEventsSample() {
     await loadEventsQueueStatus();
 }
 
+async function controlEventsQueue(action) {
+    if (!['enable', 'disable', 'drain'].includes(action)) {
+        throw new Error('Unsupported queue action');
+    }
+    const payload = { action, actor_id: getOperatorId() || undefined };
+    const response = await fetch('/api/events/ingest-queue-control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify(payload)
+    });
+    const body = await response.json();
+    if (!response.ok) {
+        throw new Error(body.error || 'Failed to control events queue');
+    }
+    await loadEventsQueueStatus();
+}
+
 async function rebuildRollupsAsync() {
     const statusEl = document.getElementById('rollups-async-status');
     if (statusEl) statusEl.textContent = 'Queueing async rollup rebuild...';
@@ -5263,6 +5280,27 @@ function setupEventListeners() {
             await enqueueEventsSample();
         } catch (error) {
             showError(error.message || 'Failed to enqueue sample events');
+        }
+    });
+    on('enable-events-queue', 'click', async () => {
+        try {
+            await controlEventsQueue('enable');
+        } catch (error) {
+            showError(error.message || 'Failed to enable events queue');
+        }
+    });
+    on('disable-events-queue', 'click', async () => {
+        try {
+            await controlEventsQueue('disable');
+        } catch (error) {
+            showError(error.message || 'Failed to disable events queue');
+        }
+    });
+    on('drain-events-queue', 'click', async () => {
+        try {
+            await controlEventsQueue('drain');
+        } catch (error) {
+            showError(error.message || 'Failed to drain events queue');
         }
     });
     on('run-cleanup-now', 'click', async () => {

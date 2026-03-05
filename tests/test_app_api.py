@@ -1738,3 +1738,61 @@ def test_alert_incidents_endpoints():
         assert resolved.status_code == 200
         resolved_payload = resolved.get_json()
         assert resolved_payload['resolved'] is True
+
+
+def test_rollout_lifecycle_endpoints(tmp_path, monkeypatch):
+    monkeypatch.setenv('ROLLOUTS_STATE_PATH', str(tmp_path / 'rollouts.json'))
+    client = app.test_client()
+
+    created = client.post(
+        '/api/rollouts',
+        json={
+            'name': 'pytest-rollout',
+            'baseline_config_id': 'balanced',
+            'candidate_config_id': 'balanced',
+            'traffic_percentage': 12.5,
+            'enabled': False,
+            'actor_id': 'pytest',
+        },
+    )
+    assert created.status_code == 201
+    rollout = created.get_json()['rollout']
+    rollout_id = rollout['rollout_id']
+    assert rollout['name'] == 'pytest-rollout'
+
+    listing = client.get('/api/rollouts')
+    assert listing.status_code == 200
+    payload = listing.get_json()
+    assert payload['count'] >= 1
+
+    started = client.post(f'/api/rollouts/{rollout_id}/start', json={'actor_id': 'pytest'})
+    assert started.status_code == 200
+    assert started.get_json()['rollout']['status'] == 'running'
+
+    evaluated = client.post(f'/api/rollouts/{rollout_id}/evaluate', json={'apply_auto_rollback': False, 'actor_id': 'pytest'})
+    assert evaluated.status_code == 200
+    eval_payload = evaluated.get_json()
+    assert 'evaluation' in eval_payload
+    assert 'checks' in eval_payload['evaluation']
+
+    stopped = client.post(f'/api/rollouts/{rollout_id}/stop', json={'actor_id': 'pytest'})
+    assert stopped.status_code == 200
+    assert stopped.get_json()['rollout']['status'] == 'paused'
+
+
+def test_events_queue_control_endpoints():
+    client = app.test_client()
+
+    disabled = client.post('/api/events/ingest-queue-control', json={'action': 'disable', 'actor_id': 'pytest'})
+    assert disabled.status_code == 200
+    assert disabled.get_json()['queue']['enabled'] is False
+
+    enabled = client.post('/api/events/ingest-queue-control', json={'action': 'enable', 'actor_id': 'pytest'})
+    assert enabled.status_code == 200
+    assert enabled.get_json()['queue']['enabled'] is True
+
+    drained = client.post('/api/events/ingest-queue-control', json={'action': 'drain', 'actor_id': 'pytest', 'max_items': 10})
+    assert drained.status_code == 200
+    drained_payload = drained.get_json()
+    assert 'drained' in drained_payload
+    assert 'queue' in drained_payload
