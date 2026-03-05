@@ -278,6 +278,123 @@ def _validate_scenario_rule_set(rule_set: Dict) -> Dict:
     return _validate_scenario_rule_set_impl(rule_set)
 
 
+def _deep_clone_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _scenario_lifecycle_from_metadata(metadata: Dict, fallback_rule_set: Dict) -> Dict:
+    raw = (metadata or {}).get("lifecycle") or {}
+    published_rule_set = raw.get("published_rule_set")
+    draft_rule_set = raw.get("draft_rule_set")
+    if not isinstance(published_rule_set, dict):
+        published_rule_set = _deep_clone_json(fallback_rule_set or {})
+    if not isinstance(draft_rule_set, dict):
+        draft_rule_set = _deep_clone_json(published_rule_set)
+    history = raw.get("history") if isinstance(raw.get("history"), list) else []
+    normalized = {
+        "draft_version": int(raw.get("draft_version") or 1),
+        "published_version": int(raw.get("published_version") or 1),
+        "published_rule_set": published_rule_set,
+        "draft_rule_set": draft_rule_set,
+        "published_at": raw.get("published_at"),
+        "published_by": raw.get("published_by"),
+        "last_saved_at": raw.get("last_saved_at"),
+        "last_saved_by": raw.get("last_saved_by"),
+        "history": history[:50],
+    }
+    if normalized["draft_version"] < normalized["published_version"]:
+        normalized["draft_version"] = normalized["published_version"]
+    return normalized
+
+
+def _merge_scenario_metadata_with_lifecycle(
+    metadata: Dict,
+    lifecycle: Dict,
+) -> Dict:
+    merged = _deep_clone_json(metadata or {})
+    merged["lifecycle"] = lifecycle
+    return merged
+
+
+def _scenario_for_editor_view(scenario: Dict) -> Dict:
+    if not scenario:
+        return scenario
+    lifecycle = _scenario_lifecycle_from_metadata(scenario.get("metadata") or {}, scenario.get("rule_set") or {})
+    draft_rule_set = lifecycle.get("draft_rule_set") or {}
+    projected = _deep_clone_json(scenario)
+    projected["rule_set"] = draft_rule_set
+    projected["lifecycle"] = {
+        "draft_version": lifecycle.get("draft_version"),
+        "published_version": lifecycle.get("published_version"),
+        "published_at": lifecycle.get("published_at"),
+        "published_by": lifecycle.get("published_by"),
+        "last_saved_at": lifecycle.get("last_saved_at"),
+        "last_saved_by": lifecycle.get("last_saved_by"),
+        "pending_changes": (lifecycle.get("draft_version") or 0) > (lifecycle.get("published_version") or 0),
+    }
+    return projected
+
+
+def _compute_scenario_publish_guard(rule_set: Dict, known_sources: List[str]) -> Dict:
+    include_sources = set(_normalize_string_list(rule_set.get("include_sources")))
+    exclude_sources = set(_normalize_string_list(rule_set.get("exclude_sources")))
+    include_sections = set(_normalize_string_list(rule_set.get("include_sections")))
+    exclude_sections = set(_normalize_string_list(rule_set.get("exclude_sections")))
+    include_keywords = set(_normalize_string_list(rule_set.get("include_keywords")))
+    exclude_keywords = set(_normalize_string_list(rule_set.get("exclude_keywords")))
+    known_source_set = set(_normalize_string_list(known_sources))
+    checks: List[Dict[str, Any]] = []
+
+    overlap_sources = sorted(include_sources.intersection(exclude_sources))
+    checks.append({
+        "name": "include_exclude_source_conflict",
+        "pass": len(overlap_sources) == 0,
+        "detail": f"overlap={overlap_sources[:10]}" if overlap_sources else "none",
+    })
+    overlap_sections = sorted(include_sections.intersection(exclude_sections))
+    checks.append({
+        "name": "include_exclude_section_conflict",
+        "pass": len(overlap_sections) == 0,
+        "detail": f"overlap={overlap_sections[:10]}" if overlap_sections else "none",
+    })
+    overlap_keywords = sorted(include_keywords.intersection(exclude_keywords))
+    checks.append({
+        "name": "include_exclude_keyword_conflict",
+        "pass": len(overlap_keywords) == 0,
+        "detail": f"overlap={overlap_keywords[:10]}" if overlap_keywords else "none",
+    })
+    if include_sources:
+        present_include = sorted(include_sources.intersection(known_source_set))
+        checks.append({
+            "name": "include_sources_exist_in_inventory",
+            "pass": len(present_include) > 0,
+            "detail": f"present={present_include[:10]}",
+        })
+    if known_source_set:
+        excluded_all = known_source_set.issubset(exclude_sources)
+        checks.append({
+            "name": "exclude_sources_not_blocking_all_inventory",
+            "pass": not excluded_all,
+            "detail": f"known_sources={len(known_source_set)}, excluded={len(exclude_sources)}",
+        })
+    min_freshness = rule_set.get("min_freshness")
+    if min_freshness is not None:
+        checks.append({
+            "name": "min_freshness_not_too_strict",
+            "pass": float(min_freshness) <= 0.95,
+            "detail": f"value={min_freshness}",
+        })
+    max_age_days = rule_set.get("max_age_days")
+    if max_age_days is not None:
+        checks.append({
+            "name": "max_age_days_positive",
+            "pass": int(max_age_days) > 0,
+            "detail": f"value={max_age_days}",
+        })
+    passed = all(bool(item.get("pass")) for item in checks)
+    return {"passed": passed, "checks": checks}
+
+
 def _embedding_config_path() -> str:
     return os.getenv("EMBEDDING_CONFIG_PATH", "config/embedding_settings.json")
 
@@ -2769,7 +2886,7 @@ def scenarios():
     if request.method == "GET":
         include_disabled = request.args.get("include_disabled", "true").lower() == "true"
         scenario_items = store.list_scenarios(include_disabled=include_disabled)
-        return jsonify({"scenarios": scenario_items, "count": len(scenario_items)})
+        return jsonify({"scenarios": [_scenario_for_editor_view(item) for item in scenario_items], "count": len(scenario_items)})
 
     try:
         payload = request.get_json() or {}
@@ -2780,13 +2897,30 @@ def scenarios():
         if not name:
             return jsonify({"error": "name is required"}), 400
         rule_set = _validate_scenario_rule_set(payload.get("rule_set") or {})
+        actor_id = request.headers.get("X-Actor-Id") or payload.get("actor_id") or "system"
+        now_iso = datetime.now().isoformat()
+        lifecycle = _scenario_lifecycle_from_metadata(payload.get("metadata") or {}, rule_set)
+        lifecycle["draft_rule_set"] = _deep_clone_json(rule_set)
+        lifecycle["published_rule_set"] = _deep_clone_json(rule_set)
+        lifecycle["draft_version"] = 1
+        lifecycle["published_version"] = 1
+        lifecycle["published_at"] = now_iso
+        lifecycle["published_by"] = actor_id
+        lifecycle["last_saved_at"] = now_iso
+        lifecycle["last_saved_by"] = actor_id
+        lifecycle["history"] = [{
+            "version": 1,
+            "published_at": now_iso,
+            "published_by": actor_id,
+            "rule_set": _deep_clone_json(rule_set),
+        }]
         scenario = store.upsert_scenario(
             scenario_id=scenario_id,
             name=name,
             description=str(payload.get("description", "")).strip(),
             enabled=bool(payload.get("enabled", True)),
-            rule_set=rule_set,
-            metadata=payload.get("metadata") or {},
+            rule_set=_deep_clone_json(rule_set),
+            metadata=_merge_scenario_metadata_with_lifecycle(payload.get("metadata") or {}, lifecycle),
         )
         _record_audit(
             action="create",
@@ -2795,7 +2929,7 @@ def scenarios():
             payload=payload,
             extra={"enabled": bool(payload.get("enabled", True))},
         )
-        return jsonify(scenario), 201
+        return jsonify(_scenario_for_editor_view(scenario)), 201
     except Exception as e:
         logger.error(f"Error creating scenario: {str(e)}")
         logger.error(traceback.format_exc())
@@ -2811,7 +2945,7 @@ def scenario_detail(scenario_id):
         scenario = store.get_scenario(scenario_id)
         if not scenario:
             return jsonify({"error": "Scenario not found"}), 404
-        return jsonify(scenario)
+        return jsonify(_scenario_for_editor_view(scenario))
 
     if request.method == "DELETE":
         deleted = store.delete_scenario(scenario_id)
@@ -2830,26 +2964,177 @@ def scenario_detail(scenario_id):
         if not current:
             return jsonify({"error": "Scenario not found"}), 404
         payload = request.get_json() or {}
+        actor_id = request.headers.get("X-Actor-Id") or payload.get("actor_id") or "system"
+        now_iso = datetime.now().isoformat()
+        incoming_rule_set = _validate_scenario_rule_set(payload.get("rule_set") or current.get("rule_set") or {})
+        lifecycle = _scenario_lifecycle_from_metadata(current.get("metadata") or {}, current.get("rule_set") or {})
+        lifecycle["draft_rule_set"] = _deep_clone_json(incoming_rule_set)
+        lifecycle["draft_version"] = int(lifecycle.get("draft_version") or 1) + 1
+        lifecycle["last_saved_at"] = now_iso
+        lifecycle["last_saved_by"] = actor_id
         scenario = store.upsert_scenario(
             scenario_id=scenario_id,
             name=str(payload.get("name", current["name"])).strip(),
             description=str(payload.get("description", current.get("description", ""))).strip(),
             enabled=bool(payload.get("enabled", current.get("enabled", True))),
-            rule_set=_validate_scenario_rule_set(payload.get("rule_set") or current.get("rule_set") or {}),
-            metadata=payload.get("metadata") if "metadata" in payload else current.get("metadata", {}),
+            # Keep runtime scenario stable until publish.
+            rule_set=_deep_clone_json(lifecycle.get("published_rule_set") or current.get("rule_set") or {}),
+            metadata=_merge_scenario_metadata_with_lifecycle(
+                payload.get("metadata") if "metadata" in payload else current.get("metadata", {}),
+                lifecycle,
+            ),
         )
         _record_audit(
             action="update",
             resource_type="scenario",
             resource_id=scenario_id,
             payload=payload,
-            extra={"enabled": scenario.get("enabled")},
+            extra={"enabled": scenario.get("enabled"), "draft_version": lifecycle.get("draft_version"), "published_version": lifecycle.get("published_version")},
         )
-        return jsonify(scenario)
+        return jsonify(_scenario_for_editor_view(scenario))
     except Exception as e:
         logger.error(f"Error updating scenario: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/scenarios/<scenario_id>/publish", methods=["POST"])
+def scenario_publish(scenario_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        scenario = store.get_scenario(scenario_id)
+        if not scenario:
+            return jsonify({"error": "Scenario not found"}), 404
+        payload = request.get_json() or {}
+        actor_id = request.headers.get("X-Actor-Id") or payload.get("actor_id") or "system"
+        lifecycle = _scenario_lifecycle_from_metadata(scenario.get("metadata") or {}, scenario.get("rule_set") or {})
+        draft_rule_set = lifecycle.get("draft_rule_set") or {}
+        known_sources: List[str] = []
+        if recommender:
+            for data in recommender.article_vectors.values():
+                metadata = data.get("metadata") or {}
+                source = recommender.extract_source(metadata.get("url", ""))
+                if source:
+                    known_sources.append(source)
+        guard = _compute_scenario_publish_guard(draft_rule_set, known_sources)
+        if not guard.get("passed"):
+            return jsonify({"error": "Scenario publish blocked by guardrails", "guard_evaluation": guard}), 409
+
+        now_iso = datetime.now().isoformat()
+        next_version = int(lifecycle.get("published_version") or 0) + 1
+        lifecycle["published_rule_set"] = _deep_clone_json(draft_rule_set)
+        lifecycle["published_version"] = next_version
+        lifecycle["published_at"] = now_iso
+        lifecycle["published_by"] = actor_id
+        history = lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else []
+        history.append(
+            {
+                "version": next_version,
+                "published_at": now_iso,
+                "published_by": actor_id,
+                "rule_set": _deep_clone_json(draft_rule_set),
+            }
+        )
+        lifecycle["history"] = history[-50:]
+        updated = store.upsert_scenario(
+            scenario_id=scenario_id,
+            name=scenario.get("name", ""),
+            description=scenario.get("description", ""),
+            enabled=bool(scenario.get("enabled", True)),
+            rule_set=_deep_clone_json(draft_rule_set),
+            metadata=_merge_scenario_metadata_with_lifecycle(scenario.get("metadata") or {}, lifecycle),
+        )
+        _record_audit(
+            action="publish",
+            resource_type="scenario",
+            resource_id=scenario_id,
+            payload=payload,
+            extra={"published_version": next_version},
+        )
+        return jsonify({"scenario": _scenario_for_editor_view(updated), "guard_evaluation": guard, "published_version": next_version})
+    except Exception as e:
+        logger.error(f"Error publishing scenario: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/scenarios/<scenario_id>/rollback", methods=["POST"])
+def scenario_rollback(scenario_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    try:
+        scenario = store.get_scenario(scenario_id)
+        if not scenario:
+            return jsonify({"error": "Scenario not found"}), 404
+        payload = request.get_json() or {}
+        actor_id = request.headers.get("X-Actor-Id") or payload.get("actor_id") or "system"
+        target_version = int(payload.get("target_version") or 0) if payload.get("target_version") else None
+        lifecycle = _scenario_lifecycle_from_metadata(scenario.get("metadata") or {}, scenario.get("rule_set") or {})
+        history = lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else []
+        if not history:
+            return jsonify({"error": "No published history available for rollback"}), 409
+        selected = None
+        if target_version is not None:
+            selected = next((item for item in history if int(item.get("version") or 0) == target_version), None)
+        else:
+            current_version = int(lifecycle.get("published_version") or 0)
+            older = [item for item in history if int(item.get("version") or 0) < current_version]
+            selected = older[-1] if older else None
+        if not selected:
+            return jsonify({"error": "Rollback target version not found"}), 404
+        selected_rule_set = _validate_scenario_rule_set(selected.get("rule_set") or {})
+        lifecycle["published_rule_set"] = _deep_clone_json(selected_rule_set)
+        lifecycle["draft_rule_set"] = _deep_clone_json(selected_rule_set)
+        lifecycle["published_version"] = int(selected.get("version") or lifecycle.get("published_version") or 1)
+        lifecycle["draft_version"] = lifecycle["published_version"]
+        lifecycle["published_at"] = datetime.now().isoformat()
+        lifecycle["published_by"] = actor_id
+        updated = store.upsert_scenario(
+            scenario_id=scenario_id,
+            name=scenario.get("name", ""),
+            description=scenario.get("description", ""),
+            enabled=bool(scenario.get("enabled", True)),
+            rule_set=_deep_clone_json(selected_rule_set),
+            metadata=_merge_scenario_metadata_with_lifecycle(scenario.get("metadata") or {}, lifecycle),
+        )
+        _record_audit(
+            action="rollback",
+            resource_type="scenario",
+            resource_id=scenario_id,
+            payload=payload,
+            extra={"rolled_back_to_version": lifecycle["published_version"]},
+        )
+        return jsonify({"scenario": _scenario_for_editor_view(updated), "rolled_back_to_version": lifecycle["published_version"]})
+    except Exception as e:
+        logger.error(f"Error rolling back scenario: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/scenarios/<scenario_id>/versions", methods=["GET"])
+def scenario_versions(scenario_id):
+    if not store:
+        return jsonify({"error": "Store unavailable"}), 500
+    scenario = store.get_scenario(scenario_id)
+    if not scenario:
+        return jsonify({"error": "Scenario not found"}), 404
+    lifecycle = _scenario_lifecycle_from_metadata(scenario.get("metadata") or {}, scenario.get("rule_set") or {})
+    history = lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else []
+    versions = sorted(
+        [
+            {
+                "version": int(item.get("version") or 0),
+                "published_at": item.get("published_at"),
+                "published_by": item.get("published_by"),
+            }
+            for item in history
+            if int(item.get("version") or 0) > 0
+        ],
+        key=lambda item: item["version"],
+        reverse=True,
+    )
+    return jsonify({"scenario_id": scenario_id, "versions": versions, "count": len(versions)})
 
 
 def _execute_recommendation_query(payload: Dict[str, Any], api_surface: str = "query") -> Dict[str, Any]:
@@ -3127,10 +3412,16 @@ def simulate_scenario(scenario_id):
         return jsonify({"error": "Scenario not found"}), 404
     try:
         payload = request.get_json() or {}
+        use_draft = bool(payload.get("use_draft", True))
+        lifecycle = _scenario_lifecycle_from_metadata(scenario.get("metadata") or {}, scenario.get("rule_set") or {})
+        active_rule_set = lifecycle.get("draft_rule_set") if use_draft else lifecycle.get("published_rule_set")
+        active_rule_set = _validate_scenario_rule_set(active_rule_set or scenario.get("rule_set") or {})
+        scenario_for_simulation = _deep_clone_json(scenario)
+        scenario_for_simulation["rule_set"] = active_rule_set
         user_id = str(payload.get("user_id", "demo_user"))
         top_n = max(1, min(50, int(payload.get("top_n", 10))))
-        requested_sources = payload.get("sources") or scenario.get("rule_set", {}).get("include_sources") or []
-        config_id = scenario.get("rule_set", {}).get("ranking_config_id") or payload.get("config_id", "balanced")
+        requested_sources = payload.get("sources") or scenario_for_simulation.get("rule_set", {}).get("include_sources") or []
+        config_id = scenario_for_simulation.get("rule_set", {}).get("ranking_config_id") or payload.get("config_id", "balanced")
         user_reads = payload.get("user_reads") or recommender.user_profiles.get(user_id, [])
 
         context = _build_decision_context(requested_sources, config_id, None)
@@ -3143,10 +3434,11 @@ def simulate_scenario(scenario_id):
             config_id=context["effective_config_id"],
             ranking_config=context["effective_ranking_config"],
         ) if context["selected_sources"] else []
-        reranked, scenario_trace = _apply_scenario_rules(base, scenario, include_decisions=True)
+        reranked, scenario_trace = _apply_scenario_rules(base, scenario_for_simulation, include_decisions=True)
         return jsonify(
             {
                 "scenario_id": scenario_id,
+                "using_rule_set": "draft" if use_draft else "published",
                 "base_count": len(base),
                 "scenario_count": len(reranked),
                 "context": context,
@@ -3322,6 +3614,11 @@ def _evaluate_promotion_guard(compare_payload: Dict[str, Any], guard: Dict[str, 
     max_precision_drop = float(guard.get("max_precision_drop", 0.0))
     max_recall_drop = float(guard.get("max_recall_drop", 0.0))
     max_mrr_drop = float(guard.get("max_mrr_drop", 0.0))
+    min_source_coverage = float(guard.get("min_source_coverage_at_k", 0.0))
+    min_section_coverage = float(guard.get("min_section_coverage_at_k", 0.0))
+    min_avg_freshness = float(guard.get("min_avg_freshness", 0.0))
+    max_top_source_share = float(guard.get("max_top_source_share_at_k", 1.0))
+    max_stale_ratio = float(guard.get("max_stale_ratio_at_k", 1.0))
 
     checks = []
 
@@ -3380,6 +3677,61 @@ def _evaluate_promotion_guard(compare_payload: Dict[str, Any], guard: Dict[str, 
         }
     )
 
+    candidate_source_coverage = float(candidate.get("source_coverage_at_k", 0.0))
+    checks.append(
+        {
+            "metric": "source_coverage_at_k",
+            "value": round(candidate_source_coverage, 6),
+            "target": round(min_source_coverage, 6),
+            "operator": ">=",
+            "pass": candidate_source_coverage >= min_source_coverage,
+        }
+    )
+
+    candidate_section_coverage = float(candidate.get("section_coverage_at_k", 0.0))
+    checks.append(
+        {
+            "metric": "section_coverage_at_k",
+            "value": round(candidate_section_coverage, 6),
+            "target": round(min_section_coverage, 6),
+            "operator": ">=",
+            "pass": candidate_section_coverage >= min_section_coverage,
+        }
+    )
+
+    candidate_avg_freshness = float(candidate.get("avg_freshness", 0.0))
+    checks.append(
+        {
+            "metric": "avg_freshness",
+            "value": round(candidate_avg_freshness, 6),
+            "target": round(min_avg_freshness, 6),
+            "operator": ">=",
+            "pass": candidate_avg_freshness >= min_avg_freshness,
+        }
+    )
+
+    candidate_top_source_share = float(candidate.get("top_source_share_at_k", 0.0))
+    checks.append(
+        {
+            "metric": "top_source_share_at_k",
+            "value": round(candidate_top_source_share, 6),
+            "target": round(max_top_source_share, 6),
+            "operator": "<=",
+            "pass": candidate_top_source_share <= max_top_source_share,
+        }
+    )
+
+    candidate_stale_ratio = float(candidate.get("stale_ratio_at_k", 0.0))
+    checks.append(
+        {
+            "metric": "stale_ratio_at_k",
+            "value": round(candidate_stale_ratio, 6),
+            "target": round(max_stale_ratio, 6),
+            "operator": "<=",
+            "pass": candidate_stale_ratio <= max_stale_ratio,
+        }
+    )
+
     passed = all(item["pass"] for item in checks)
     return {
         "passed": passed,
@@ -3390,6 +3742,11 @@ def _evaluate_promotion_guard(compare_payload: Dict[str, Any], guard: Dict[str, 
             "max_precision_drop": max_precision_drop,
             "max_recall_drop": max_recall_drop,
             "max_mrr_drop": max_mrr_drop,
+            "min_source_coverage_at_k": min_source_coverage,
+            "min_section_coverage_at_k": min_section_coverage,
+            "min_avg_freshness": min_avg_freshness,
+            "max_top_source_share_at_k": max_top_source_share,
+            "max_stale_ratio_at_k": max_stale_ratio,
         },
     }
 
@@ -4790,16 +5147,31 @@ def _compute_recommendation_quality_metrics(
     idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_hits + 1))
     ndcg_at_k = (dcg / idcg) if idcg > 0 else 0.0
 
-    unique_sources = {rec.get("source", "unknown") for rec in recommendations}
-    source_coverage_at_k = len(unique_sources) / top_k if top_k else 0.0
-    avg_score = sum(float(rec.get("score", 0.0)) for rec in recommendations) / top_k if top_k else 0.0
+    source_counts: Dict[str, int] = {}
+    section_values = set()
     freshness_values = []
+    stale_count = 0
     for rec in recommendations:
+        source = str(rec.get("source") or "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+        section = rec.get("section") or ((rec.get("metadata") or {}).get("section"))
+        if section:
+            section_values.add(str(section))
         features = rec.get("features") or {}
         freshness = features.get("freshness")
         if isinstance(freshness, (int, float)):
-            freshness_values.append(float(freshness))
+            freshness_value = float(freshness)
+            freshness_values.append(freshness_value)
+            if freshness_value < 0.2:
+                stale_count += 1
+
+    unique_sources = set(source_counts.keys())
+    source_coverage_at_k = len(unique_sources) / top_k if top_k else 0.0
+    avg_score = sum(float(rec.get("score", 0.0)) for rec in recommendations) / top_k if top_k else 0.0
     avg_freshness = (sum(freshness_values) / len(freshness_values)) if freshness_values else 0.0
+    top_source_share_at_k = (max(source_counts.values()) / top_k) if (source_counts and top_k) else 0.0
+    section_coverage_at_k = (len(section_values) / top_k) if top_k else 0.0
+    stale_ratio_at_k = (stale_count / top_k) if top_k else 0.0
 
     return {
         "precision_at_k": precision_at_k,
@@ -4807,6 +5179,9 @@ def _compute_recommendation_quality_metrics(
         "ndcg_at_k": ndcg_at_k,
         "mrr": mrr,
         "source_coverage_at_k": source_coverage_at_k,
+        "section_coverage_at_k": section_coverage_at_k,
+        "top_source_share_at_k": top_source_share_at_k,
+        "stale_ratio_at_k": stale_ratio_at_k,
         "avg_score": avg_score,
         "avg_freshness": avg_freshness,
     }
@@ -4820,6 +5195,9 @@ def _aggregate_quality_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]
             "ndcg_at_k": 0.0,
             "mrr": 0.0,
             "source_coverage_at_k": 0.0,
+            "section_coverage_at_k": 0.0,
+            "top_source_share_at_k": 0.0,
+            "stale_ratio_at_k": 0.0,
             "avg_score": 0.0,
             "avg_freshness": 0.0,
         }

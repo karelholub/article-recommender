@@ -45,21 +45,36 @@ const GUARD_PRESETS = {
         min_ctr_lift: 0.002,
         max_precision_drop: 0.005,
         max_recall_drop: 0.005,
-        max_mrr_drop: 0.005
+        max_mrr_drop: 0.005,
+        min_source_coverage_at_k: 0.45,
+        min_section_coverage_at_k: 0.30,
+        min_avg_freshness: 0.20,
+        max_top_source_share_at_k: 0.60,
+        max_stale_ratio_at_k: 0.30
     },
     balanced: {
         min_ndcg_lift: 0.0,
         min_ctr_lift: 0.0,
         max_precision_drop: 0.02,
         max_recall_drop: 0.02,
-        max_mrr_drop: 0.02
+        max_mrr_drop: 0.02,
+        min_source_coverage_at_k: 0.30,
+        min_section_coverage_at_k: 0.20,
+        min_avg_freshness: 0.15,
+        max_top_source_share_at_k: 0.70,
+        max_stale_ratio_at_k: 0.45
     },
     aggressive: {
         min_ndcg_lift: -0.005,
         min_ctr_lift: -0.001,
         max_precision_drop: 0.05,
         max_recall_drop: 0.05,
-        max_mrr_drop: 0.05
+        max_mrr_drop: 0.05,
+        min_source_coverage_at_k: 0.15,
+        min_section_coverage_at_k: 0.10,
+        min_avg_freshness: 0.10,
+        max_top_source_share_at_k: 0.85,
+        max_stale_ratio_at_k: 0.60
     }
 };
 
@@ -981,22 +996,62 @@ function applyScenarioToEditor(scenario) {
     if (hasElement('rule-include-sources')) {
         populateRuleBuilderFromRuleSet(scenario?.rule_set || {});
     }
+    renderScenarioLifecycleStatus(scenario || null);
+    loadScenarioVersions(scenario?.scenario_id || '').catch(() => {});
+}
+
+function renderScenarioLifecycleStatus(scenario) {
+    const el = document.getElementById('scenario-lifecycle-status');
+    if (!el) return;
+    if (!scenario) {
+        el.textContent = 'Lifecycle status unavailable.';
+        return;
+    }
+    const lifecycle = scenario.lifecycle || {};
+    const draftVersion = Number(lifecycle.draft_version || 1);
+    const publishedVersion = Number(lifecycle.published_version || 1);
+    const pending = Boolean(lifecycle.pending_changes);
+    const publishedAt = lifecycle.published_at || 'n/a';
+    const publishedBy = lifecycle.published_by || 'n/a';
+    el.innerHTML = `
+        Draft v${draftVersion} | Published v${publishedVersion}
+        ${pending ? '<span class="text-warning">| Pending draft changes</span>' : '<span class="text-success">| In sync</span>'}
+        <br><span class="text-muted">Last publish: ${publishedAt} by ${publishedBy}</span>
+    `;
+}
+
+async function loadScenarioVersions(scenarioId) {
+    const select = document.getElementById('scenario-version-select');
+    if (!select) return;
+    if (!scenarioId) {
+        select.innerHTML = '<option value="">Latest previous version</option>';
+        return;
+    }
+    try {
+        const payload = await ApiClient.get(`/api/scenarios/${encodeURIComponent(scenarioId)}/versions`);
+        const versions = payload.versions || [];
+        const options = ['<option value="">Latest previous version</option>'].concat(
+            versions.map(item => `<option value="${item.version}">v${item.version} (${item.published_at || 'n/a'})</option>`)
+        );
+        select.innerHTML = options.join('');
+    } catch (_error) {
+        select.innerHTML = '<option value="">Versions unavailable</option>';
+    }
 }
 
 async function loadScenarios() {
     try {
-        const response = await fetch('/api/scenarios?include_disabled=true');
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to load scenarios');
-        }
-        const data = await response.json();
+        const data = await ApiClient.get('/api/scenarios', { query: { include_disabled: true } });
         scenarios = data.scenarios || [];
         const select = document.getElementById('scenario-select');
         if (select) {
             const current = select.value;
             select.innerHTML = '<option value="">No scenario</option>' + scenarios
-                .map(item => `<option value="${item.scenario_id}">${item.name} (${item.scenario_id})${item.enabled ? '' : ' [disabled]'}</option>`)
+                .map(item => {
+                    const lifecycle = item.lifecycle || {};
+                    const pending = lifecycle.pending_changes ? ' *draft' : '';
+                    return `<option value="${item.scenario_id}">${item.name} (${item.scenario_id})${item.enabled ? '' : ' [disabled]'}${pending}</option>`;
+                })
                 .join('');
             if (current && scenarios.some(item => item.scenario_id === current)) {
                 select.value = current;
@@ -1043,15 +1098,7 @@ async function saveScenario() {
         enabled,
         rule_set: ruleSet
     };
-    const response = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to save scenario');
-    }
+    await ApiClient.request(url, { method, headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() }, body: JSON.stringify(payload) });
     await loadScenarios();
     document.getElementById('scenario-select').value = scenarioId;
     loadDecisionContext();
@@ -1062,15 +1109,65 @@ async function deleteScenario() {
     if (!scenarioId) {
         throw new Error('Select a scenario first');
     }
-    const response = await fetch(`/api/scenarios/${encodeURIComponent(scenarioId)}`, { method: 'DELETE' });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to delete scenario');
-    }
+    await ApiClient.del(`/api/scenarios/${encodeURIComponent(scenarioId)}`);
     await loadScenarios();
     document.getElementById('scenario-select').value = '';
     applyScenarioToEditor(null);
     loadDecisionContext();
+}
+
+async function publishScenario() {
+    const scenarioId = (document.getElementById('scenario-id').value || '').trim();
+    if (!scenarioId) {
+        throw new Error('Select a scenario first');
+    }
+    const response = await fetch(`/api/scenarios/${encodeURIComponent(scenarioId)}/publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({ actor_id: getOperatorId() || undefined })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        if (response.status === 409 && payload.guard_evaluation) {
+            const failed = (payload.guard_evaluation.checks || []).filter(item => !item.pass);
+            const details = failed.map(item => `${item.name}: ${item.detail}`).join(' | ');
+            throw new Error(`Publish blocked by guardrails. ${details || 'Fix scenario constraints.'}`);
+        }
+        throw new Error(payload.error || 'Failed to publish scenario');
+    }
+    await loadScenarios();
+    document.getElementById('scenario-select').value = scenarioId;
+    const selected = scenarios.find(item => item.scenario_id === scenarioId) || null;
+    applyScenarioToEditor(selected);
+    loadDecisionContext();
+    setRuleBuilderStatus(`Published scenario ${scenarioId} (v${payload.published_version}).`);
+}
+
+async function rollbackScenario() {
+    const scenarioId = (document.getElementById('scenario-id').value || '').trim();
+    if (!scenarioId) {
+        throw new Error('Select a scenario first');
+    }
+    const targetVersionRaw = (document.getElementById('scenario-version-select')?.value || '').trim();
+    const targetVersion = targetVersionRaw ? Number(targetVersionRaw) : undefined;
+    const response = await fetch(`/api/scenarios/${encodeURIComponent(scenarioId)}/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getOperatorHeaders() },
+        body: JSON.stringify({
+            actor_id: getOperatorId() || undefined,
+            target_version: Number.isFinite(targetVersion) ? targetVersion : undefined
+        })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+        throw new Error(payload.error || 'Failed to rollback scenario');
+    }
+    await loadScenarios();
+    document.getElementById('scenario-select').value = scenarioId;
+    const selected = scenarios.find(item => item.scenario_id === scenarioId) || null;
+    applyScenarioToEditor(selected);
+    loadDecisionContext();
+    setRuleBuilderStatus(`Rolled back scenario ${scenarioId} to published v${payload.rolled_back_to_version}.`);
 }
 
 function populateRuleBuilderFromRuleSet(ruleSet) {
@@ -2851,6 +2948,37 @@ function renderConfigCompareResult(payload) {
     }
 }
 
+function renderPromotionGuardResult(guardEvaluation) {
+    const panel = document.getElementById('promotion-guard-result');
+    if (!panel) return;
+    if (!guardEvaluation || !Array.isArray(guardEvaluation.checks) || !guardEvaluation.checks.length) {
+        panel.className = 'small mb-2 text-muted';
+        panel.textContent = 'No guard evaluation yet.';
+        return;
+    }
+    const failedCount = guardEvaluation.checks.filter(item => !item.pass).length;
+    const toneClass = failedCount ? 'small mb-2 text-danger' : 'small mb-2 text-success';
+    const title = failedCount
+        ? `Guard checks failed (${failedCount}/${guardEvaluation.checks.length}).`
+        : `All guard checks passed (${guardEvaluation.checks.length}/${guardEvaluation.checks.length}).`;
+    const rows = guardEvaluation.checks.map((item) => {
+        const status = item.pass ? 'PASS' : 'FAIL';
+        const value = Number(item.value || 0).toFixed(4);
+        const target = Number(item.target || 0).toFixed(4);
+        return `<tr><td>${status}</td><td>${item.metric}</td><td>${value}</td><td>${item.operator}</td><td>${target}</td></tr>`;
+    }).join('');
+    panel.className = toneClass;
+    panel.innerHTML = `
+        <div class="mb-1">${title}</div>
+        <div class="table-responsive">
+            <table class="table table-sm mb-0">
+                <thead><tr><th>Status</th><th>Metric</th><th>Value</th><th>Rule</th><th>Target</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
+}
+
 async function loadQualitySnapshotHistory() {
     const summary = document.getElementById('reporting-quality-summary');
     try {
@@ -2936,6 +3064,7 @@ async function runOfflineConfigCompare() {
     }
     const payload = await response.json();
     renderConfigCompareResult(payload);
+    renderPromotionGuardResult(null);
 }
 
 async function promoteCandidateConfig() {
@@ -3096,7 +3225,12 @@ function collectPromotionGuardFromUi() {
         min_ctr_lift: Number(document.getElementById('guard-min-ctr-lift')?.value || 0),
         max_precision_drop: Number(document.getElementById('guard-max-precision-drop')?.value || 0),
         max_recall_drop: Number(document.getElementById('guard-max-recall-drop')?.value || 0),
-        max_mrr_drop: Number(document.getElementById('guard-max-mrr-drop')?.value || 0)
+        max_mrr_drop: Number(document.getElementById('guard-max-mrr-drop')?.value || 0),
+        min_source_coverage_at_k: Number(document.getElementById('guard-min-source-coverage')?.value || 0),
+        min_section_coverage_at_k: Number(document.getElementById('guard-min-section-coverage')?.value || 0),
+        min_avg_freshness: Number(document.getElementById('guard-min-avg-freshness')?.value || 0),
+        max_top_source_share_at_k: Number(document.getElementById('guard-max-top-source-share')?.value || 1),
+        max_stale_ratio_at_k: Number(document.getElementById('guard-max-stale-ratio')?.value || 1)
     };
 }
 
@@ -3110,7 +3244,12 @@ function applyGuardPreset(presetName, persist = true) {
         ['guard-min-ctr-lift', preset.min_ctr_lift],
         ['guard-max-precision-drop', preset.max_precision_drop],
         ['guard-max-recall-drop', preset.max_recall_drop],
-        ['guard-max-mrr-drop', preset.max_mrr_drop]
+        ['guard-max-mrr-drop', preset.max_mrr_drop],
+        ['guard-min-source-coverage', preset.min_source_coverage_at_k],
+        ['guard-min-section-coverage', preset.min_section_coverage_at_k],
+        ['guard-min-avg-freshness', preset.min_avg_freshness],
+        ['guard-max-top-source-share', preset.max_top_source_share_at_k],
+        ['guard-max-stale-ratio', preset.max_stale_ratio_at_k]
     ];
     pairs.forEach(([id, value]) => {
         const el = document.getElementById(id);
@@ -3167,14 +3306,19 @@ async function promoteWithGuard() {
     if (!response.ok) {
         if (response.status === 409) {
             renderConfigCompareResult(payload.comparison || {});
+            renderPromotionGuardResult(payload.guard_evaluation || null);
             const failedChecks = (payload.guard_evaluation?.checks || []).filter(item => !item.pass);
-            const msg = failedChecks.map(item => `${item.metric} ${item.value} ${item.operator} ${item.target} (failed)`).join(' | ');
+            const msg = failedChecks
+                .slice(0, 3)
+                .map(item => `${item.metric}: ${item.value} ${item.operator} ${item.target}`)
+                .join(' | ');
             if (summary) summary.textContent = `Guard blocked promotion: ${msg || 'threshold not met'}`;
             return;
         }
         throw new Error(payload.error || 'Failed guarded promotion');
     }
     renderConfigCompareResult(payload.comparison || {});
+    renderPromotionGuardResult(payload.guard_evaluation || null);
     if (summary) summary.textContent = `Guard passed. Promoted ${payload.source_config_id} to ${payload.target_config_id} v${payload.target_version}.`;
     await loadRankingConfigs();
 }
@@ -4567,8 +4711,18 @@ function setupEventListeners() {
         }
         applyGuardPreset(preset, true);
     });
-    ['guard-min-ndcg-lift', 'guard-min-ctr-lift', 'guard-max-precision-drop', 'guard-max-recall-drop', 'guard-max-mrr-drop']
-        .forEach((id) => on(id, 'input', markGuardPresetCustom));
+    [
+        'guard-min-ndcg-lift',
+        'guard-min-ctr-lift',
+        'guard-max-precision-drop',
+        'guard-max-recall-drop',
+        'guard-max-mrr-drop',
+        'guard-min-source-coverage',
+        'guard-min-section-coverage',
+        'guard-min-avg-freshness',
+        'guard-max-top-source-share',
+        'guard-max-stale-ratio'
+    ].forEach((id) => on(id, 'input', markGuardPresetCustom));
     on('compare-experiment-variants', 'click', async () => {
         try {
             await compareExperimentVariants();
@@ -4669,7 +4823,33 @@ function setupEventListeners() {
             showError(error.message || 'Failed to delete scenario');
         }
     });
+    on('publish-scenario', 'click', async () => {
+        try {
+            await publishScenario();
+            await loadScenarioMetrics();
+            await loadScenarioSourceMetrics();
+        } catch (error) {
+            showError(error.message || 'Failed to publish scenario');
+        }
+    });
+    on('rollback-scenario', 'click', async () => {
+        try {
+            await rollbackScenario();
+            await loadScenarioMetrics();
+            await loadScenarioSourceMetrics();
+        } catch (error) {
+            showError(error.message || 'Failed to rollback scenario');
+        }
+    });
     on('refresh-scenarios', 'click', loadScenarios);
+    on('refresh-scenario-versions', 'click', async () => {
+        try {
+            const scenarioId = (document.getElementById('scenario-id')?.value || '').trim();
+            await loadScenarioVersions(scenarioId);
+        } catch (error) {
+            showError(error.message || 'Failed to refresh scenario versions');
+        }
+    });
     on('refresh-scenario-metrics', 'click', loadScenarioMetrics);
     on('refresh-scenario-source-metrics', 'click', loadScenarioSourceMetrics);
     on('apply-rule-builder', 'click', () => {
